@@ -6,20 +6,42 @@ import com.google.gson.GsonBuilder;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Einfache JSON-Konfiguration unter ~/.config/hugoafk/config.json.
- * Merkt sich den zuletzt genutzten Server und die AFK-Einstellungen.
+ * Merkt sich Server- und Verhaltenseinstellungen.
  */
 public class Config {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+    // Verbindung
     public String lastServer = "";
     public boolean autoReconnect = true;
-    public int reconnectDelaySeconds = 10;
+    public int reconnectDelaySeconds = 5;
+    /** 0 = unbegrenzt viele Reconnect-Versuche. */
+    public int maxReconnectAttempts = 0;
+
+    // Anti-AFK
     public boolean antiAfkEnabled = true;
     public int antiAfkSeconds = 60;
+
+    // Anzeige
+    public boolean showTimestamps = true;
+    public boolean logChat = true;
+
+    // Benachrichtigungen
+    public boolean highlightUsername = true;
+    public boolean bellOnHighlight = true;
+    public List<String> highlightKeywords = new ArrayList<>();
+
+    // Spielerliste
+    public boolean announcePlayerJoinLeave = false;
+
+    // Spielverhalten
+    public boolean autoRespawn = true;
 
     private transient Path file;
 
@@ -36,6 +58,9 @@ public class Config {
             }
         } catch (Exception e) {
             config = new Config();
+        }
+        if (config.highlightKeywords == null) {
+            config.highlightKeywords = new ArrayList<>();
         }
         config.file = file;
         return config;
