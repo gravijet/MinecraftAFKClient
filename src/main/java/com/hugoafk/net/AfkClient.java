@@ -23,7 +23,11 @@ import org.geysermc.mcprotocollib.protocol.data.game.ResourcePackStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PositionElement;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundStoreCookiePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundTransferPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
+import org.geysermc.mcprotocollib.protocol.packet.cookie.clientbound.ClientboundCookieRequestPacket;
+import org.geysermc.mcprotocollib.protocol.packet.cookie.serverbound.ServerboundCookieResponsePacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundLoginPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundPlayerChatPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundPlayerInfoRemovePacket;
@@ -45,7 +49,11 @@ import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.BitSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -55,13 +63,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Verbindet sich mit dem Server und behandelt eingehende Pakete (Chat, Resource-Pack,
- * Teleport, Health, Spielerliste), sendet Chat/Befehle, haelt die Verbindung per Anti-AFK
- * aktiv, respawnt automatisch und verbindet bei Verbindungsabbruch mit Backoff neu.
+ * Teleport, Health, Spielerliste, Cookies, Transfer). Sendet Chat/Befehle (rate-limitiert),
+ * haelt die Verbindung per Anti-AFK aktiv, respawnt automatisch und verbindet bei
+ * Verbindungsabbruch mit Backoff neu. Ziel: moeglichst nie gekickt zu werden.
  */
 public class AfkClient {
 
     private static final int ACK_THRESHOLD = 20;
     private static final int MAX_BACKOFF_SECONDS = 300;
+    private static final int THROTTLE_MIN_DELAY = 30;
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
 
     private final AuthManager auth;
@@ -81,6 +91,10 @@ public class AfkClient {
 
     private final AtomicInteger unacknowledged = new AtomicInteger();
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
+    /** Ausgehende Nachrichten/Befehle, rate-limitiert gesendet (gegen Spam-Kick). */
+    private final Queue<String> outgoing = new ConcurrentLinkedQueue<>();
+    /** Server-Cookies (fuer Transfers / Netzwerk-Auth) merken und auf Anfrage zurueckgeben. */
+    private final Map<String, byte[]> cookies = new ConcurrentHashMap<>();
 
     private volatile ClientSession session;
     private volatile boolean shuttingDown = false;
@@ -108,6 +122,12 @@ public class AfkClient {
 
         scheduler.scheduleAtFixedRate(this::antiAfkTick,
                 config.antiAfkSeconds, config.antiAfkSeconds, TimeUnit.SECONDS);
+        int chatDelay = Math.max(200, config.chatMinDelayMs);
+        scheduler.scheduleAtFixedRate(this::drainOutgoing, chatDelay, chatDelay, TimeUnit.MILLISECONDS);
+    }
+
+    public List<String> playerNames() {
+        return playerList.sortedNames();
     }
 
     public void connect(String host, int port) {
@@ -128,17 +148,20 @@ public class AfkClient {
                     .setProtocol(protocol)
                     .create();
             client.setFlag(MinecraftConstants.SESSION_SERVICE_KEY, sessionService);
+            client.setFlag(MinecraftConstants.AUTOMATIC_KEEP_ALIVE_MANAGEMENT, true);
+            // Transfers selbst behandeln, damit unser Listener erhalten bleibt.
+            client.setFlag(MinecraftConstants.FOLLOW_TRANSFERS, false);
             client.addListener(new Listener());
             this.session = client;
             console.info("Verbinde zu " + host + ":" + port + " ...");
             client.connect();
         } catch (Exception e) {
             console.error("Verbindung fehlgeschlagen: " + e.getMessage());
-            scheduleReconnect();
+            scheduleReconnect(0);
         }
     }
 
-    private void scheduleReconnect() {
+    private void scheduleReconnect(int minDelaySeconds) {
         if (shuttingDown || !config.autoReconnect) {
             return;
         }
@@ -152,7 +175,7 @@ public class AfkClient {
         reconnectAttempts++;
         int exp = Math.min(reconnectAttempts - 1, 6);
         int delay = Math.min((int) (config.reconnectDelaySeconds * Math.pow(2, exp)), MAX_BACKOFF_SECONDS);
-        delay = Math.max(1, delay);
+        delay = Math.max(Math.max(1, delay), minDelaySeconds);
         console.info("Reconnect-Versuch " + reconnectAttempts + " in " + delay + "s ...");
         scheduler.schedule(() -> {
             reconnectScheduled.set(false);
@@ -189,10 +212,22 @@ public class AfkClient {
         console.info("Anti-AFK ist jetzt " + (enabled ? "AN" : "AUS") + ".");
     }
 
+    /** Stellt eine Eingabe in die rate-limitierte Sende-Warteschlange. */
     public void sendChatInput(String input) {
+        if (!inGame || session == null || !session.isConnected()) {
+            console.error("Nicht verbunden - Nachricht nicht gesendet.");
+            return;
+        }
+        outgoing.add(input);
+    }
+
+    private void drainOutgoing() {
         ClientSession current = session;
         if (current == null || !current.isConnected() || !inGame) {
-            console.error("Nicht verbunden - Nachricht nicht gesendet.");
+            return;
+        }
+        String input = outgoing.poll();
+        if (input == null) {
             return;
         }
         int offset = unacknowledged.getAndSet(0);
@@ -200,29 +235,23 @@ public class AfkClient {
             current.send(new ServerboundChatCommandPacket(input.substring(1)));
         } else {
             current.send(new ServerboundChatPacket(
-                    input,
-                    Instant.now().toEpochMilli(),
-                    0L,
-                    null,            // unsigniert (Server mit enforce-secure-profile=false)
-                    offset,
-                    new BitSet(),
-                    0));
+                    input, Instant.now().toEpochMilli(), 0L, null, offset, new BitSet(), 0));
         }
     }
 
     public void printStatus() {
         boolean connected = session != null && session.isConnected() && inGame;
         console.info("=== Status ===");
-        console.info("  Server:        " + host + ":" + port);
-        console.info("  Verbunden:     " + (connected ? "ja" : "nein"));
-        console.info("  Spieler:       " + auth.username());
-        console.info("  Leben/Hunger:  " + Math.round(health) + " / " + food);
+        console.info("  Server:         " + host + ":" + port);
+        console.info("  Verbunden:      " + (connected ? "ja" : "nein"));
+        console.info("  Spieler:        " + auth.username());
+        console.info("  Leben/Hunger:   " + Math.round(health) + " / " + food);
         int ping = selfId != null ? playerList.latencyOf(selfId) : -1;
-        console.info("  Ping:          " + (ping >= 0 ? ping + " ms" : "?"));
-        console.info("  Online:        " + playerList.size());
-        console.info("  Anti-AFK:      " + (config.antiAfkEnabled ? "an (" + config.antiAfkSeconds + "s)" : "aus"));
-        console.info("  Auto-Reconnect:" + (config.autoReconnect ? " an" : " aus"));
-        console.info("  Auto-Respawn:  " + (config.autoRespawn ? "an" : "aus"));
+        console.info("  Ping:           " + (ping >= 0 ? ping + " ms" : "?"));
+        console.info("  Online:         " + playerList.size());
+        console.info("  Anti-AFK:       " + (config.antiAfkEnabled ? "an (" + config.antiAfkSeconds + "s)" : "aus"));
+        console.info("  Auto-Reconnect: " + (config.autoReconnect ? "an" : "aus"));
+        console.info("  Auto-Respawn:   " + (config.autoRespawn ? "an" : "aus"));
     }
 
     public void printPlayers() {
@@ -246,8 +275,10 @@ public class AfkClient {
         }
         current.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
         if (havePosition) {
-            // Leichte Drehung, um AFK-Erkennung zu umgehen (ohne die Position zu aendern).
-            yaw = (yaw + ThreadLocalRandom.current().nextFloat() * 20f - 10f) % 360f;
+            // Leichte Dreh-/Blickaenderung gegen AFK-Erkennung (ohne die Position zu aendern).
+            ThreadLocalRandom rnd = ThreadLocalRandom.current();
+            yaw = (yaw + rnd.nextFloat() * 20f - 10f) % 360f;
+            pitch = Math.max(-30f, Math.min(30f, pitch + rnd.nextFloat() * 10f - 5f));
             current.send(new ServerboundMovePlayerPosRotPacket(true, false, posX, posY, posZ, yaw, pitch));
         }
     }
@@ -275,7 +306,7 @@ public class AfkClient {
         if (highlight) {
             body = Console.HIGHLIGHT + body + Console.RESET;
             if (config.bellOnHighlight) {
-                body = Console.BELL + body; // Terminal-Glocke
+                body = Console.BELL + body;
             }
         }
         console.printAbove(prefix + body);
@@ -295,6 +326,13 @@ public class AfkClient {
         return false;
     }
 
+    private static boolean looksThrottled(String reason) {
+        String r = reason.toLowerCase();
+        return r.contains("throttl") || r.contains("wait") || r.contains("already")
+                || r.contains("logged in") || r.contains("too fast") || r.contains("slow down")
+                || r.contains("try again");
+    }
+
     private double relative(List<PositionElement> relatives, PositionElement element,
                             double current, double value) {
         return relatives.contains(element) ? current + value : value;
@@ -309,14 +347,7 @@ public class AfkClient {
         @Override
         public void packetReceived(Session ignored, Packet packet) {
             if (packet instanceof ClientboundLoginPacket) {
-                inGame = true;
-                reconnectAttempts = 0;
-                connectedAt = System.currentTimeMillis();
-                unacknowledged.set(0);
-                wasDead = false;
-                havePosition = false;
-                playerList.clear();
-                console.info("Verbunden und im Spiel als " + auth.username() + ".");
+                onJoin();
             } else if (packet instanceof ClientboundSystemChatPacket chat) {
                 displayChat(chat.getContent());
             } else if (packet instanceof ClientboundPlayerChatPacket chat) {
@@ -328,8 +359,7 @@ public class AfkClient {
                         .append(Component.text("> ")).append(content));
                 maybeAcknowledge();
             } else if (packet instanceof ClientboundResourcePackPushPacket pack) {
-                // Resource-Pack NICHT laden, aber bestaetigen -> kein Kick auf Servern,
-                // die das Pack erzwingen.
+                // Resource-Pack NICHT laden, aber bestaetigen -> kein Kick bei erzwungenem Pack.
                 session.send(new ServerboundResourcePackPacket(pack.getId(), ResourcePackStatus.ACCEPTED));
                 session.send(new ServerboundResourcePackPacket(pack.getId(), ResourcePackStatus.SUCCESSFULLY_LOADED));
                 console.info("Resource-Pack bestaetigt (nicht geladen).");
@@ -341,15 +371,48 @@ public class AfkClient {
                 handlePlayerInfo(info);
             } else if (packet instanceof ClientboundPlayerInfoRemovePacket remove) {
                 handlePlayerRemove(remove);
+            } else if (packet instanceof ClientboundStoreCookiePacket cookie) {
+                cookies.put(cookie.getKey().asString(), cookie.getPayload());
+            } else if (packet instanceof ClientboundCookieRequestPacket request) {
+                // Cookie zurueckgeben (oder null) -> kein Haengenbleiben bei Netzwerk-Auth.
+                session.send(new ServerboundCookieResponsePacket(
+                        request.getKey(), cookies.get(request.getKey().asString())));
+            } else if (packet instanceof ClientboundTransferPacket transfer) {
+                console.info("Server-Transfer zu " + transfer.getHost() + ":" + transfer.getPort());
+                switchServer(transfer.getHost(), transfer.getPort());
             }
         }
 
         @Override
         public void disconnected(DisconnectedEvent event) {
             inGame = false;
-            String reason = event.getReason() != null ? ansi.serialize(event.getReason()) : "unbekannt";
-            console.error("Getrennt: " + reason);
-            scheduleReconnect();
+            String reasonPlain = event.getReason() != null ? plain.serialize(event.getReason()) : "";
+            String reasonDisplay = event.getReason() != null ? ansi.serialize(event.getReason()) : "unbekannt";
+            console.error("Getrennt: " + reasonDisplay);
+            scheduleReconnect(looksThrottled(reasonPlain) ? THROTTLE_MIN_DELAY : 0);
+        }
+    }
+
+    private void onJoin() {
+        inGame = true;
+        reconnectAttempts = 0;
+        connectedAt = System.currentTimeMillis();
+        unacknowledged.set(0);
+        outgoing.clear();
+        wasDead = false;
+        havePosition = false;
+        playerList.clear();
+        console.info("Verbunden und im Spiel als " + auth.username() + ".");
+
+        if (!config.onJoinCommands.isEmpty()) {
+            scheduler.schedule(() -> {
+                for (String cmd : config.onJoinCommands) {
+                    if (cmd != null && !cmd.isBlank()) {
+                        outgoing.add(cmd.trim());
+                    }
+                }
+                console.info("Auto-Beitrittsbefehle gesendet (" + config.onJoinCommands.size() + ").");
+            }, Math.max(0, config.onJoinDelaySeconds), TimeUnit.SECONDS);
         }
     }
 

@@ -79,6 +79,7 @@ public class Main {
         int port = portHolder[0];
 
         AfkClient client = new AfkClient(auth, config, console, chatLog);
+        console.setPlayerNameSupplier(client::playerNames);
 
         // Sauberes Beenden bei Ctrl-C / Kill.
         Runtime.getRuntime().addShutdownHook(new Thread(client::shutdown, "hugoafk-shutdown"));

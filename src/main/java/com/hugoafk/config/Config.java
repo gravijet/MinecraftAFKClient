@@ -43,6 +43,13 @@ public class Config {
     // Spielverhalten
     public boolean autoRespawn = true;
 
+    // Robustheit / Komfort
+    /** Mindestabstand zwischen ausgehenden Nachrichten (gegen Spam-Kick). */
+    public int chatMinDelayMs = 1100;
+    /** Befehle, die nach dem Beitritt automatisch gesendet werden (z. B. "/login pass"). */
+    public List<String> onJoinCommands = new ArrayList<>();
+    public int onJoinDelaySeconds = 3;
+
     private transient Path file;
 
     public static Config load(Path file) {
@@ -61,6 +68,9 @@ public class Config {
         }
         if (config.highlightKeywords == null) {
             config.highlightKeywords = new ArrayList<>();
+        }
+        if (config.onJoinCommands == null) {
+            config.onJoinCommands = new ArrayList<>();
         }
         config.file = file;
         return config;
