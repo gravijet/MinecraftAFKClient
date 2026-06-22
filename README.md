@@ -24,6 +24,29 @@ node-minecraft-protocol oft scheitern.
 - **Highlight + Glocke**, wenn dein Name oder ein Stichwort im Chat fällt.
 - **Chat-Log** in `~/.config/hugoafk/chat.log`.
 - **Serverwechsel zur Laufzeit** (`:server <ip>`), CLI-Optionen, sauberes Beenden (Ctrl-C).
+- **Tab-Vervollständigung** für `:`-Befehle und Online-Spielernamen.
+- **Auto-Beitrittsbefehle** (z. B. `/login`, `/register`) nach dem Spawn.
+
+## „Nie gekickt werden" – eingebaute Schutzmechanismen
+
+Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick führt:
+
+- **KeepAlive / Ping** – automatisch beantwortet (kein „Timed out").
+- **Resource-Pack** – bestätigt, auch wenn es erzwungen wird.
+- **Teleport** – wird bestätigt (kein Rubber-Banding / „moved wrongly").
+- **Chat-Acknowledgement** – empfangene Nachrichten werden quittiert (kein
+  „chat validation error").
+- **Spam-Schutz** – eigene Nachrichten/Befehle werden rate-limitiert gesendet
+  (`chatMinDelayMs`), damit kein „kicked for spamming".
+- **Cookies & Transfer** – Netzwerk-Cookies werden beantwortet und Server-Transfers
+  gefolgt (Velocity/BungeeCord-Netzwerke).
+- **Auto-Login** – per `onJoinCommands` z. B. `/login <pass>` automatisch senden, damit
+  Auth-Server nicht wegen fehlender Anmeldung kicken.
+- **Anti-AFK** – periodische Bewegung gegen AFK-Timeouts.
+- **Auto-Reconnect** mit Backoff; bei „throttled/already logged in" wird länger gewartet.
+
+> Hinweis: Manuelle Kicks (Ban, Whitelist, Server voll) oder erzwungener **signierter
+> Chat** (`enforce-secure-profile=true`) lassen sich client-seitig nicht umgehen.
 
 ## Voraussetzungen: JDK 21 installieren
 
@@ -89,7 +112,9 @@ java -jar hugoafkclient.jar [optionen] [host[:port]]
 Liegt unter `~/.config/hugoafk/`:
 - `config.json` – Server, Anti-AFK, Auto-Reconnect/Backoff, Zeitstempel, Chat-Log,
   Highlight-Stichwörter (`highlightKeywords`), Join/Leave-Meldungen
-  (`announcePlayerJoinLeave`), Auto-Respawn u. a.
+  (`announcePlayerJoinLeave`), Auto-Respawn, Spam-Schutz (`chatMinDelayMs`),
+  Auto-Beitrittsbefehle (`onJoinCommands`, `onJoinDelaySeconds`) u. a.
+  Beispiel `onJoinCommands`: `["/login meinPasswort"]`
 - `auth.json` – zwischengespeicherte Anmeldung (enthält Tokens; nicht weitergeben).
 - `chat.log` – mitgeschriebener Chat (abschaltbar via `logChat` in `config.json`).
 

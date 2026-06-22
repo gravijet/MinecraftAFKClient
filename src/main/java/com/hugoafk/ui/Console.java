@@ -8,6 +8,9 @@ import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 
 import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Schlanke Konsolen-Oberflaeche auf JLine-Basis.
@@ -24,10 +27,19 @@ public class Console {
 
     private final Terminal terminal;
     private final LineReader reader;
+    private volatile Supplier<Collection<String>> playerNames = List::of;
 
     public Console() throws IOException {
         this.terminal = TerminalBuilder.builder().system(true).build();
-        this.reader = LineReaderBuilder.builder().terminal(terminal).build();
+        this.reader = LineReaderBuilder.builder()
+                .terminal(terminal)
+                .completer(new HugoCompleter(() -> playerNames.get()))
+                .build();
+    }
+
+    /** Liefert die aktuellen Online-Spielernamen fuer die Tab-Vervollstaendigung. */
+    public void setPlayerNameSupplier(Supplier<Collection<String>> supplier) {
+        this.playerNames = supplier != null ? supplier : List::of;
     }
 
     /** Gibt eine Zeile oberhalb der Eingabezeile aus (klobbert die Eingabe nicht). */
