@@ -14,10 +14,16 @@ node-minecraft-protocol oft scheitern.
 
 - Microsoft-Login per **Device-Code** (kein Browser-Callback nötig); Anmeldung wird
   zwischengespeichert und automatisch erneuert.
-- Chat **empfangen** (farbig) und **senden**; Serverbefehle mit `/...`.
+- Chat **empfangen** (farbig, mit Zeitstempel) und **senden**; Serverbefehle mit `/...`.
 - **Resource-Pack** wird bestätigt (nicht heruntergeladen) → kein Kick auf Servern, die ein
   Pack erzwingen.
-- **Anti-AFK** (periodischer Arm-Schwung) + **Auto-Reconnect**.
+- **Teleport-Bestätigung** → kein Rubber-Banding / Kick beim Spawn.
+- **Auto-Respawn** beim Tod (bleibt nicht im Todesbildschirm hängen).
+- **Anti-AFK** (Arm-Schwung + leichte Drehung) + **Auto-Reconnect mit Backoff**.
+- **Spielerliste** (`:players`) und **Status** (`:status`: Leben, Hunger, Ping, Online-Zahl).
+- **Highlight + Glocke**, wenn dein Name oder ein Stichwort im Chat fällt.
+- **Chat-Log** in `~/.config/hugoafk/chat.log`.
+- **Serverwechsel zur Laufzeit** (`:server <ip>`), CLI-Optionen, sauberes Beenden (Ctrl-C).
 
 ## Voraussetzungen: JDK 21 installieren
 
@@ -54,17 +60,38 @@ cd HugoAFKClient
 Beim ersten Start erscheint ein **Microsoft-Login-Code**: die angezeigte URL öffnen, den
 Code eingeben, fertig. Danach wird die Anmeldung gespeichert.
 
+### CLI-Optionen
+
+```
+java -jar hugoafkclient.jar [optionen] [host[:port]]
+  --server <host[:port]>   Server-Adresse
+  --no-reconnect           Auto-Reconnect deaktivieren
+  --no-afk                 Anti-AFK deaktivieren
+  --afk <sekunden>         Anti-AFK-Intervall setzen
+  -h, --help               Hilfe
+```
+
 ## Bedienung
 
 - Text tippen + Enter → Chat-Nachricht senden.
 - `/befehl` → Serverbefehl (z. B. `/list`).
-- `:help` Hilfe · `:reconnect` neu verbinden · `:afk on|off` Anti-AFK · `:quit` beenden.
+- Interne Befehle:
+  - `:help` – Hilfe
+  - `:status` – Verbindung, Leben/Hunger, Ping, Online-Zahl
+  - `:players` – Online-Spieler auflisten
+  - `:server <ip>` – zu anderem Server wechseln
+  - `:reconnect` – neu verbinden
+  - `:afk on|off` – Anti-AFK ein/aus
+  - `:quit` – beenden
 
 ## Konfiguration
 
 Liegt unter `~/.config/hugoafk/`:
-- `config.json` – letzter Server, Anti-AFK-Intervall, Auto-Reconnect.
+- `config.json` – Server, Anti-AFK, Auto-Reconnect/Backoff, Zeitstempel, Chat-Log,
+  Highlight-Stichwörter (`highlightKeywords`), Join/Leave-Meldungen
+  (`announcePlayerJoinLeave`), Auto-Respawn u. a.
 - `auth.json` – zwischengespeicherte Anmeldung (enthält Tokens; nicht weitergeben).
+- `chat.log` – mitgeschriebener Chat (abschaltbar via `logChat` in `config.json`).
 
 ## Minecraft-Version anpassen
 

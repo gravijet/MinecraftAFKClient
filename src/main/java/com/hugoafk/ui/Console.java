@@ -16,6 +16,12 @@ import java.io.IOException;
  */
 public class Console {
 
+    public static final String RESET = "\u001b[0m";
+    public static final String GRAY = "\u001b[90m";
+    public static final String RED = "\u001b[91m";
+    public static final String HIGHLIGHT = "\u001b[1m\u001b[93m";
+    public static final String BELL = "\u0007";
+
     private final Terminal terminal;
     private final LineReader reader;
 
@@ -30,11 +36,11 @@ public class Console {
     }
 
     public void info(String text) {
-        printAbove("[90m" + text + "[0m");
+        printAbove(GRAY + text + RESET);
     }
 
     public void error(String text) {
-        printAbove("[91m" + text + "[0m");
+        printAbove(RED + text + RESET);
     }
 
     /** Liest eine Zeile. Gibt {@code null} bei EOF/Ctrl-D oder Ctrl-C zurueck. */
