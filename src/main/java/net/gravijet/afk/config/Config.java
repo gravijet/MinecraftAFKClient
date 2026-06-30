@@ -74,6 +74,28 @@ public class Config {
     public int keepAliveIntervalMs = 1000;
 
     // =====================================================================
+    // Aktiver Anti-AFK (gegen serverseitige Inaktivitaets-/AFK-Kicks)
+    // =====================================================================
+    /**
+     * Manche Netzwerke (Proxy/Plugins) werten einen voellig regungslosen Spieler TROTZ
+     * Keep-Alive als "AFK" und trennen mit einer Timeout-aehnlichen Meldung
+     * ({@code disconnect.timeout}). Der reine stationaere Keep-Alive (immer gleiche
+     * Koordinaten/Blickrichtung) reicht solchen Systemen nicht - sie wollen echte Aktivitaet.
+     *
+     * <p>Dieser aktive Anti-AFK sendet daher in groesseren Abstaenden subtile,
+     * anticheat-sichere Aktionen: ein leichtes Umsehen (kleine Yaw/Pitch-Aenderung) und
+     * gelegentlich einen Arm-Schwung - genau das, was ein echter, gelegentlich umherblickender
+     * Spieler tut. Der Spieler wird dabei NICHT von der Stelle bewegt.
+     */
+    public boolean antiAfkEnabled = true;
+    /** Abstand zwischen zwei Anti-AFK-Aktionen in Sekunden (>= 5). */
+    public int antiAfkIntervalSeconds = 20;
+    /** Ausschlag des "Umsehens" in Grad (0 = nicht umsehen, nur Arm-Schwung). */
+    public double antiAfkYawDegrees = 12.0;
+    /** Zusaetzlich gelegentlich den Arm schwingen (Links-Klick-Animation). */
+    public boolean antiAfkSwing = true;
+
+    // =====================================================================
     // Befehle bei Ereignissen
     // =====================================================================
     /** Befehle direkt nach jedem erfolgreichen Beitritt (z. B. "/login pass", "/afk"). */
@@ -262,6 +284,9 @@ public class Config {
         if (privateMessageMarker == null) privateMessageMarker = "-> Du:";
         if (autoReplyMessage == null) autoReplyMessage = "";
         if (keepAliveIntervalMs < 500) keepAliveIntervalMs = 500;
+        if (antiAfkIntervalSeconds < 5) antiAfkIntervalSeconds = 5;
+        if (antiAfkYawDegrees < 0) antiAfkYawDegrees = 0;
+        if (antiAfkYawDegrees > 45) antiAfkYawDegrees = 45;
         if (chatMinDelayMs < 200) chatMinDelayMs = 200;
         if (maxBackoffSeconds < 1) maxBackoffSeconds = 1;
         if (chatHistorySize < 10) chatHistorySize = 10;

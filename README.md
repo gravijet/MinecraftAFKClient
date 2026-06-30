@@ -16,13 +16,22 @@ Abbruch automatisch neu.
 > annehmen, private Nachrichten beantworten und den Chat-Spam filtern. Wer trotzdem in die
 > AFK-Welt will, legt `/afk` in `onJoinCommands` oder als periodischen Befehl ab.
 >
-> **Update – warum trotzdem noch vereinzelt gekickt wurde:** Neben den stationären
-> Positionspaketen beantwortet der Server ein eigenes **KeepAlive-Protokollpaket**; kommt die
-> Antwort zu spät, folgt `disconnect.timeout`. Bei Chat-Spam blockierte das synchrone Schreiben
-> ins Terminal kurz den Netzwerk-Thread und verzögerte genau diese Antwort. Jetzt wird das
-> KeepAlive **selbst und mit Vorrang** beantwortet (vor jeder Chat-Verarbeitung) und die
-> **Terminal-Ausgabe läuft asynchron**, sodass der Netzwerk-Thread frei bleibt. Ein
-> **Watchdog** (Standard 60s ohne Server-Paket) baut zusätzlich „halb tote" Verbindungen neu auf.
+> **Update 1 – KeepAlive-Protokollpaket:** Neben den stationären Positionspaketen beantwortet
+> der Server ein eigenes **KeepAlive-Protokollpaket**; kommt die Antwort zu spät, folgt
+> `disconnect.timeout`. Bei Chat-Spam blockierte das synchrone Schreiben ins Terminal kurz den
+> Netzwerk-Thread und verzögerte genau diese Antwort. Jetzt wird das KeepAlive **selbst und mit
+> Vorrang** beantwortet (vor jeder Chat-Verarbeitung) und die **Terminal-Ausgabe läuft
+> asynchron**, sodass der Netzwerk-Thread frei bleibt.
+>
+> **Update 2 – aktiver Anti-AFK gegen serverseitige AFK-Kicks:** Ein *völlig* regungsloser
+> Spieler (immer exakt gleiche Position/Blickrichtung) wird von manchen Netzwerken trotz
+> KeepAlive als „AFK" gewertet und mit einer Timeout-Meldung getrennt. Der Client sendet daher
+> jetzt in größeren Abständen **subtile, anticheat-sichere Aktivität** – ein leichtes Umsehen
+> (pendelnde Yaw/Pitch) und gelegentlich einen Arm-Schwung, **ohne den Spieler von der Stelle
+> zu bewegen** (`antiAfkEnabled`, Standard alle `20s`). Zusätzlich nennt die Trennungsmeldung
+> jetzt **„letztes Server-Paket vor Xs"**: war die Verbindung gesund (kleiner Wert), war es ein
+> aktiver AFK-/Anticheat-Kick; war sie lange still, ist die Verbindung weggebrochen (Netz/Proxy).
+> Ein **Watchdog** (Standard 60s ohne Server-Paket) baut „halb tote" Verbindungen ohnehin neu auf.
 
 Gebaut mit **Java 21 + [MCProtocolLib](https://github.com/GeyserMC/MCProtocolLib)** (GeyserMC)
 und **[MinecraftAuth](https://github.com/RaphiMC/MinecraftAuth)** (RaphiMC). Diese Bibliotheken
@@ -89,6 +98,10 @@ Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick fü
   Koordinaten, keine Bewegung). Das verhindert `disconnect.timeout`, ohne den Spieler zu
   bewegen, und wird nicht als „Bewegungs-Bot" erkannt. `/afk` hingegen schützt **nicht** vor
   Kicks (nur Teleport in die AFK-Welt).
+- **Aktiver Anti-AFK** (`antiAfkEnabled`, Standard an) – gegen Netzwerke, die einen regungslosen
+  Spieler trotz Keep-Alive als „AFK" werten: subtiles Umsehen (pendelnde Yaw/Pitch) + gelegentlicher
+  Arm-Schwung, alle `antiAfkIntervalSeconds` (Std. 20s). Bewegt den Spieler **nicht** von der
+  Stelle und ist anticheat-sicher. Abschaltbar mit `:set antiafk off`.
 - **Befehle nach Kick** – kommt es doch zu einem Kick, läuft nach dem erneuten Beitritt
   automatisch `onKickCommands` (z. B. wieder `/afk`).
 - **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
@@ -196,6 +209,7 @@ Liegt unter `~/.config/hugoafk/`:
   | --- | --- |
   | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers`, `dontReconnectOnReasons`, `scheduledRestartMinutes`, `inboundSilenceTimeoutSeconds` |
   | Keep-Alive | `keepAliveEnabled`, `keepAliveIntervalMs` (Std. 1000) |
+  | Anti-AFK | `antiAfkEnabled` (Std. an), `antiAfkIntervalSeconds` (Std. 20), `antiAfkYawDegrees` (Std. 12), `antiAfkSwing` |
   | Ereignis-Befehle | `onJoinCommands`, `onJoinDelaySeconds`, `onKickCommands`, `onKickDelaySeconds`, `onDeathCommands` |
   | Periodisch / Trigger | `periodicCommands` (`{enabled, command, intervalSeconds}`), `triggers` (`{enabled, contains, response, cooldownSeconds}`) |
   | Auto-TPA | `autoAcceptTpa`, `autoAcceptTpaWhitelist`, `tpaAcceptCommand`, `tpaRequestMarker` |
