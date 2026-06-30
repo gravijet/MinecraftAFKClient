@@ -78,12 +78,18 @@ node-minecraft-protocol oft scheitern.
 
 ## „Nie gekickt werden" – eingebaute Schutzmechanismen
 
-Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick führt:
+Der Client antwortet auf **genau dieselben Pakete wie ein echter Vanilla-Client** – jedes
+Paket, dessen Ignorieren sonst zum Kick führt, wird korrekt beantwortet:
 
-- **KeepAlive / Ping** – wird **selbst und mit Vorrang** beantwortet: die Antwort geht raus,
+- **KeepAlive** – wird **selbst und mit Vorrang** beantwortet: die Antwort geht raus,
   _bevor_ eingehender (ggf. spammender) Chat verarbeitet wird, sodass sie nie zu spät kommt
   (kein „Timed out" / `disconnect.timeout`). Die gesamte Terminal-Ausgabe läuft dafür
   **asynchron** über einen eigenen Thread und blockiert den Netzwerk-Thread nicht mehr.
+- **Ping → Pong** – der In-Game-Ping (von Proxys/Anticheats genutzt) wird sofort beantwortet,
+  genau wie es ein echter Vanilla-Client tut.
+- **Spieleinstellungen** – beim Beitritt wird `ClientInformation` (Sprache, Render-Distanz,
+  Skin-Teile, Haupthand …) gesendet, wie ein echter Client; Server/Anticheats, die das
+  erwarten, sehen einen vollständig „geladenen" Spieler.
 - **Resource-Pack** – bestätigt, auch wenn es erzwungen wird.
 - **Teleport** – wird bestätigt (kein Rubber-Banding / „moved wrongly").
 - **Chat-Acknowledgement** – empfangene Nachrichten werden quittiert (kein

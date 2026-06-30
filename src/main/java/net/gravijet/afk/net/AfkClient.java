@@ -21,12 +21,19 @@ import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntryAction;
 import org.geysermc.mcprotocollib.protocol.data.game.ResourcePackStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.player.HandPreference;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PositionElement;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.ChatVisibility;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.ParticleStatus;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.SkinPart;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundPingPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundStoreCookiePacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundTransferPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundClientInformationPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundKeepAlivePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundPongPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.clientbound.ClientboundCookieRequestPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.serverbound.ServerboundCookieResponsePacket;
@@ -49,6 +56,7 @@ import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
@@ -834,6 +842,15 @@ public class AfkClient {
                 }
                 return;
             }
+            // Ping ebenfalls sofort mit Pong beantworten - genau wie ein echter Vanilla-Client.
+            // Manche Proxys/Anticheats senden diesen Ping und werten ein Ausbleiben als Timeout.
+            if (packet instanceof ClientboundPingPacket ping) {
+                ClientSession current = session;
+                if (current != null && current.isConnected()) {
+                    current.send(new ServerboundPongPacket(ping.getId()));
+                }
+                return;
+            }
             if (packet instanceof ClientboundLoginPacket) {
                 onJoin();
             } else if (packet instanceof ClientboundSystemChatPacket chat) {
@@ -946,6 +963,10 @@ public class AfkClient {
         playerList.clear();
         console.info("Verbunden und im Spiel als " + auth.username() + ".");
 
+        // Wie ein echter Client beim Beitritt die Spieleinstellungen senden. Manche Server/
+        // Anticheats erwarten dieses Paket und behandeln einen Client ohne es als "nicht geladen".
+        sendClientSettings();
+
         // Beitrittsbefehle.
         if (!config.onJoinCommands.isEmpty()) {
             scheduler.schedule(() -> queueCommands(config.onJoinCommands, "Auto-Beitrittsbefehle"),
@@ -958,6 +979,18 @@ public class AfkClient {
             scheduler.schedule(() -> queueCommands(config.onKickCommands, "Nach-Kick-Befehle"),
                     Math.max(0, config.onKickDelaySeconds), TimeUnit.SECONDS);
         }
+    }
+
+    /** Sendet die Spieleinstellungen (Sprache, Render-Distanz, Skin-Teile ...) wie ein echter Client. */
+    private void sendClientSettings() {
+        ClientSession current = session;
+        if (current == null || !current.isConnected()) {
+            return;
+        }
+        current.send(new ServerboundClientInformationPacket(
+                "de_DE", 10, ChatVisibility.FULL, true,
+                Arrays.asList(SkinPart.values()), HandPreference.RIGHT_HAND,
+                false, true, ParticleStatus.ALL));
     }
 
     private void queueCommands(List<String> commands, String label) {
