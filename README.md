@@ -15,6 +15,23 @@ Abbruch automatisch neu.
 > Zusätzlich: **eigene Befehle nach einem Kick** (`onKickCommands`), TPA-Anfragen automatisch
 > annehmen, private Nachrichten beantworten und den Chat-Spam filtern. Wer trotzdem in die
 > AFK-Welt will, legt `/afk` in `onJoinCommands` oder als periodischen Befehl ab.
+>
+> **Update 1 – KeepAlive-Protokollpaket:** Neben den stationären Positionspaketen beantwortet
+> der Server ein eigenes **KeepAlive-Protokollpaket**; kommt die Antwort zu spät, folgt
+> `disconnect.timeout`. Bei Chat-Spam blockierte das synchrone Schreiben ins Terminal kurz den
+> Netzwerk-Thread und verzögerte genau diese Antwort. Jetzt wird das KeepAlive **selbst und mit
+> Vorrang** beantwortet (vor jeder Chat-Verarbeitung) und die **Terminal-Ausgabe läuft
+> asynchron**, sodass der Netzwerk-Thread frei bleibt.
+>
+> **Update 2 – aktiver Anti-AFK gegen serverseitige AFK-Kicks:** Ein *völlig* regungsloser
+> Spieler (immer exakt gleiche Position/Blickrichtung) wird von manchen Netzwerken trotz
+> KeepAlive als „AFK" gewertet und mit einer Timeout-Meldung getrennt. Der Client sendet daher
+> jetzt in größeren Abständen **subtile, anticheat-sichere Aktivität** – ein leichtes Umsehen
+> (pendelnde Yaw/Pitch) und gelegentlich einen Arm-Schwung, **ohne den Spieler von der Stelle
+> zu bewegen** (`antiAfkEnabled`, Standard alle `20s`). Zusätzlich nennt die Trennungsmeldung
+> jetzt **„letztes Server-Paket vor Xs"**: war die Verbindung gesund (kleiner Wert), war es ein
+> aktiver AFK-/Anticheat-Kick; war sie lange still, ist die Verbindung weggebrochen (Netz/Proxy).
+> Ein **Watchdog** (Standard 60s ohne Server-Paket) baut „halb tote" Verbindungen ohnehin neu auf.
 
 Gebaut mit **Java 21 + [MCProtocolLib](https://github.com/GeyserMC/MCProtocolLib)** (GeyserMC)
 und **[MinecraftAuth](https://github.com/RaphiMC/MinecraftAuth)** (RaphiMC). Diese Bibliotheken
@@ -47,8 +64,8 @@ node-minecraft-protocol oft scheitern.
 - **Verbindungs-Watchdog** (`inboundSilenceTimeoutSeconds`) und **geplanter Neustart**
   (`scheduledRestartMinutes`) halten die Session frisch.
 - **Aktion bei niedrigem Leben** (`lowHealthCommands`, z. B. `/warp spawn`).
-- **Laufzeit-Statistik** (`:stats`): Verbindungen, Kicks, Reconnects, Tode, TPAs, Trigger,
-  Chat-Zeilen, letzte Trennungsursache.
+- **Laufzeit-Statistik** (`:stats`): Verbindungen, beantwortete Keep-Alives, Kicks, Reconnects,
+  Tode, TPAs, Trigger, Chat-Zeilen, letzte Trennungsursache.
 - **Chat-Historie** (`:history`), **Koordinaten** (`:pos`), **Bildschirm leeren** (`:clear`).
 - **Asynchrones Chat-Log** mit Größenrotation (entlastet den Netzwerk-Thread).
 - **Spielerliste** (`:players`) und **Status** (`:status`: Leben, Hunger, Ping, Online-Zahl).
@@ -61,9 +78,18 @@ node-minecraft-protocol oft scheitern.
 
 ## „Nie gekickt werden" – eingebaute Schutzmechanismen
 
-Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick führt:
+Der Client antwortet auf **genau dieselben Pakete wie ein echter Vanilla-Client** – jedes
+Paket, dessen Ignorieren sonst zum Kick führt, wird korrekt beantwortet:
 
-- **KeepAlive / Ping** – automatisch beantwortet (kein „Timed out").
+- **KeepAlive** – wird **selbst und mit Vorrang** beantwortet: die Antwort geht raus,
+  _bevor_ eingehender (ggf. spammender) Chat verarbeitet wird, sodass sie nie zu spät kommt
+  (kein „Timed out" / `disconnect.timeout`). Die gesamte Terminal-Ausgabe läuft dafür
+  **asynchron** über einen eigenen Thread und blockiert den Netzwerk-Thread nicht mehr.
+- **Ping → Pong** – der In-Game-Ping (von Proxys/Anticheats genutzt) wird sofort beantwortet,
+  genau wie es ein echter Vanilla-Client tut.
+- **Spieleinstellungen** – beim Beitritt wird `ClientInformation` (Sprache, Render-Distanz,
+  Skin-Teile, Haupthand …) gesendet, wie ein echter Client; Server/Anticheats, die das
+  erwarten, sehen einen vollständig „geladenen" Spieler.
 - **Resource-Pack** – bestätigt, auch wenn es erzwungen wird.
 - **Teleport** – wird bestätigt (kein Rubber-Banding / „moved wrongly").
 - **Chat-Acknowledgement** – empfangene Nachrichten werden quittiert (kein
@@ -78,12 +104,17 @@ Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick fü
   Koordinaten, keine Bewegung). Das verhindert `disconnect.timeout`, ohne den Spieler zu
   bewegen, und wird nicht als „Bewegungs-Bot" erkannt. `/afk` hingegen schützt **nicht** vor
   Kicks (nur Teleport in die AFK-Welt).
+- **Aktiver Anti-AFK** (`antiAfkEnabled`, Standard an) – gegen Netzwerke, die einen regungslosen
+  Spieler trotz Keep-Alive als „AFK" werten: subtiles Umsehen (pendelnde Yaw/Pitch) + gelegentlicher
+  Arm-Schwung, alle `antiAfkIntervalSeconds` (Std. 20s). Bewegt den Spieler **nicht** von der
+  Stelle und ist anticheat-sicher. Abschaltbar mit `:set antiafk off`.
 - **Befehle nach Kick** – kommt es doch zu einem Kick, läuft nach dem erneuten Beitritt
   automatisch `onKickCommands` (z. B. wieder `/afk`).
 - **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
   „throttled/already logged in" wird länger gewartet.
 - **Verbindungs-Watchdog** – kommt `inboundSilenceTimeoutSeconds` lang kein Paket vom
-  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (0 = aus).
+  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (Standard 60s, 0 = aus).
+  Hilft gegen stilles Einfrieren / `disconnect.endOfStream`, das sonst nie als Trennung ankommt.
 - **Geplanter Neustart** – `scheduledRestartMinutes` baut die Verbindung regelmäßig neu
   auf, um Session-Verfall vorzubeugen (0 = aus).
 - **Ban/Whitelist-Erkennung** – enthält die Trennungsursache z. B. „banned"/„whitelist"
@@ -184,6 +215,7 @@ Liegt unter `~/.config/hugoafk/`:
   | --- | --- |
   | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers`, `dontReconnectOnReasons`, `scheduledRestartMinutes`, `inboundSilenceTimeoutSeconds` |
   | Keep-Alive | `keepAliveEnabled`, `keepAliveIntervalMs` (Std. 1000) |
+  | Anti-AFK | `antiAfkEnabled` (Std. an), `antiAfkIntervalSeconds` (Std. 20), `antiAfkYawDegrees` (Std. 12), `antiAfkSwing` |
   | Ereignis-Befehle | `onJoinCommands`, `onJoinDelaySeconds`, `onKickCommands`, `onKickDelaySeconds`, `onDeathCommands` |
   | Periodisch / Trigger | `periodicCommands` (`{enabled, command, intervalSeconds}`), `triggers` (`{enabled, contains, response, cooldownSeconds}`) |
   | Auto-TPA | `autoAcceptTpa`, `autoAcceptTpaWhitelist`, `tpaAcceptCommand`, `tpaRequestMarker` |

@@ -463,6 +463,8 @@ public class Main {
                 case "belldisconnect" -> config.bellOnDisconnect = parseBool(value);
                 case "highlightname" -> config.highlightUsername = parseBool(value);
                 case "keepalive" -> config.keepAliveEnabled = parseBool(value);
+                case "antiafk" -> config.antiAfkEnabled = parseBool(value);
+                case "antiafkswing" -> config.antiAfkSwing = parseBool(value);
                 case "lowhealth" -> config.lowHealthActionEnabled = parseBool(value);
                 case "collapse" -> config.collapseDuplicates = parseBool(value);
                 case "color" -> {
@@ -475,6 +477,8 @@ public class Main {
                 case "maxbackoff" -> config.maxBackoffSeconds = Math.max(1, Integer.parseInt(value));
                 case "jitter" -> config.reconnectJitterMs = Math.max(0, Integer.parseInt(value));
                 case "keepaliveinterval" -> config.keepAliveIntervalMs = Math.max(500, Integer.parseInt(value));
+                case "antiafkinterval" -> config.antiAfkIntervalSeconds = Math.max(5, Integer.parseInt(value));
+                case "antiafkyaw" -> config.antiAfkYawDegrees = Math.max(0, Math.min(45, Double.parseDouble(value)));
                 case "joindelay" -> config.onJoinDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "kickdelay" -> config.onKickDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "replycooldown" -> config.autoReplyCooldownSeconds = Math.max(0, Integer.parseInt(value));
@@ -513,6 +517,9 @@ public class Main {
         console.info("  fallbackServers:  " + config.fallbackServers.size());
         console.info("  keepalive:        " + config.keepAliveEnabled
                 + "  keepaliveinterval=" + config.keepAliveIntervalMs + "ms");
+        console.info("  antiafk:          " + config.antiAfkEnabled
+                + "  antiafkinterval=" + config.antiAfkIntervalSeconds + "s"
+                + "  antiafkyaw=" + config.antiAfkYawDegrees + "  antiafkswing=" + config.antiAfkSwing);
         console.info("  onJoin/onKick:    " + config.onJoinCommands.size() + " / " + config.onKickCommands.size());
         console.info("  onDeath:          " + config.onDeathCommands.size());
         console.info("  respawn:          " + config.autoRespawn);
