@@ -17,7 +17,10 @@ public class HugoCompleter implements Completer {
     private static final List<String> COMMANDS = List.of(
             ":help", ":status", ":stats", ":config", ":players", ":list", ":server",
             ":reconnect", ":keepalive", ":tpa", ":reply", ":filter", ":mute", ":periodic",
-            ":join", ":kickcmd", ":death", ":hide", ":highlight", ":set", ":quit", ":exit");
+            ":trigger", ":alias", ":in", ":ignore", ":showonly", ":norecon",
+            ":join", ":kickcmd", ":death", ":hide", ":highlight",
+            ":history", ":pos", ":coords", ":clear", ":cls", ":reload", ":save",
+            ":set", ":quit", ":exit");
 
     private final Supplier<Collection<String>> playerNames;
 

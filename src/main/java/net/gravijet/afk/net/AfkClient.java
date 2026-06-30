@@ -105,6 +105,10 @@ public class AfkClient {
     private final Map<String, Long> periodicLastRun = new ConcurrentHashMap<>();
     /** Letzte Auto-Antwort je Spieler (fuer den Cooldown). */
     private final Map<String, Long> lastAutoReply = new ConcurrentHashMap<>();
+    /** Letzte Ausloesung je Auto-Responder-Regel (Schluessel = Ausloeser-Text). */
+    private final Map<String, Long> lastTrigger = new ConcurrentHashMap<>();
+    /** Ringpuffer der zuletzt empfangenen Chat-Zeilen (fuer :history). */
+    private final java.util.ArrayDeque<String> history = new java.util.ArrayDeque<>();
 
     // Statistik
     private final AtomicLong statKicks = new AtomicLong();
@@ -112,6 +116,8 @@ public class AfkClient {
     private final AtomicLong statDeaths = new AtomicLong();
     private final AtomicLong statChatLines = new AtomicLong();
     private final AtomicLong statTpaAccepted = new AtomicLong();
+    private final AtomicLong statTriggers = new AtomicLong();
+    private final AtomicLong statConnects = new AtomicLong();
     private final long startedAt = System.currentTimeMillis();
 
     private volatile ClientSession session;
@@ -123,8 +129,12 @@ public class AfkClient {
     private volatile int fallbackIndex = 0;
     private volatile long connectedAt = 0;
     private volatile long lastKeepAlive = 0;
+    private volatile long lastInbound = 0;
+    private volatile long lastRestart = 0;
     private volatile String lastTpaSender = "";
     private volatile long lastTpaAt = 0;
+    private volatile String lastDisconnectReason = "-";
+    private volatile String lastDuplicate = "";
     /** Klein-geschriebener Eigenname (einmal zwischengespeichert, spart Allokationen je Chat-Zeile). */
     private volatile String usernameLower = "";
 
@@ -364,6 +374,25 @@ public class AfkClient {
             current.send(new ServerboundMovePlayerPosRotPacket(true, false, posX, posY, posZ, yaw, pitch));
         }
 
+        // Watchdog: Kommt laenger kein Paket vom Server, ist die Verbindung evtl. "halb tot".
+        if (config.inboundSilenceTimeoutSeconds > 0 && lastInbound > 0
+                && now - lastInbound >= config.inboundSilenceTimeoutSeconds * 1000L) {
+            console.error("Keine Server-Pakete seit " + config.inboundSilenceTimeoutSeconds
+                    + "s - verbinde neu (Watchdog).");
+            lastInbound = now;
+            reconnectNow();
+            return;
+        }
+
+        // Geplanter Neustart der Verbindung (haelt die Session frisch).
+        if (config.scheduledRestartMinutes > 0
+                && now - lastRestart >= config.scheduledRestartMinutes * 60_000L) {
+            lastRestart = now;
+            console.info("Geplanter Neustart der Verbindung (" + config.scheduledRestartMinutes + " min).");
+            reconnectNow();
+            return;
+        }
+
         // Frei konfigurierte periodische Befehle (z. B. regelmaessig "/afk").
         List<Config.PeriodicCommand> commands = config.periodicCommands;
         for (int i = 0, n = commands.size(); i < n; i++) {
@@ -393,11 +422,19 @@ public class AfkClient {
     // ===================== Anzeige & Auto-Aktionen =====================
 
     private void displayChat(Component component) {
+        displayChat(component, null);
+    }
+
+    /**
+     * @param senderName bei Spieler-Chat der Absendername (fuer die Ignorierliste), sonst null.
+     */
+    private void displayChat(Component component, String senderName) {
         String plainText = plain.serialize(component);
         statChatLines.incrementAndGet();
         if (config.logChat) {
             chatLog.append(plainText);
         }
+        addToHistory(plainText);
 
         // Auto-Aktionen laufen immer - auch wenn die Zeile gleich ausgeblendet wird.
         handleAutoActions(plainText);
@@ -405,27 +442,91 @@ public class AfkClient {
         String lower = plainText.toLowerCase();
         boolean highlight = matchesHighlight(lower);
 
-        // Stummschaltung / Spam-Filter (Highlights werden nie ausgeblendet).
+        // Stummschaltung / Filter / Ignorierliste (Highlights werden nie ausgeblendet).
         if (!highlight) {
             if (config.muteChat) {
+                return;
+            }
+            if (isIgnored(senderName)) {
                 return;
             }
             if (config.chatFilterEnabled && matchesHideFilter(plainText, lower)) {
                 return;
             }
+            if (!config.chatShowOnly.isEmpty() && !matchesShowOnly(lower)) {
+                return;
+            }
+            if (config.collapseDuplicates && plainText.equals(lastDuplicate)) {
+                return;
+            }
         }
+        lastDuplicate = plainText;
 
+        boolean color = console.isColor() && config.colorOutput;
         String prefix = config.showTimestamps
-                ? Console.GRAY + "[" + LocalTime.now().format(TIME) + "] " + Console.RESET
+                ? (color ? Console.GRAY + "[" + LocalTime.now().format(TIME) + "] " + Console.RESET
+                         : "[" + LocalTime.now().format(TIME) + "] ")
                 : "";
-        String body = ansi.serialize(component);
+        String body = color ? ansi.serialize(component) : plainText;
         if (highlight) {
-            body = Console.HIGHLIGHT + body + Console.RESET;
+            if (color) {
+                body = Console.HIGHLIGHT + body + Console.RESET;
+            }
             if (config.bellOnHighlight) {
                 body = Console.BELL + body;
             }
         }
         console.printAbove(prefix + body);
+    }
+
+    private void addToHistory(String line) {
+        synchronized (history) {
+            history.addLast(line);
+            while (history.size() > config.chatHistorySize) {
+                history.removeFirst();
+            }
+        }
+    }
+
+    /** Gibt die letzten {@code count} Chat-Zeilen aus (auch ausgeblendete). */
+    public void printHistory(int count) {
+        List<String> snapshot;
+        synchronized (history) {
+            snapshot = new java.util.ArrayList<>(history);
+        }
+        int from = Math.max(0, snapshot.size() - Math.max(1, count));
+        if (snapshot.isEmpty()) {
+            console.info("Keine Chat-Historie vorhanden.");
+            return;
+        }
+        console.info("=== Letzte " + (snapshot.size() - from) + " Chat-Zeilen ===");
+        for (int i = from; i < snapshot.size(); i++) {
+            console.info("  " + snapshot.get(i));
+        }
+    }
+
+    private boolean isIgnored(String senderName) {
+        if (senderName == null || config.ignoredPlayers.isEmpty()) {
+            return false;
+        }
+        for (int i = 0, n = config.ignoredPlayers.size(); i < n; i++) {
+            String p = config.ignoredPlayers.get(i);
+            if (p != null && p.equalsIgnoreCase(senderName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesShowOnly(String lower) {
+        List<String> show = config.chatShowOnly;
+        for (int i = 0, n = show.size(); i < n; i++) {
+            String s = show.get(i);
+            if (s != null && !s.isBlank() && lower.contains(s.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void handleAutoActions(String text) {
@@ -460,6 +561,30 @@ public class AfkClient {
                     lastAutoReply.put(sender.toLowerCase(), now);
                     outgoing.add(config.autoReplyCommand + " " + sender + " " + config.autoReplyMessage);
                     console.info("Auto-Antwort an " + sender + " gesendet.");
+                }
+            }
+        }
+
+        // 3) Auto-Responder: Stichwort im Chat -> Antwort/Befehl senden.
+        List<Config.Trigger> triggers = config.triggers;
+        if (!triggers.isEmpty()) {
+            String lower = text.toLowerCase();
+            long now = System.currentTimeMillis();
+            for (int i = 0, n = triggers.size(); i < n; i++) {
+                Config.Trigger t = triggers.get(i);
+                if (t == null || !t.enabled || t.contains == null || t.contains.isBlank()
+                        || t.response == null || t.response.isBlank()) {
+                    continue;
+                }
+                if (!lower.contains(t.contains.toLowerCase())) {
+                    continue;
+                }
+                long last = lastTrigger.getOrDefault(t.contains, 0L);
+                if (now - last >= Math.max(0, t.cooldownSeconds) * 1000L) {
+                    lastTrigger.put(t.contains, now);
+                    outgoing.add(t.response);
+                    statTriggers.incrementAndGet();
+                    console.info("Auto-Responder: \"" + t.contains + "\" -> " + t.response);
                 }
             }
         }
@@ -541,19 +666,59 @@ public class AfkClient {
         console.info("  Auto-Antwort:   " + (config.autoReplyEnabled ? "an" : "aus"));
         console.info("  Chat-Filter:    " + (config.chatFilterEnabled ? "an (" + config.chatHideFilters.size() + " Regeln)" : "aus"));
         console.info("  Stumm:          " + (config.muteChat ? "ja" : "nein"));
+        console.info("  Ignoriert:      " + config.ignoredPlayers.size() + " Spieler");
+        console.info("  Trigger:        " + config.triggers.size());
+        if (config.scheduledRestartMinutes > 0) {
+            console.info("  Geplant. Restart: alle " + config.scheduledRestartMinutes + " min");
+        }
     }
 
     public void printStats() {
         long uptime = (System.currentTimeMillis() - startedAt) / 1000;
         long online = connectedAt > 0 && inGame ? (System.currentTimeMillis() - connectedAt) / 1000 : 0;
         console.info("=== Statistik ===");
-        console.info("  Laufzeit:        " + formatDuration(uptime));
-        console.info("  Aktuell online:  " + formatDuration(online));
-        console.info("  Reconnects:      " + statReconnects.get());
-        console.info("  Kicks/Trennungen:" + statKicks.get());
-        console.info("  Tode:            " + statDeaths.get());
-        console.info("  TPA angenommen:  " + statTpaAccepted.get());
-        console.info("  Chat-Zeilen:     " + statChatLines.get());
+        console.info("  Laufzeit:         " + formatDuration(uptime));
+        console.info("  Aktuell online:   " + formatDuration(online));
+        console.info("  Verbindungen:     " + statConnects.get());
+        console.info("  Reconnects:       " + statReconnects.get());
+        console.info("  Kicks/Trennungen: " + statKicks.get());
+        console.info("  Tode:             " + statDeaths.get());
+        console.info("  TPA angenommen:   " + statTpaAccepted.get());
+        console.info("  Trigger ausgel.:  " + statTriggers.get());
+        console.info("  Chat-Zeilen:      " + statChatLines.get());
+        console.info("  Letzte Ursache:   " + lastDisconnectReason);
+    }
+
+    /** Gibt die aktuellen Koordinaten aus. */
+    public void printPosition() {
+        if (!havePosition) {
+            console.info("Position noch unbekannt (warte auf Server-Teleport).");
+            return;
+        }
+        console.info(String.format("Position: X=%.1f  Y=%.1f  Z=%.1f  Yaw=%.1f  Pitch=%.1f",
+                posX, posY, posZ, yaw, pitch));
+    }
+
+    /** Plant einen einmaligen Befehl/Chat nach {@code seconds} Sekunden. */
+    public void scheduleOnce(int seconds, String input) {
+        if (input == null || input.isBlank()) {
+            return;
+        }
+        String trimmed = input.trim();
+        scheduler.schedule(() -> {
+            if (inGame && session != null && session.isConnected()) {
+                outgoing.add(trimmed);
+                console.info("Geplanter Befehl gesendet: " + trimmed);
+            } else {
+                console.error("Geplanter Befehl verworfen (nicht verbunden): " + trimmed);
+            }
+        }, Math.max(0, seconds), TimeUnit.SECONDS);
+        console.info("Geplant in " + Math.max(0, seconds) + "s: " + trimmed);
+    }
+
+    /** Uebernimmt die Farbeinstellung aus der Config in die Konsole. */
+    public void applyColorSetting() {
+        console.setColor(config.colorOutput);
     }
 
     private static String formatDuration(long seconds) {
@@ -589,6 +754,7 @@ public class AfkClient {
     private final class Listener extends SessionAdapter {
         @Override
         public void packetReceived(Session ignored, Packet packet) {
+            lastInbound = System.currentTimeMillis();
             if (packet instanceof ClientboundLoginPacket) {
                 onJoin();
             } else if (packet instanceof ClientboundSystemChatPacket chat) {
@@ -598,8 +764,9 @@ public class AfkClient {
                 Component content = chat.getUnsignedContent() != null
                         ? chat.getUnsignedContent()
                         : Component.text(chat.getContent());
+                String senderName = plain.serialize(chat.getName());
                 displayChat(Component.text("<").append(chat.getName())
-                        .append(Component.text("> ")).append(content));
+                        .append(Component.text("> ")).append(content), senderName);
                 maybeAcknowledge();
             } else if (packet instanceof ClientboundResourcePackPushPacket pack) {
                 // Resource-Pack NICHT laden, aber bestaetigen -> kein Kick bei erzwungenem Pack.
@@ -634,12 +801,34 @@ public class AfkClient {
             boolean wasKick = !intentionalDisconnect && !shuttingDown;
             if (wasKick) {
                 statKicks.incrementAndGet();
+                lastDisconnectReason = reasonPlain.isBlank() ? "unbekannt" : reasonPlain;
                 rejoinAfterKick = !config.onKickCommands.isEmpty();
             }
             String bell = config.bellOnDisconnect ? Console.BELL : "";
             console.error(bell + "Getrennt: " + reasonDisplay);
+
+            // Bei Bann/Whitelist o. Ae. NICHT endlos neu verbinden.
+            if (wasKick && matchesNoReconnect(reasonPlain)) {
+                console.error("Trennungsursache deutet auf Bann/Whitelist hin - kein Auto-Reconnect."
+                        + " Mit :reconnect kannst du es manuell erzwingen.");
+                return;
+            }
             scheduleReconnect(looksThrottled(reasonPlain) ? THROTTLE_MIN_DELAY : 0);
         }
+    }
+
+    private boolean matchesNoReconnect(String reasonPlain) {
+        if (reasonPlain == null || reasonPlain.isBlank()) {
+            return false;
+        }
+        String lower = reasonPlain.toLowerCase();
+        for (int i = 0, n = config.dontReconnectOnReasons.size(); i < n; i++) {
+            String r = config.dontReconnectOnReasons.get(i);
+            if (r != null && !r.isBlank() && lower.contains(r.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean looksThrottled(String reason) {
@@ -655,6 +844,9 @@ public class AfkClient {
         fallbackIndex = 0;
         connectedAt = System.currentTimeMillis();
         lastKeepAlive = connectedAt;
+        lastInbound = connectedAt;
+        lastRestart = connectedAt;
+        statConnects.incrementAndGet();
         unacknowledged.set(0);
         outgoing.clear();
         wasDead = false;

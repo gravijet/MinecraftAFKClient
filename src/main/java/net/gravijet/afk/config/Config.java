@@ -42,6 +42,19 @@ public class Config {
      * nicht erreichbar ist. Format: "host" oder "host:port".
      */
     public List<String> fallbackServers = new ArrayList<>();
+    /**
+     * Enthaelt die Trennungsursache einen dieser Texte, wird NICHT automatisch neu
+     * verbunden (z. B. Bann/Whitelist) - verhindert sinnloses Dauer-Reconnecten.
+     */
+    public List<String> dontReconnectOnReasons = new ArrayList<>(List.of(
+            "banned", "gebannt", "verbannt", "whitelist", "blacklist", "ban"));
+    /** Geplanter Neustart der Verbindung alle N Minuten (0 = aus). Haelt Sessions frisch. */
+    public int scheduledRestartMinutes = 0;
+    /**
+     * Kommt N Sekunden lang KEIN Paket vom Server, proaktiv neu verbinden
+     * (Watchdog gegen "halb tote" Verbindungen; 0 = aus).
+     */
+    public int inboundSilenceTimeoutSeconds = 0;
 
     // =====================================================================
     // Keep-Alive (echter Timeout-Schutz - ersetzt den alten Bewegungs-Anti-AFK)
@@ -124,6 +137,41 @@ public class Config {
             "/rtpqueue beitreten"));
     /** Komplett stummschalten (kein eingehender Chat wird angezeigt). */
     public boolean muteChat = false;
+    /**
+     * Wenn nicht leer: NUR Chat-Zeilen anzeigen, die einen dieser Texte enthalten
+     * (Whitelist-Modus). Highlights werden immer angezeigt.
+     */
+    public List<String> chatShowOnly = new ArrayList<>();
+    /** Spieler, deren Nachrichten ausgeblendet werden (Ignorierliste). */
+    public List<String> ignoredPlayers = new ArrayList<>();
+    /** Identische Folgezeilen unterdruecken (Anti-Wiederholungs-Spam). */
+    public boolean collapseDuplicates = false;
+
+    // =====================================================================
+    // Auto-Responder (Stichwort -> Antwort)
+    // =====================================================================
+    /** Regeln: enthaelt der Chat einen Ausloeser, wird automatisch geantwortet. */
+    public List<Trigger> triggers = new ArrayList<>();
+
+    /** Eine Auto-Responder-Regel. */
+    public static class Trigger {
+        public boolean enabled = true;
+        /** Ausloeser-Text (Teilstring, case-insensitiv). */
+        public String contains = "";
+        /** Antwort/Befehl, der gesendet wird (z. B. "Hallo!" oder "/spawn"). */
+        public String response = "";
+        /** Mindestabstand zwischen zwei Ausloesungen derselben Regel (Sekunden). */
+        public int cooldownSeconds = 30;
+
+        public Trigger() {
+        }
+
+        public Trigger(String contains, String response, int cooldownSeconds) {
+            this.contains = contains;
+            this.response = response;
+            this.cooldownSeconds = cooldownSeconds;
+        }
+    }
 
     // =====================================================================
     // Gesundheit
@@ -145,6 +193,18 @@ public class Config {
     public boolean announcePlayerJoinLeave = false;
     /** Bei Verbinden/Trennen die Terminal-Glocke laeuten. */
     public boolean bellOnDisconnect = false;
+    /** Farbige Ausgabe (ANSI). Bei false werden Farbcodes weggelassen. */
+    public boolean colorOutput = true;
+    /** Anzahl zuletzt gepufferter Chat-Zeilen fuer :history. */
+    public int chatHistorySize = 100;
+    /** Maximale Groesse der Chat-Logdatei in Bytes vor Rotation. */
+    public long maxLogBytes = 5_000_000L;
+
+    // =====================================================================
+    // Befehls-Aliase (z. B. "h" -> "/home", Eingabe ":h")
+    // =====================================================================
+    /** Eigene Kurzbefehle: Alias -> auszufuehrende Eingabe (Chat oder /Befehl). */
+    public java.util.Map<String, String> commandAliases = new java.util.LinkedHashMap<>();
 
     // =====================================================================
     // Rate-Limit (gegen Spam-Kick)
@@ -186,6 +246,11 @@ public class Config {
         if (chatHideFilters == null) chatHideFilters = new ArrayList<>();
         if (periodicCommands == null) periodicCommands = new ArrayList<>();
         if (lowHealthCommands == null) lowHealthCommands = new ArrayList<>();
+        if (chatShowOnly == null) chatShowOnly = new ArrayList<>();
+        if (ignoredPlayers == null) ignoredPlayers = new ArrayList<>();
+        if (triggers == null) triggers = new ArrayList<>();
+        if (dontReconnectOnReasons == null) dontReconnectOnReasons = new ArrayList<>();
+        if (commandAliases == null) commandAliases = new java.util.LinkedHashMap<>();
         if (tpaAcceptCommand == null || tpaAcceptCommand.isBlank()) tpaAcceptCommand = "/tpaccept";
         if (tpaRequestMarker == null) tpaRequestMarker = "Teleportations-Anfrage";
         if (autoReplyCommand == null || autoReplyCommand.isBlank()) autoReplyCommand = "/msg";
@@ -194,6 +259,37 @@ public class Config {
         if (keepAliveIntervalMs < 500) keepAliveIntervalMs = 500;
         if (chatMinDelayMs < 200) chatMinDelayMs = 200;
         if (maxBackoffSeconds < 1) maxBackoffSeconds = 1;
+        if (chatHistorySize < 10) chatHistorySize = 10;
+        if (maxLogBytes < 100_000L) maxLogBytes = 100_000L;
+    }
+
+    /**
+     * Liest die Konfigurationsdatei neu ein und uebernimmt alle Werte in dieses Objekt.
+     * Bestehende Referenzen auf das Config-Objekt bleiben damit gueltig (fuer :reload).
+     */
+    public synchronized boolean reload() {
+        if (file == null || !Files.exists(file)) {
+            return false;
+        }
+        try {
+            Config fresh = GSON.fromJson(Files.readString(file), Config.class);
+            if (fresh == null) {
+                return false;
+            }
+            fresh.normalize();
+            for (java.lang.reflect.Field f : Config.class.getDeclaredFields()) {
+                int mod = f.getModifiers();
+                if (java.lang.reflect.Modifier.isStatic(mod)
+                        || java.lang.reflect.Modifier.isTransient(mod)) {
+                    continue;
+                }
+                f.setAccessible(true);
+                f.set(this, f.get(fresh));
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public void save() {

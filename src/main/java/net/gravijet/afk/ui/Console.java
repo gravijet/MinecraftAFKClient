@@ -28,6 +28,7 @@ public class Console {
     private final Terminal terminal;
     private final LineReader reader;
     private volatile Supplier<Collection<String>> playerNames = List::of;
+    private volatile boolean color = true;
 
     public Console() throws IOException {
         this.terminal = TerminalBuilder.builder().system(true).build();
@@ -42,17 +43,34 @@ public class Console {
         this.playerNames = supplier != null ? supplier : List::of;
     }
 
+    /** Schaltet farbige Ausgabe an/aus. */
+    public void setColor(boolean enabled) {
+        this.color = enabled;
+    }
+
+    public boolean isColor() {
+        return color;
+    }
+
     /** Gibt eine Zeile oberhalb der Eingabezeile aus (klobbert die Eingabe nicht). */
     public void printAbove(String text) {
         reader.printAbove(text);
     }
 
     public void info(String text) {
-        printAbove(GRAY + text + RESET);
+        printAbove(color ? GRAY + text + RESET : text);
     }
 
     public void error(String text) {
-        printAbove(RED + text + RESET);
+        printAbove(color ? RED + text + RESET : text);
+    }
+
+    /** Leert den Bildschirm. */
+    public void clearScreen() {
+        try {
+            reader.printAbove("[2J[H");
+        } catch (Exception ignored) {
+        }
     }
 
     /** Liest eine Zeile. Gibt {@code null} bei EOF/Ctrl-D oder Ctrl-C zurueck. */

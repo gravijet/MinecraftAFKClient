@@ -37,15 +37,25 @@ node-minecraft-protocol oft scheitern.
   (z. B. wieder `/afk`), läuft nach erneutem Beitritt automatisch.
 - **Auto-TPA**: eingehende Teleport-Anfragen automatisch annehmen (optional mit Whitelist).
 - **Auto-Antwort** auf private Nachrichten (mit Cooldown pro Spieler).
-- **Chat-Spam-Filter**: nervige Broadcasts (RTP-Suche etc.) ausblenden; `:mute` blendet alles aus.
-- **Periodische eigene Befehle** (`periodicCommands`) mit jeweils eigenem Intervall.
+- **Auto-Responder** (`:trigger`): bei Stichwort im Chat automatisch antworten/Befehl senden.
+- **Chat-Spam-Filter**: nervige Broadcasts (RTP-Suche etc.) ausblenden; dazu **Nur-Anzeigen-
+  Modus** (`:showonly`), **Ignorierliste** (`:ignore`), **Duplikat-Unterdrückung** und `:mute`.
+- **Periodische eigene Befehle** (`:periodic`) und **einmalige verzögerte Befehle** (`:in`).
+- **Befehls-Aliase** (`:alias`): Kurzbefehle wie `:h` → `/home`.
+- **Ban/Whitelist-Erkennung**: kein sinnloses Dauer-Reconnecten bei Bann
+  (`dontReconnectOnReasons`).
+- **Verbindungs-Watchdog** (`inboundSilenceTimeoutSeconds`) und **geplanter Neustart**
+  (`scheduledRestartMinutes`) halten die Session frisch.
 - **Aktion bei niedrigem Leben** (`lowHealthCommands`, z. B. `/warp spawn`).
-- **Laufzeit-Statistik** (`:stats`): Kicks, Reconnects, Tode, angenommene TPAs, Chat-Zeilen.
+- **Laufzeit-Statistik** (`:stats`): Verbindungen, Kicks, Reconnects, Tode, TPAs, Trigger,
+  Chat-Zeilen, letzte Trennungsursache.
+- **Chat-Historie** (`:history`), **Koordinaten** (`:pos`), **Bildschirm leeren** (`:clear`).
+- **Asynchrones Chat-Log** mit Größenrotation (entlastet den Netzwerk-Thread).
 - **Spielerliste** (`:players`) und **Status** (`:status`: Leben, Hunger, Ping, Online-Zahl).
 - **Highlight + Glocke**, wenn dein Name oder ein Stichwort im Chat fällt.
-- **Chat-Log** in `~/.config/hugoafk/chat.log`.
 - **Serverwechsel zur Laufzeit** (`:server <ip>`), CLI-Optionen, sauberes Beenden (Ctrl-C).
-- **Laufzeit-Konfiguration** über `:set`, `:config` und Listenbefehle (`:join`, `:hide`, …).
+- **Laufzeit-Konfiguration** über `:set`, `:config`, `:reload`/`:save` und Listenbefehle.
+- **Farbe abschaltbar** (`colorOutput` / `:set color off`) für Logfiles/Pipes.
 - **Tab-Vervollständigung** für `:`-Befehle und Online-Spielernamen.
 - **Auto-Beitrittsbefehle** (z. B. `/login`, `/register`) nach dem Spawn.
 
@@ -72,6 +82,12 @@ Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick fü
   automatisch `onKickCommands` (z. B. wieder `/afk`).
 - **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
   „throttled/already logged in" wird länger gewartet.
+- **Verbindungs-Watchdog** – kommt `inboundSilenceTimeoutSeconds` lang kein Paket vom
+  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (0 = aus).
+- **Geplanter Neustart** – `scheduledRestartMinutes` baut die Verbindung regelmäßig neu
+  auf, um Session-Verfall vorzubeugen (0 = aus).
+- **Ban/Whitelist-Erkennung** – enthält die Trennungsursache z. B. „banned"/„whitelist"
+  (`dontReconnectOnReasons`), wird **nicht** endlos neu verbunden; `:reconnect` erzwingt es.
 
 > Hinweis: Manuelle Kicks (Ban, Whitelist, Server voll) oder erzwungener **signierter
 > Chat** (`enforce-secure-profile=true`) lassen sich client-seitig nicht umgehen.
@@ -145,8 +161,16 @@ java -jar hugoafkclient.jar [optionen] [host[:port]]
   - `:reply on|off` / `:reply msg <text>` – Auto-Antwort auf private Nachrichten
   - `:filter on|off` – Chat-Spam-Filter; `:mute on|off` – gesamten Chat aus/ein
   - `:periodic add <sek> <cmd>` – periodischen Befehl (z. B. `/afk`) hinzufügen
+  - `:in <sek> <cmd>` – Befehl/Chat einmalig verzögert senden
+  - `:trigger add <auslöser> | <antwort>` – Auto-Responder (Stichwort → Antwort/Befehl)
+  - `:alias add <name> <cmd>` – Kurzbefehl, danach z. B. `:h` → `/home`
+  - `:ignore add|remove|list` – Spieler im Chat ausblenden
+  - `:showonly add|…` – nur Zeilen mit diesen Texten anzeigen (Whitelist-Modus)
+  - `:norecon add|…` – Trennungsgründe, bei denen NICHT neu verbunden wird
   - `:join` / `:kickcmd` / `:death` – Befehlslisten pflegen (`add|remove|clear|list`)
   - `:hide` / `:highlight` – Filter- bzw. Highlight-Wörter pflegen
+  - `:history [n]` – letzte n Chat-Zeilen · `:pos` – Koordinaten · `:clear` – Bildschirm leeren
+  - `:reload` / `:save` – Konfiguration neu laden / speichern
   - `:set <key> <wert>` – Einzelwert zur Laufzeit ändern (Keys siehe `:config`)
   - `:quit` – beenden
 
@@ -158,22 +182,26 @@ Liegt unter `~/.config/hugoafk/`:
 
   | Bereich | Felder |
   | --- | --- |
-  | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers` |
+  | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers`, `dontReconnectOnReasons`, `scheduledRestartMinutes`, `inboundSilenceTimeoutSeconds` |
   | Keep-Alive | `keepAliveEnabled`, `keepAliveIntervalMs` (Std. 1000) |
   | Ereignis-Befehle | `onJoinCommands`, `onJoinDelaySeconds`, `onKickCommands`, `onKickDelaySeconds`, `onDeathCommands` |
+  | Periodisch / Trigger | `periodicCommands` (`{enabled, command, intervalSeconds}`), `triggers` (`{enabled, contains, response, cooldownSeconds}`) |
   | Auto-TPA | `autoAcceptTpa`, `autoAcceptTpaWhitelist`, `tpaAcceptCommand`, `tpaRequestMarker` |
   | Auto-Antwort | `autoReplyEnabled`, `autoReplyMessage`, `autoReplyCommand`, `privateMessageMarker`, `autoReplyCooldownSeconds` |
-  | Chat-Filter | `chatFilterEnabled`, `chatHideFilters`, `muteChat` |
-  | Periodisch | `periodicCommands` (Liste aus `{enabled, command, intervalSeconds}`) |
+  | Chat-Filter | `chatFilterEnabled`, `chatHideFilters`, `chatShowOnly`, `ignoredPlayers`, `collapseDuplicates`, `muteChat` |
+  | Aliase | `commandAliases` (Map `name` → Befehl/Text) |
   | Gesundheit | `autoRespawn`, `lowHealthActionEnabled`, `lowHealthThreshold`, `lowHealthCommands` |
-  | Anzeige | `showTimestamps`, `logChat`, `highlightUsername`, `highlightKeywords`, `bellOnHighlight`, `bellOnDisconnect`, `announcePlayerJoinLeave` |
+  | Anzeige | `showTimestamps`, `logChat`, `colorOutput`, `chatHistorySize`, `maxLogBytes`, `highlightUsername`, `highlightKeywords`, `bellOnHighlight`, `bellOnDisconnect`, `announcePlayerJoinLeave` |
   | Spam-Schutz | `chatMinDelayMs` |
 
   Beispiel `onJoinCommands`: `["/login meinPasswort"]` ·
   Beispiel `onKickCommands`: `["/afk"]` ·
-  Beispiel `periodicCommands`: `[{"enabled":true,"command":"/hub","intervalSeconds":600}]`
+  Beispiel `periodicCommands`: `[{"enabled":true,"command":"/hub","intervalSeconds":600}]` ·
+  Beispiel `triggers`: `[{"enabled":true,"contains":"hilfe?","response":"/spawn","cooldownSeconds":30}]` ·
+  Beispiel `commandAliases`: `{"h":"/home","s":"/spawn"}`
 - `auth.json` – zwischengespeicherte Anmeldung (enthält Tokens; nicht weitergeben).
-- `chat.log` – mitgeschriebener Chat (abschaltbar via `logChat` in `config.json`).
+- `chat.log` – mitgeschriebener Chat, asynchron geschrieben und bei `maxLogBytes`
+  rotiert (`chat.log.1`); abschaltbar via `logChat`.
 
 ## Minecraft-Version anpassen
 
