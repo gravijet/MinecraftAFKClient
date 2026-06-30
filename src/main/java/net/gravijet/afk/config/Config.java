@@ -1,4 +1,4 @@
-package com.hugoafk.config;
+package net.gravijet.afk.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -14,9 +14,12 @@ import java.util.List;
  * Merkt sich Server- und Verhaltenseinstellungen. Alle Felder haben sinnvolle
  * Standardwerte, sodass eine fehlende oder unvollstaendige Datei nie zum Absturz fuehrt.
  *
- * <p>Wichtig: Der frueher vorhandene bewegungsbasierte Anti-AFK (Drehen/Swing) wurde
- * bewusst entfernt. Auf vielen Servern (auch HugoSMP) ist ein periodischer Befehl wie
- * {@code /afk} der zuverlaessige Weg gegen den AFK-/Timeout-Kick - siehe {@link #antiKickCommand}.
+ * <p><b>Wichtig zum Timeout-Kick:</b> Der frueher vorhandene bewegungsbasierte Anti-AFK
+ * (Drehen/Swing) wurde entfernt. Gegen den {@code disconnect.timeout} hilft NICHT der
+ * {@code /afk}-Befehl (der teleportiert nur in die AFK-Welt), sondern ein echter
+ * Verbindungs-Keep-Alive: ein periodisches, <em>stationaeres</em> Positionspaket (gleiche
+ * Koordinaten) - genau das, was ein stehender Vanilla-Client sendet. Siehe
+ * {@link #keepAliveEnabled} / {@link #keepAliveIntervalMs}.
  */
 public class Config {
 
@@ -41,24 +44,21 @@ public class Config {
     public List<String> fallbackServers = new ArrayList<>();
 
     // =====================================================================
-    // Anti-Kick (befehlsbasiert - ersetzt den alten Bewegungs-Anti-AFK)
+    // Keep-Alive (echter Timeout-Schutz - ersetzt den alten Bewegungs-Anti-AFK)
     // =====================================================================
-    /** Sendet periodisch {@link #antiKickCommand}, um nicht wegen AFK/Timeout gekickt zu werden. */
-    public boolean antiKickEnabled = true;
-    /** Befehl, der periodisch gesendet wird (z. B. "/afk"). Leer = nur Keep-Alive-Pakete. */
-    public String antiKickCommand = "/afk";
-    /** Intervall fuer den Anti-Kick-Befehl in Sekunden. */
-    public int antiKickIntervalSeconds = 120;
     /**
-     * Wenn true, wird {@link #antiKickCommand} zweimal kurz hintereinander gesendet
-     * (an/aus-Toggle-Befehle wie "/afk" landen so wieder im Ausgangszustand).
+     * Sendet periodisch ein stationaeres Positionspaket (gleiche Koordinaten/Blickrichtung),
+     * damit der Server/Proxy die Verbindung nicht wegen Inaktivitaet trennt
+     * ({@code disconnect.timeout}). Bewegt den Spieler NICHT.
      */
-    public boolean antiKickToggle = false;
+    public boolean keepAliveEnabled = true;
+    /** Intervall des Keep-Alive-Positionspakets in Millisekunden (>= 500). */
+    public int keepAliveIntervalMs = 1000;
 
     // =====================================================================
     // Befehle bei Ereignissen
     // =====================================================================
-    /** Befehle direkt nach jedem erfolgreichen Beitritt (z. B. "/login pass"). */
+    /** Befehle direkt nach jedem erfolgreichen Beitritt (z. B. "/login pass", "/afk"). */
     public List<String> onJoinCommands = new ArrayList<>();
     public int onJoinDelaySeconds = 3;
     /**
@@ -69,6 +69,27 @@ public class Config {
     public int onKickDelaySeconds = 3;
     /** Befehle, die beim Tod (vor/nach Respawn) gesendet werden (z. B. "/warp spawn"). */
     public List<String> onDeathCommands = new ArrayList<>();
+
+    // =====================================================================
+    // Periodische Befehle (frei konfigurierbar, z. B. regelmaessig "/afk")
+    // =====================================================================
+    /** Liste eigener Wiederholbefehle, jeweils mit eigenem Intervall. */
+    public List<PeriodicCommand> periodicCommands = new ArrayList<>();
+
+    /** Ein periodisch gesendeter Befehl. */
+    public static class PeriodicCommand {
+        public boolean enabled = true;
+        public String command = "";
+        public int intervalSeconds = 300;
+
+        public PeriodicCommand() {
+        }
+
+        public PeriodicCommand(String command, int intervalSeconds) {
+            this.command = command;
+            this.intervalSeconds = intervalSeconds;
+        }
+    }
 
     // =====================================================================
     // Auto-TPA (Teleport-Anfragen automatisch annehmen)
@@ -105,31 +126,10 @@ public class Config {
     public boolean muteChat = false;
 
     // =====================================================================
-    // Periodische Befehle (frei konfigurierbar)
-    // =====================================================================
-    /** Liste eigener Wiederholbefehle, jeweils mit eigenem Intervall. */
-    public List<PeriodicCommand> periodicCommands = new ArrayList<>();
-
-    /** Ein periodisch gesendeter Befehl. */
-    public static class PeriodicCommand {
-        public boolean enabled = true;
-        public String command = "";
-        public int intervalSeconds = 300;
-
-        public PeriodicCommand() {
-        }
-
-        public PeriodicCommand(String command, int intervalSeconds) {
-            this.command = command;
-            this.intervalSeconds = intervalSeconds;
-        }
-    }
-
-    // =====================================================================
     // Gesundheit
     // =====================================================================
     public boolean autoRespawn = true;
-    /** Befehl bei niedrigem Leben (z. B. "/warp spawn" oder Item essen ueber Plugin). */
+    /** Befehl bei niedrigem Leben (z. B. "/warp spawn"). */
     public boolean lowHealthActionEnabled = false;
     public double lowHealthThreshold = 6.0;
     public List<String> lowHealthCommands = new ArrayList<>();
@@ -175,7 +175,7 @@ public class Config {
         return config;
     }
 
-    /** Sorgt dafuer, dass keine Liste null ist (aeltere/teilweise Dateien). */
+    /** Sorgt fuer gueltige Werte (aeltere/teilweise Dateien, null-Listen, Mindestwerte). */
     private void normalize() {
         if (highlightKeywords == null) highlightKeywords = new ArrayList<>();
         if (onJoinCommands == null) onJoinCommands = new ArrayList<>();
@@ -186,13 +186,12 @@ public class Config {
         if (chatHideFilters == null) chatHideFilters = new ArrayList<>();
         if (periodicCommands == null) periodicCommands = new ArrayList<>();
         if (lowHealthCommands == null) lowHealthCommands = new ArrayList<>();
-        if (antiKickCommand == null) antiKickCommand = "";
         if (tpaAcceptCommand == null || tpaAcceptCommand.isBlank()) tpaAcceptCommand = "/tpaccept";
         if (tpaRequestMarker == null) tpaRequestMarker = "Teleportations-Anfrage";
         if (autoReplyCommand == null || autoReplyCommand.isBlank()) autoReplyCommand = "/msg";
         if (privateMessageMarker == null) privateMessageMarker = "-> Du:";
         if (autoReplyMessage == null) autoReplyMessage = "";
-        if (antiKickIntervalSeconds < 5) antiKickIntervalSeconds = 5;
+        if (keepAliveIntervalMs < 500) keepAliveIntervalMs = 500;
         if (chatMinDelayMs < 200) chatMinDelayMs = 200;
         if (maxBackoffSeconds < 1) maxBackoffSeconds = 1;
     }

@@ -1,4 +1,4 @@
-package com.hugoafk.auth;
+package net.gravijet.afk.auth;
 
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;

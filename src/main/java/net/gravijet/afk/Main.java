@@ -1,10 +1,10 @@
-package com.hugoafk;
+package net.gravijet.afk;
 
-import com.hugoafk.auth.AuthManager;
-import com.hugoafk.config.Config;
-import com.hugoafk.net.AfkClient;
-import com.hugoafk.ui.Console;
-import com.hugoafk.util.ChatLog;
+import net.gravijet.afk.auth.AuthManager;
+import net.gravijet.afk.config.Config;
+import net.gravijet.afk.net.AfkClient;
+import net.gravijet.afk.ui.Console;
+import net.gravijet.afk.util.ChatLog;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -31,16 +31,11 @@ public class Main {
                     return;
                 }
                 case "--no-reconnect" -> config.autoReconnect = false;
-                case "--no-antikick", "--no-afk" -> config.antiKickEnabled = false;
-                case "--antikick-cmd" -> {
-                    if (i + 1 < args.length) {
-                        config.antiKickCommand = args[++i];
-                    }
-                }
-                case "--antikick-interval", "--afk" -> {
+                case "--no-keepalive", "--no-afk" -> config.keepAliveEnabled = false;
+                case "--keepalive-interval" -> {
                     if (i + 1 < args.length) {
                         try {
-                            config.antiKickIntervalSeconds = Math.max(5, Integer.parseInt(args[++i]));
+                            config.keepAliveIntervalMs = Math.max(500, Integer.parseInt(args[++i]));
                         } catch (NumberFormatException ignored) {
                         }
                     }
@@ -144,12 +139,13 @@ public class Main {
                     client.switchServer(h, holder[0]);
                 }
             }
-            // Anti-Kick: an/aus, Befehl und Intervall.
-            case "antikick", "afk" -> handleAntiKick(arg, console, client, config);
+            // Keep-Alive (Timeout-Schutz): an/aus und Intervall.
+            case "keepalive", "afk" -> handleKeepAlive(arg, console, client, config);
             case "tpa" -> client.setAutoTpa(!arg.equalsIgnoreCase("off"));
             case "reply" -> handleReply(arg, console, client, config);
             case "filter" -> client.setChatFilter(!arg.equalsIgnoreCase("off"));
             case "mute" -> client.setMute(!arg.equalsIgnoreCase("off"));
+            case "periodic" -> handlePeriodic(arg, console, config);
             // Listen pflegen.
             case "join" -> handleList(arg, console, config, config.onJoinCommands, "Beitrittsbefehle");
             case "kickcmd" -> handleList(arg, console, config, config.onKickCommands, "Nach-Kick-Befehle");
@@ -164,28 +160,77 @@ public class Main {
         return false;
     }
 
-    private static void handleAntiKick(String arg, Console console, AfkClient client, Config config) {
+    private static void handleKeepAlive(String arg, Console console, AfkClient client, Config config) {
         String[] sub = arg.split("\\s+", 2);
         String key = sub[0].toLowerCase();
         String value = sub.length > 1 ? sub[1].trim() : "";
         switch (key) {
-            case "", "on" -> client.setAntiKick(true);
-            case "off" -> client.setAntiKick(false);
-            case "cmd" -> {
-                config.antiKickCommand = value;
-                config.save();
-                console.info("Anti-Kick-Befehl ist jetzt: " + (value.isBlank() ? "(keiner)" : value));
-            }
+            case "", "on" -> client.setKeepAlive(true);
+            case "off" -> client.setKeepAlive(false);
             case "interval" -> {
                 try {
-                    config.antiKickIntervalSeconds = Math.max(5, Integer.parseInt(value));
+                    client.setKeepAliveInterval(Integer.parseInt(value));
+                } catch (NumberFormatException e) {
+                    console.error("Ungueltige Millisekundenzahl.");
+                }
+            }
+            default -> console.error("Nutzung: :keepalive on|off | :keepalive interval <ms>");
+        }
+    }
+
+    /** Pflegt periodische Befehle: add <sek> <befehl> | remove <nr> | clear | list. */
+    private static void handlePeriodic(String arg, Console console, Config config) {
+        String[] sub = arg.split("\\s+", 2);
+        String op = sub[0].toLowerCase();
+        String rest = sub.length > 1 ? sub[1].trim() : "";
+        switch (op) {
+            case "add" -> {
+                String[] p = rest.split("\\s+", 2);
+                if (p.length < 2 || p[1].isBlank()) {
+                    console.error("Nutzung: :periodic add <sekunden> <befehl>");
+                    return;
+                }
+                try {
+                    int interval = Math.max(5, Integer.parseInt(p[0]));
+                    config.periodicCommands.add(new Config.PeriodicCommand(p[1].trim(), interval));
                     config.save();
-                    console.info("Anti-Kick-Intervall ist jetzt " + config.antiKickIntervalSeconds + "s.");
+                    console.info("Periodischer Befehl hinzugefuegt: alle " + interval + "s -> " + p[1].trim());
                 } catch (NumberFormatException e) {
                     console.error("Ungueltige Sekundenzahl.");
                 }
             }
-            default -> console.error("Nutzung: :antikick on|off | :antikick cmd <befehl> | :antikick interval <sek>");
+            case "remove", "rm" -> {
+                try {
+                    int idx = Integer.parseInt(rest.trim()) - 1;
+                    if (idx >= 0 && idx < config.periodicCommands.size()) {
+                        Config.PeriodicCommand removed = config.periodicCommands.remove(idx);
+                        config.save();
+                        console.info("Entfernt: " + removed.command);
+                    } else {
+                        console.error("Ungueltige Nummer (siehe :periodic list).");
+                    }
+                } catch (NumberFormatException e) {
+                    console.error("Nutzung: :periodic remove <nr>");
+                }
+            }
+            case "clear" -> {
+                config.periodicCommands.clear();
+                config.save();
+                console.info("Periodische Befehle geleert.");
+            }
+            case "", "list" -> {
+                if (config.periodicCommands.isEmpty()) {
+                    console.info("Periodische Befehle: (leer)");
+                } else {
+                    console.info("Periodische Befehle (" + config.periodicCommands.size() + "):");
+                    for (int i = 0; i < config.periodicCommands.size(); i++) {
+                        Config.PeriodicCommand pc = config.periodicCommands.get(i);
+                        console.info("  " + (i + 1) + ". alle " + pc.intervalSeconds + "s -> "
+                                + pc.command + (pc.enabled ? "" : " (aus)"));
+                    }
+                }
+            }
+            default -> console.error("Nutzung: :periodic add <sek> <befehl> | remove <nr> | clear | list");
         }
     }
 
@@ -267,19 +312,18 @@ public class Main {
                 case "bellhighlight" -> config.bellOnHighlight = parseBool(value);
                 case "belldisconnect" -> config.bellOnDisconnect = parseBool(value);
                 case "highlightname" -> config.highlightUsername = parseBool(value);
-                case "antikicktoggle" -> config.antiKickToggle = parseBool(value);
+                case "keepalive" -> config.keepAliveEnabled = parseBool(value);
                 case "lowhealth" -> config.lowHealthActionEnabled = parseBool(value);
                 case "chatdelay" -> config.chatMinDelayMs = Math.max(200, Integer.parseInt(value));
                 case "reconnectdelay" -> config.reconnectDelaySeconds = Math.max(1, Integer.parseInt(value));
                 case "maxattempts" -> config.maxReconnectAttempts = Math.max(0, Integer.parseInt(value));
                 case "maxbackoff" -> config.maxBackoffSeconds = Math.max(1, Integer.parseInt(value));
                 case "jitter" -> config.reconnectJitterMs = Math.max(0, Integer.parseInt(value));
-                case "interval" -> config.antiKickIntervalSeconds = Math.max(5, Integer.parseInt(value));
+                case "keepaliveinterval" -> config.keepAliveIntervalMs = Math.max(500, Integer.parseInt(value));
                 case "joindelay" -> config.onJoinDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "kickdelay" -> config.onKickDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "replycooldown" -> config.autoReplyCooldownSeconds = Math.max(0, Integer.parseInt(value));
                 case "lowhealththreshold" -> config.lowHealthThreshold = Double.parseDouble(value);
-                case "antikickcmd" -> config.antiKickCommand = value;
                 case "tpacmd" -> config.tpaAcceptCommand = value;
                 case "replymsg" -> config.autoReplyMessage = value;
                 case "replycmd" -> config.autoReplyCommand = value;
@@ -307,8 +351,8 @@ public class Main {
         console.info("  reconnectdelay:   " + config.reconnectDelaySeconds + "s  jitter=" + config.reconnectJitterMs + "ms");
         console.info("  maxattempts:      " + config.maxReconnectAttempts + "  maxbackoff=" + config.maxBackoffSeconds + "s");
         console.info("  fallbackServers:  " + config.fallbackServers.size());
-        console.info("  antikick:         " + config.antiKickEnabled + "  cmd='" + config.antiKickCommand
-                + "'  interval=" + config.antiKickIntervalSeconds + "s  toggle=" + config.antiKickToggle);
+        console.info("  keepalive:        " + config.keepAliveEnabled
+                + "  keepaliveinterval=" + config.keepAliveIntervalMs + "ms");
         console.info("  onJoin/onKick:    " + config.onJoinCommands.size() + " / " + config.onKickCommands.size());
         console.info("  onDeath:          " + config.onDeathCommands.size());
         console.info("  respawn:          " + config.autoRespawn);
@@ -364,14 +408,14 @@ public class Main {
         console.info("  :players               Online-Spieler auflisten");
         console.info("  :server <ip>           zu anderem Server wechseln");
         console.info("  :reconnect             neu verbinden");
-        console.info("  :antikick on|off       Anti-Kick (periodischer Befehl) ein/aus");
-        console.info("  :antikick cmd <befehl> Anti-Kick-Befehl setzen (z. B. /afk)");
-        console.info("  :antikick interval <s> Intervall des Anti-Kick-Befehls");
+        console.info("  :keepalive on|off      Keep-Alive (Timeout-Schutz) ein/aus");
+        console.info("  :keepalive interval <ms> Keep-Alive-Intervall setzen");
         console.info("  :tpa on|off            TPA-Anfragen automatisch annehmen");
         console.info("  :reply on|off          Auto-Antwort auf private Nachrichten");
         console.info("  :reply msg <text>      Auto-Antwort-Text setzen");
         console.info("  :filter on|off         Chat-Spam-Filter ein/aus");
         console.info("  :mute on|off           gesamten eingehenden Chat aus/ein");
+        console.info("  :periodic add <s> <cmd> periodischen Befehl hinzufuegen (z. B. /afk)");
         console.info("  :join  add|remove|list Beitrittsbefehle pflegen");
         console.info("  :kickcmd add|remove|.. Befehle nach einem Kick pflegen");
         console.info("  :death add|remove|list Befehle beim Tod pflegen");
@@ -390,9 +434,8 @@ public class Main {
                 Optionen:
                   --server <host[:port]>     Server-Adresse
                   --no-reconnect             Auto-Reconnect deaktivieren
-                  --no-antikick              Anti-Kick deaktivieren
-                  --antikick-cmd <befehl>    Anti-Kick-Befehl (Standard: /afk)
-                  --antikick-interval <sek>  Intervall des Anti-Kick-Befehls
+                  --no-keepalive             Keep-Alive (Timeout-Schutz) deaktivieren
+                  --keepalive-interval <ms>  Intervall des Keep-Alive-Pakets (Standard 1000)
                   --auto-tpa                 TPA-Anfragen automatisch annehmen
                   --mute                     eingehenden Chat ausblenden
                   --no-filter                Chat-Spam-Filter deaktivieren

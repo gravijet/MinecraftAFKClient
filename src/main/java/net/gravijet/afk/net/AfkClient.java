@@ -1,9 +1,9 @@
-package com.hugoafk.net;
+package net.gravijet.afk.net;
 
-import com.hugoafk.auth.AuthManager;
-import com.hugoafk.config.Config;
-import com.hugoafk.ui.Console;
-import com.hugoafk.util.ChatLog;
+import net.gravijet.afk.auth.AuthManager;
+import net.gravijet.afk.config.Config;
+import net.gravijet.afk.ui.Console;
+import net.gravijet.afk.util.ChatLog;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.ansi.ANSIComponentSerializer;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
@@ -122,9 +122,11 @@ public class AfkClient {
     private volatile int reconnectAttempts = 0;
     private volatile int fallbackIndex = 0;
     private volatile long connectedAt = 0;
-    private volatile long lastAntiKick = 0;
+    private volatile long lastKeepAlive = 0;
     private volatile String lastTpaSender = "";
     private volatile long lastTpaAt = 0;
+    /** Klein-geschriebener Eigenname (einmal zwischengespeichert, spart Allokationen je Chat-Zeile). */
+    private volatile String usernameLower = "";
 
     // Spielzustand
     private volatile UUID selfId;
@@ -143,10 +145,12 @@ public class AfkClient {
         this.config = config;
         this.console = console;
         this.chatLog = chatLog;
+        String name = auth.username();
+        this.usernameLower = name != null ? name.toLowerCase() : "";
 
-        // Ein einziger 1-Sekunden-Heartbeat steuert Anti-Kick und periodische Befehle.
-        // So wirken Aenderungen via :set sofort, ohne Neuplanung.
-        scheduler.scheduleAtFixedRate(this::heartbeat, 1, 1, TimeUnit.SECONDS);
+        // Ein 500-ms-Heartbeat steuert Keep-Alive (Timeout-Schutz) und periodische Befehle.
+        // So wirken Aenderungen via :set sofort, ohne Neuplanung. 500 ms ist vernachlaessigbar guenstig.
+        scheduler.scheduleAtFixedRate(this::heartbeat, 500, 500, TimeUnit.MILLISECONDS);
         int chatDelay = Math.max(200, config.chatMinDelayMs);
         scheduler.scheduleAtFixedRate(this::drainOutgoing, chatDelay, chatDelay, TimeUnit.MILLISECONDS);
     }
@@ -271,10 +275,17 @@ public class AfkClient {
 
     // ===================== Laufzeit-Schalter =====================
 
-    public void setAntiKick(boolean enabled) {
-        config.antiKickEnabled = enabled;
+    public void setKeepAlive(boolean enabled) {
+        config.keepAliveEnabled = enabled;
         config.save();
-        console.info("Anti-Kick (" + describeAntiKick() + ") ist jetzt " + onOff(enabled) + ".");
+        console.info("Keep-Alive (Timeout-Schutz) ist jetzt " + onOff(enabled)
+                + (enabled ? " - alle " + config.keepAliveIntervalMs + "ms" : "") + ".");
+    }
+
+    public void setKeepAliveInterval(int intervalMs) {
+        config.keepAliveIntervalMs = Math.max(500, intervalMs);
+        config.save();
+        console.info("Keep-Alive-Intervall ist jetzt " + config.keepAliveIntervalMs + "ms.");
     }
 
     public void setMute(boolean muted) {
@@ -299,12 +310,6 @@ public class AfkClient {
         config.autoReplyEnabled = enabled;
         config.save();
         console.info("Auto-Antwort ist jetzt " + onOff(enabled) + ".");
-    }
-
-    private String describeAntiKick() {
-        return config.antiKickCommand.isBlank()
-                ? "nur Keep-Alive"
-                : config.antiKickCommand + " alle " + config.antiKickIntervalSeconds + "s";
     }
 
     private static String onOff(boolean b) {
@@ -342,7 +347,7 @@ public class AfkClient {
         }
     }
 
-    // ===================== Heartbeat (Anti-Kick + periodische Befehle) =====================
+    // ===================== Heartbeat (Keep-Alive + periodische Befehle) =====================
 
     private void heartbeat() {
         ClientSession current = session;
@@ -351,18 +356,18 @@ public class AfkClient {
         }
         long now = System.currentTimeMillis();
 
-        // Anti-Kick-Befehl periodisch.
-        if (config.antiKickEnabled && !config.antiKickCommand.isBlank()
-                && now - lastAntiKick >= config.antiKickIntervalSeconds * 1000L) {
-            lastAntiKick = now;
-            outgoing.add(config.antiKickCommand);
-            if (config.antiKickToggle) {
-                outgoing.add(config.antiKickCommand);
-            }
+        // Echter Timeout-Schutz: stationaeres Positionspaket (gleiche Koordinaten, KEINE Bewegung).
+        // Ein stehender Vanilla-Client sendet genau das; verhindert disconnect.timeout.
+        if (config.keepAliveEnabled && havePosition
+                && now - lastKeepAlive >= config.keepAliveIntervalMs) {
+            lastKeepAlive = now;
+            current.send(new ServerboundMovePlayerPosRotPacket(true, false, posX, posY, posZ, yaw, pitch));
         }
 
-        // Frei konfigurierte periodische Befehle.
-        for (Config.PeriodicCommand pc : config.periodicCommands) {
+        // Frei konfigurierte periodische Befehle (z. B. regelmaessig "/afk").
+        List<Config.PeriodicCommand> commands = config.periodicCommands;
+        for (int i = 0, n = commands.size(); i < n; i++) {
+            Config.PeriodicCommand pc = commands.get(i);
             if (pc == null || !pc.enabled || pc.command == null || pc.command.isBlank()) {
                 continue;
             }
@@ -397,14 +402,15 @@ public class AfkClient {
         // Auto-Aktionen laufen immer - auch wenn die Zeile gleich ausgeblendet wird.
         handleAutoActions(plainText);
 
-        boolean highlight = matchesHighlight(plainText);
+        String lower = plainText.toLowerCase();
+        boolean highlight = matchesHighlight(lower);
 
         // Stummschaltung / Spam-Filter (Highlights werden nie ausgeblendet).
         if (!highlight) {
             if (config.muteChat) {
                 return;
             }
-            if (config.chatFilterEnabled && matchesHideFilter(plainText)) {
+            if (config.chatFilterEnabled && matchesHideFilter(plainText, lower)) {
                 return;
             }
         }
@@ -488,13 +494,14 @@ public class AfkClient {
         return candidate.isEmpty() ? null : candidate;
     }
 
-    private boolean matchesHighlight(String text) {
-        String lower = text.toLowerCase();
-        if (config.highlightUsername && auth.username() != null
-                && lower.contains(auth.username().toLowerCase())) {
+    /** Erwartet bereits klein-geschriebenen Text (Allokation nur einmal pro Chat-Zeile). */
+    private boolean matchesHighlight(String lower) {
+        if (config.highlightUsername && !usernameLower.isEmpty() && lower.contains(usernameLower)) {
             return true;
         }
-        for (String keyword : config.highlightKeywords) {
+        List<String> keywords = config.highlightKeywords;
+        for (int i = 0, n = keywords.size(); i < n; i++) {
+            String keyword = keywords.get(i);
             if (keyword != null && !keyword.isBlank() && lower.contains(keyword.toLowerCase())) {
                 return true;
             }
@@ -502,9 +509,13 @@ public class AfkClient {
         return false;
     }
 
-    private boolean matchesHideFilter(String text) {
-        for (String filter : config.chatHideFilters) {
-            if (filter != null && !filter.isBlank() && text.contains(filter)) {
+    /** Filter sind i. d. R. case-sensitiv (Originaltext); zusaetzlich case-insensitiver Fallback. */
+    private boolean matchesHideFilter(String text, String lower) {
+        List<String> filters = config.chatHideFilters;
+        for (int i = 0, n = filters.size(); i < n; i++) {
+            String filter = filters.get(i);
+            if (filter != null && !filter.isBlank()
+                    && (text.contains(filter) || lower.contains(filter.toLowerCase()))) {
                 return true;
             }
         }
@@ -523,7 +534,7 @@ public class AfkClient {
         int ping = selfId != null ? playerList.latencyOf(selfId) : -1;
         console.info("  Ping:           " + (ping >= 0 ? ping + " ms" : "?"));
         console.info("  Online:         " + playerList.size());
-        console.info("  Anti-Kick:      " + (config.antiKickEnabled ? "an (" + describeAntiKick() + ")" : "aus"));
+        console.info("  Keep-Alive:     " + (config.keepAliveEnabled ? "an (" + config.keepAliveIntervalMs + "ms)" : "aus"));
         console.info("  Auto-Reconnect: " + (config.autoReconnect ? "an" : "aus"));
         console.info("  Auto-Respawn:   " + (config.autoRespawn ? "an" : "aus"));
         console.info("  Auto-TPA:       " + (config.autoAcceptTpa ? "an" : "aus"));
@@ -643,8 +654,7 @@ public class AfkClient {
         reconnectAttempts = 0;
         fallbackIndex = 0;
         connectedAt = System.currentTimeMillis();
-        // Anti-Kick-Befehl erst nach einem vollen Intervall nach dem Beitritt.
-        lastAntiKick = connectedAt;
+        lastKeepAlive = connectedAt;
         unacknowledged.set(0);
         outgoing.clear();
         wasDead = false;
