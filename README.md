@@ -15,6 +15,14 @@ Abbruch automatisch neu.
 > Zusätzlich: **eigene Befehle nach einem Kick** (`onKickCommands`), TPA-Anfragen automatisch
 > annehmen, private Nachrichten beantworten und den Chat-Spam filtern. Wer trotzdem in die
 > AFK-Welt will, legt `/afk` in `onJoinCommands` oder als periodischen Befehl ab.
+>
+> **Update – warum trotzdem noch vereinzelt gekickt wurde:** Neben den stationären
+> Positionspaketen beantwortet der Server ein eigenes **KeepAlive-Protokollpaket**; kommt die
+> Antwort zu spät, folgt `disconnect.timeout`. Bei Chat-Spam blockierte das synchrone Schreiben
+> ins Terminal kurz den Netzwerk-Thread und verzögerte genau diese Antwort. Jetzt wird das
+> KeepAlive **selbst und mit Vorrang** beantwortet (vor jeder Chat-Verarbeitung) und die
+> **Terminal-Ausgabe läuft asynchron**, sodass der Netzwerk-Thread frei bleibt. Ein
+> **Watchdog** (Standard 60s ohne Server-Paket) baut zusätzlich „halb tote" Verbindungen neu auf.
 
 Gebaut mit **Java 21 + [MCProtocolLib](https://github.com/GeyserMC/MCProtocolLib)** (GeyserMC)
 und **[MinecraftAuth](https://github.com/RaphiMC/MinecraftAuth)** (RaphiMC). Diese Bibliotheken
@@ -47,8 +55,8 @@ node-minecraft-protocol oft scheitern.
 - **Verbindungs-Watchdog** (`inboundSilenceTimeoutSeconds`) und **geplanter Neustart**
   (`scheduledRestartMinutes`) halten die Session frisch.
 - **Aktion bei niedrigem Leben** (`lowHealthCommands`, z. B. `/warp spawn`).
-- **Laufzeit-Statistik** (`:stats`): Verbindungen, Kicks, Reconnects, Tode, TPAs, Trigger,
-  Chat-Zeilen, letzte Trennungsursache.
+- **Laufzeit-Statistik** (`:stats`): Verbindungen, beantwortete Keep-Alives, Kicks, Reconnects,
+  Tode, TPAs, Trigger, Chat-Zeilen, letzte Trennungsursache.
 - **Chat-Historie** (`:history`), **Koordinaten** (`:pos`), **Bildschirm leeren** (`:clear`).
 - **Asynchrones Chat-Log** mit Größenrotation (entlastet den Netzwerk-Thread).
 - **Spielerliste** (`:players`) und **Status** (`:status`: Leben, Hunger, Ping, Online-Zahl).
@@ -63,7 +71,10 @@ node-minecraft-protocol oft scheitern.
 
 Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick führt:
 
-- **KeepAlive / Ping** – automatisch beantwortet (kein „Timed out").
+- **KeepAlive / Ping** – wird **selbst und mit Vorrang** beantwortet: die Antwort geht raus,
+  _bevor_ eingehender (ggf. spammender) Chat verarbeitet wird, sodass sie nie zu spät kommt
+  (kein „Timed out" / `disconnect.timeout`). Die gesamte Terminal-Ausgabe läuft dafür
+  **asynchron** über einen eigenen Thread und blockiert den Netzwerk-Thread nicht mehr.
 - **Resource-Pack** – bestätigt, auch wenn es erzwungen wird.
 - **Teleport** – wird bestätigt (kein Rubber-Banding / „moved wrongly").
 - **Chat-Acknowledgement** – empfangene Nachrichten werden quittiert (kein
@@ -83,7 +94,8 @@ Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick fü
 - **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
   „throttled/already logged in" wird länger gewartet.
 - **Verbindungs-Watchdog** – kommt `inboundSilenceTimeoutSeconds` lang kein Paket vom
-  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (0 = aus).
+  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (Standard 60s, 0 = aus).
+  Hilft gegen stilles Einfrieren / `disconnect.endOfStream`, das sonst nie als Trennung ankommt.
 - **Geplanter Neustart** – `scheduledRestartMinutes` baut die Verbindung regelmäßig neu
   auf, um Session-Verfall vorzubeugen (0 = aus).
 - **Ban/Whitelist-Erkennung** – enthält die Trennungsursache z. B. „banned"/„whitelist"

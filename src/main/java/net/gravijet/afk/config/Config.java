@@ -53,8 +53,13 @@ public class Config {
     /**
      * Kommt N Sekunden lang KEIN Paket vom Server, proaktiv neu verbinden
      * (Watchdog gegen "halb tote" Verbindungen; 0 = aus).
+     *
+     * <p>Standard 60s: ein gesunder Server schickt mindestens alle ~15s ein Keep-Alive, daher
+     * bedeutet eine Stille von 60s praktisch immer eine tote/eingefrorene Verbindung (z. B. ein
+     * stilles {@code disconnect.endOfStream}, das nie als Trennung ankommt). Statt scheinbar
+     * "online" festzuhaengen, verbinden wir dann selbst neu.
      */
-    public int inboundSilenceTimeoutSeconds = 0;
+    public int inboundSilenceTimeoutSeconds = 60;
 
     // =====================================================================
     // Keep-Alive (echter Timeout-Schutz - ersetzt den alten Bewegungs-Anti-AFK)
