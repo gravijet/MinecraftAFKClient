@@ -21,9 +21,11 @@ import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntryAction;
 import org.geysermc.mcprotocollib.protocol.data.game.ResourcePackStatus;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PositionElement;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundStoreCookiePacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundTransferPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundKeepAlivePacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.clientbound.ClientboundCookieRequestPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.serverbound.ServerboundCookieResponsePacket;
@@ -118,6 +120,8 @@ public class AfkClient {
     private final AtomicLong statTpaAccepted = new AtomicLong();
     private final AtomicLong statTriggers = new AtomicLong();
     private final AtomicLong statConnects = new AtomicLong();
+    /** Beantwortete Server-Keep-Alives (Schutz gegen disconnect.timeout). */
+    private final AtomicLong statKeepAlives = new AtomicLong();
     private final long startedAt = System.currentTimeMillis();
 
     private volatile ClientSession session;
@@ -188,7 +192,11 @@ public class AfkClient {
                     .setProtocol(protocol)
                     .create();
             client.setFlag(MinecraftConstants.SESSION_SERVICE_KEY, sessionService);
-            client.setFlag(MinecraftConstants.AUTOMATIC_KEEP_ALIVE_MANAGEMENT, true);
+            // Keep-Alive beantworten wir SELBST (siehe Listener) und schalten daher das
+            // automatische Management ab - sonst antworten beide und der Server kann die
+            // doppelte/unerwartete Antwort als Fehler werten. Eigene Behandlung heisst: die
+            // Antwort geht als allererstes raus, bevor Chat o. Ae. den Paket-Thread aufhaelt.
+            client.setFlag(MinecraftConstants.AUTOMATIC_KEEP_ALIVE_MANAGEMENT, false);
             // Transfers selbst behandeln, damit unser Listener erhalten bleibt.
             client.setFlag(MinecraftConstants.FOLLOW_TRANSFERS, false);
             client.addListener(new Listener());
@@ -681,6 +689,7 @@ public class AfkClient {
         console.info("  Aktuell online:   " + formatDuration(online));
         console.info("  Verbindungen:     " + statConnects.get());
         console.info("  Reconnects:       " + statReconnects.get());
+        console.info("  Keep-Alives:      " + statKeepAlives.get());
         console.info("  Kicks/Trennungen: " + statKicks.get());
         console.info("  Tode:             " + statDeaths.get());
         console.info("  TPA angenommen:   " + statTpaAccepted.get());
@@ -755,6 +764,17 @@ public class AfkClient {
         @Override
         public void packetReceived(Session ignored, Packet packet) {
             lastInbound = System.currentTimeMillis();
+            // Keep-Alive ZUERST und sofort beantworten - das ist der eigentliche Schutz gegen
+            // disconnect.timeout. Der Server trennt, wenn die Antwort nicht rechtzeitig kommt;
+            // deshalb antworten wir, bevor wir (potenziell langsamen) Chat o. Ae. verarbeiten.
+            if (packet instanceof ClientboundKeepAlivePacket keepAlive) {
+                ClientSession current = session;
+                if (current != null && current.isConnected()) {
+                    current.send(new ServerboundKeepAlivePacket(keepAlive.getPingId()));
+                    statKeepAlives.incrementAndGet();
+                }
+                return;
+            }
             if (packet instanceof ClientboundLoginPacket) {
                 onJoin();
             } else if (packet instanceof ClientboundSystemChatPacket chat) {
