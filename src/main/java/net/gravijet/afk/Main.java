@@ -57,13 +57,14 @@ public class Main {
         }
 
         AuthManager auth = new AuthManager(baseDir.resolve("auth.json"));
-        ChatLog chatLog = new ChatLog(baseDir.resolve("chat.log"));
+        ChatLog chatLog = new ChatLog(baseDir.resolve("chat.log"), config.maxLogBytes);
 
         System.out.println("HugoAFKClient - Minecraft Java AFK Client");
         auth.login();
         System.out.println("Angemeldet als: " + auth.username());
 
         Console console = new Console();
+        console.setColor(config.colorOutput);
 
         String server = serverArg != null ? serverArg : config.lastServer;
         if (server == null || server.isBlank()) {
@@ -94,6 +95,7 @@ public class Main {
         runInputLoop(console, client, config);
 
         client.shutdown();
+        chatLog.close();
         console.close();
         System.out.println("Tschuess!");
     }
@@ -151,13 +153,161 @@ public class Main {
             case "kickcmd" -> handleList(arg, console, config, config.onKickCommands, "Nach-Kick-Befehle");
             case "death" -> handleList(arg, console, config, config.onDeathCommands, "Tod-Befehle");
             case "hide" -> handleList(arg, console, config, config.chatHideFilters, "Chat-Filter");
+            case "showonly" -> handleList(arg, console, config, config.chatShowOnly, "Nur-Anzeigen");
             case "highlight" -> handleList(arg, console, config, config.highlightKeywords, "Highlights");
-            case "set" -> handleSet(arg, console, config);
+            case "ignore" -> handleList(arg, console, config, config.ignoredPlayers, "Ignorierte Spieler");
+            case "norecon" -> handleList(arg, console, config, config.dontReconnectOnReasons, "Kein-Reconnect-Gruende");
+            case "trigger" -> handleTrigger(arg, console, config);
+            case "alias" -> handleAlias(arg, console, config);
+            case "in" -> handleIn(arg, console, client);
+            case "history" -> {
+                int n = 20;
+                if (!arg.isBlank()) {
+                    try {
+                        n = Integer.parseInt(arg.trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                client.printHistory(n);
+            }
+            case "pos", "coords" -> client.printPosition();
+            case "clear", "cls" -> console.clearScreen();
+            case "reload" -> {
+                if (config.reload()) {
+                    console.setColor(config.colorOutput);
+                    console.info("Konfiguration neu geladen.");
+                } else {
+                    console.error("Neu laden fehlgeschlagen.");
+                }
+            }
+            case "save" -> {
+                config.save();
+                console.info("Konfiguration gespeichert.");
+            }
+            case "set" -> handleSet(arg, console, client, config);
             case "config" -> printConfig(console, config);
             case "help" -> printHelp(console);
-            default -> console.error("Unbekannter Befehl: :" + cmd + " (siehe :help)");
+            default -> {
+                // Eigener Alias? -> als Eingabe (Chat/Befehl) ausfuehren.
+                String alias = config.commandAliases.get(cmd);
+                if (alias != null && !alias.isBlank()) {
+                    String expanded = arg.isBlank() ? alias : alias + " " + arg;
+                    console.info("Alias :" + cmd + " -> " + expanded);
+                    client.sendChatInput(expanded);
+                } else {
+                    console.error("Unbekannter Befehl: :" + cmd + " (siehe :help)");
+                }
+            }
         }
         return false;
+    }
+
+    private static void handleTrigger(String arg, Console console, Config config) {
+        String[] sub = arg.split("\\s+", 2);
+        String op = sub[0].toLowerCase();
+        String rest = sub.length > 1 ? sub[1].trim() : "";
+        switch (op) {
+            case "add" -> {
+                // Format: :trigger add <ausloeser> | <antwort>
+                int bar = rest.indexOf('|');
+                if (bar <= 0 || bar >= rest.length() - 1) {
+                    console.error("Nutzung: :trigger add <ausloeser> | <antwort>");
+                    return;
+                }
+                String contains = rest.substring(0, bar).trim();
+                String response = rest.substring(bar + 1).trim();
+                if (contains.isEmpty() || response.isEmpty()) {
+                    console.error("Ausloeser und Antwort duerfen nicht leer sein.");
+                    return;
+                }
+                config.triggers.add(new Config.Trigger(contains, response, 30));
+                config.save();
+                console.info("Trigger hinzugefuegt: \"" + contains + "\" -> " + response);
+            }
+            case "remove", "rm" -> {
+                try {
+                    int idx = Integer.parseInt(rest.trim()) - 1;
+                    if (idx >= 0 && idx < config.triggers.size()) {
+                        Config.Trigger removed = config.triggers.remove(idx);
+                        config.save();
+                        console.info("Trigger entfernt: " + removed.contains);
+                    } else {
+                        console.error("Ungueltige Nummer (siehe :trigger list).");
+                    }
+                } catch (NumberFormatException e) {
+                    console.error("Nutzung: :trigger remove <nr>");
+                }
+            }
+            case "clear" -> {
+                config.triggers.clear();
+                config.save();
+                console.info("Alle Trigger entfernt.");
+            }
+            case "", "list" -> {
+                if (config.triggers.isEmpty()) {
+                    console.info("Trigger: (leer)");
+                } else {
+                    console.info("Trigger (" + config.triggers.size() + "):");
+                    for (int i = 0; i < config.triggers.size(); i++) {
+                        Config.Trigger t = config.triggers.get(i);
+                        console.info("  " + (i + 1) + ". \"" + t.contains + "\" -> " + t.response
+                                + " (cd " + t.cooldownSeconds + "s)" + (t.enabled ? "" : " [aus]"));
+                    }
+                }
+            }
+            default -> console.error("Nutzung: :trigger add <ausloeser> | <antwort> | remove <nr> | clear | list");
+        }
+    }
+
+    private static void handleAlias(String arg, Console console, Config config) {
+        String[] sub = arg.split("\\s+", 2);
+        String op = sub[0].toLowerCase();
+        String rest = sub.length > 1 ? sub[1].trim() : "";
+        switch (op) {
+            case "add", "set" -> {
+                String[] p = rest.split("\\s+", 2);
+                if (p.length < 2 || p[1].isBlank()) {
+                    console.error("Nutzung: :alias add <name> <befehl/text>");
+                    return;
+                }
+                String name = p[0].toLowerCase().replaceFirst("^:", "");
+                config.commandAliases.put(name, p[1].trim());
+                config.save();
+                console.info("Alias gesetzt: :" + name + " -> " + p[1].trim());
+            }
+            case "remove", "rm" -> {
+                String name = rest.toLowerCase().replaceFirst("^:", "");
+                if (config.commandAliases.remove(name) != null) {
+                    config.save();
+                    console.info("Alias entfernt: :" + name);
+                } else {
+                    console.error("Alias nicht gefunden: " + name);
+                }
+            }
+            case "", "list" -> {
+                if (config.commandAliases.isEmpty()) {
+                    console.info("Aliase: (leer)");
+                } else {
+                    console.info("Aliase (" + config.commandAliases.size() + "):");
+                    config.commandAliases.forEach((k, v) -> console.info("  :" + k + " -> " + v));
+                }
+            }
+            default -> console.error("Nutzung: :alias add <name> <befehl> | remove <name> | list");
+        }
+    }
+
+    private static void handleIn(String arg, Console console, AfkClient client) {
+        String[] p = arg.split("\\s+", 2);
+        if (p.length < 2 || p[1].isBlank()) {
+            console.error("Nutzung: :in <sekunden> <befehl/text>");
+            return;
+        }
+        try {
+            int seconds = Integer.parseInt(p[0].trim());
+            client.scheduleOnce(seconds, p[1].trim());
+        } catch (NumberFormatException e) {
+            console.error("Ungueltige Sekundenzahl.");
+        }
     }
 
     private static void handleKeepAlive(String arg, Console console, AfkClient client, Config config) {
@@ -294,7 +444,7 @@ public class Main {
     }
 
     /** Setzt einfache Konfigurationswerte zur Laufzeit: :set <key> <wert>. */
-    private static void handleSet(String arg, Console console, Config config) {
+    private static void handleSet(String arg, Console console, AfkClient client, Config config) {
         String[] sub = arg.split("\\s+", 2);
         if (sub.length < 2 || sub[1].isBlank()) {
             console.error("Nutzung: :set <key> <wert>  (siehe :config fuer Keys)");
@@ -314,6 +464,11 @@ public class Main {
                 case "highlightname" -> config.highlightUsername = parseBool(value);
                 case "keepalive" -> config.keepAliveEnabled = parseBool(value);
                 case "lowhealth" -> config.lowHealthActionEnabled = parseBool(value);
+                case "collapse" -> config.collapseDuplicates = parseBool(value);
+                case "color" -> {
+                    config.colorOutput = parseBool(value);
+                    client.applyColorSetting();
+                }
                 case "chatdelay" -> config.chatMinDelayMs = Math.max(200, Integer.parseInt(value));
                 case "reconnectdelay" -> config.reconnectDelaySeconds = Math.max(1, Integer.parseInt(value));
                 case "maxattempts" -> config.maxReconnectAttempts = Math.max(0, Integer.parseInt(value));
@@ -323,10 +478,15 @@ public class Main {
                 case "joindelay" -> config.onJoinDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "kickdelay" -> config.onKickDelaySeconds = Math.max(0, Integer.parseInt(value));
                 case "replycooldown" -> config.autoReplyCooldownSeconds = Math.max(0, Integer.parseInt(value));
+                case "scheduledrestart" -> config.scheduledRestartMinutes = Math.max(0, Integer.parseInt(value));
+                case "silencetimeout" -> config.inboundSilenceTimeoutSeconds = Math.max(0, Integer.parseInt(value));
+                case "historysize" -> config.chatHistorySize = Math.max(10, Integer.parseInt(value));
                 case "lowhealththreshold" -> config.lowHealthThreshold = Double.parseDouble(value);
                 case "tpacmd" -> config.tpaAcceptCommand = value;
+                case "tpamarker" -> config.tpaRequestMarker = value;
                 case "replymsg" -> config.autoReplyMessage = value;
                 case "replycmd" -> config.autoReplyCommand = value;
+                case "pmmarker" -> config.privateMessageMarker = value;
                 default -> {
                     console.error("Unbekannter Key: " + key + " (siehe :config)");
                     return;
@@ -359,12 +519,20 @@ public class Main {
         console.info("  lowhealth:        " + config.lowHealthActionEnabled + "  threshold=" + config.lowHealthThreshold);
         console.info("  autotpa:          " + config.autoAcceptTpa + "  whitelist=" + config.autoAcceptTpaWhitelist.size());
         console.info("  autoreply:        " + config.autoReplyEnabled + "  cooldown=" + config.autoReplyCooldownSeconds + "s");
-        console.info("  chatfilter:       " + config.chatFilterEnabled + "  regeln=" + config.chatHideFilters.size());
-        console.info("  mute:             " + config.muteChat);
-        console.info("  timestamps:       " + config.showTimestamps + "  logchat=" + config.logChat);
-        console.info("  chatdelay:        " + config.chatMinDelayMs + "ms");
+        console.info("  chatfilter:       " + config.chatFilterEnabled + "  regeln=" + config.chatHideFilters.size()
+                + "  showonly=" + config.chatShowOnly.size());
+        console.info("  mute:             " + config.muteChat + "  collapse=" + config.collapseDuplicates);
+        console.info("  ignore/trigger:   " + config.ignoredPlayers.size() + " / " + config.triggers.size());
+        console.info("  aliases:          " + config.commandAliases.size());
+        console.info("  scheduledrestart: " + config.scheduledRestartMinutes + " min"
+                + "  silencetimeout=" + config.inboundSilenceTimeoutSeconds + "s");
+        console.info("  norecon-reasons:  " + config.dontReconnectOnReasons.size());
+        console.info("  timestamps:       " + config.showTimestamps + "  logchat=" + config.logChat
+                + "  color=" + config.colorOutput);
+        console.info("  chatdelay:        " + config.chatMinDelayMs + "ms"
+                + "  historysize=" + config.chatHistorySize + "  maxLogBytes=" + config.maxLogBytes);
         console.info("  periodicCommands: " + config.periodicCommands.size());
-        console.info("Tipp: Komplexe Felder direkt in der config.json bearbeiten.");
+        console.info("Tipp: Komplexe Felder direkt in der config.json bearbeiten oder :reload nutzen.");
     }
 
     /** Parst host[:port] inkl. IPv6 in [..]:port-Schreibweise. Setzt Port in holder[0]. */
@@ -416,11 +584,16 @@ public class Main {
         console.info("  :filter on|off         Chat-Spam-Filter ein/aus");
         console.info("  :mute on|off           gesamten eingehenden Chat aus/ein");
         console.info("  :periodic add <s> <cmd> periodischen Befehl hinzufuegen (z. B. /afk)");
-        console.info("  :join  add|remove|list Beitrittsbefehle pflegen");
-        console.info("  :kickcmd add|remove|.. Befehle nach einem Kick pflegen");
-        console.info("  :death add|remove|list Befehle beim Tod pflegen");
-        console.info("  :hide  add|remove|list Chat-Filterregeln pflegen");
-        console.info("  :highlight add|rm|list Highlight-Schluesselwoerter pflegen");
+        console.info("  :trigger add <a> | <b> Auto-Responder: bei Text <a> sende <b>");
+        console.info("  :alias add <name> <cmd> Kurzbefehl :name -> cmd");
+        console.info("  :in <sek> <cmd>        Befehl einmalig verzoegert senden");
+        console.info("  :ignore add|remove|..  Spieler im Chat ausblenden");
+        console.info("  :showonly add|..       nur Zeilen mit diesen Texten zeigen");
+        console.info("  :norecon add|..        Trennungsgruende ohne Auto-Reconnect");
+        console.info("  :join/:kickcmd/:death  Befehlslisten (add|remove|clear|list)");
+        console.info("  :hide/:highlight       Filter- bzw. Highlight-Woerter pflegen");
+        console.info("  :history [n]           letzte n Chat-Zeilen | :pos Koordinaten");
+        console.info("  :clear                 Bildschirm leeren | :reload Config neu laden");
         console.info("  :set <key> <wert>      Einzelwert setzen (siehe :config)");
         console.info("  :quit                  beenden");
     }
