@@ -1,4 +1,4 @@
-package com.hugoafk.util;
+package net.gravijet.afk.util;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;

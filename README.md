@@ -2,15 +2,19 @@
 
 Ein schlanker **CLI-AFK-Client für Minecraft Java Edition**. Anmeldung mit dem
 Microsoft-Account, Verbindung zu einem Server, **Chat empfangen und senden** – alles im
-Terminal. Hält die Verbindung mit einem **befehlsbasierten Anti-Kick** (z. B. periodisches
-`/afk`) aktiv und verbindet bei Abbruch automatisch neu.
+Terminal. Hält die Verbindung mit einem echten **Keep-Alive** aktiv und verbindet bei
+Abbruch automatisch neu.
 
-> **Neu:** Der frühere bewegungsbasierte Anti-AFK (Arm-Schwung + Drehung) wurde **entfernt**.
-> Auf vielen Servern – auch HugoSMP – schützt nicht Bewegung, sondern ein periodischer Befehl
-> wie `/afk` zuverlässig vor dem AFK-/Timeout-Kick. Diesen Befehl sendet der Client jetzt
-> automatisch (`antiKickCommand`, Standard `/afk`). Zusätzlich lassen sich **eigene Befehle
-> nach einem Kick** ausführen (`onKickCommands`), TPA-Anfragen automatisch annehmen, private
-> Nachrichten beantworten und der Chat-Spam filtern.
+> **Warum `disconnect.timeout` passierte – und wie es behoben ist:** Der frühere
+> bewegungsbasierte Anti-AFK (Arm-Schwung + Drehung) wurde **entfernt**. `/afk` schützt
+> **nicht** vor dem Kick – der Befehl teleportiert nur in die AFK-Welt. Der `disconnect.timeout`
+> ist ein **Verbindungs-Timeout**: Sobald der Client keine Pakete mehr sendet, trennt der
+> Server/Proxy. Ein echter, stehender Vanilla-Client sendet weiterhin laufend
+> **stationäre Positionspakete**. Genau das macht der Client jetzt automatisch
+> (`keepAliveEnabled`, Standard alle `1000 ms`) – **gleiche Koordinaten, keine Bewegung**.
+> Zusätzlich: **eigene Befehle nach einem Kick** (`onKickCommands`), TPA-Anfragen automatisch
+> annehmen, private Nachrichten beantworten und den Chat-Spam filtern. Wer trotzdem in die
+> AFK-Welt will, legt `/afk` in `onJoinCommands` oder als periodischen Befehl ab.
 
 Gebaut mit **Java 21 + [MCProtocolLib](https://github.com/GeyserMC/MCProtocolLib)** (GeyserMC)
 und **[MinecraftAuth](https://github.com/RaphiMC/MinecraftAuth)** (RaphiMC). Diese Bibliotheken
@@ -27,8 +31,8 @@ node-minecraft-protocol oft scheitern.
   Pack erzwingen.
 - **Teleport-Bestätigung** → kein Rubber-Banding / Kick beim Spawn.
 - **Auto-Respawn** beim Tod (bleibt nicht im Todesbildschirm hängen) + **Tod-Befehle**.
-- **Befehlsbasierter Anti-Kick** (periodisches `/afk` o. Ä.) + **Auto-Reconnect mit Backoff**
-  inkl. **Jitter** und **Fallback-Servern**.
+- **Keep-Alive gegen Timeout-Kicks** (stationäre Positionspakete, keine Bewegung) +
+  **Auto-Reconnect mit Backoff** inkl. **Jitter** und **Fallback-Servern**.
 - **Befehle nach einem Kick** (`onKickCommands`): genau das, was man sonst manuell tippt
   (z. B. wieder `/afk`), läuft nach erneutem Beitritt automatisch.
 - **Auto-TPA**: eingehende Teleport-Anfragen automatisch annehmen (optional mit Whitelist).
@@ -60,9 +64,10 @@ Der Client behandelt aktiv genau die Pakete, deren Ignorieren sonst zum Kick fü
   gefolgt (Velocity/BungeeCord-Netzwerke).
 - **Auto-Login** – per `onJoinCommands` z. B. `/login <pass>` automatisch senden, damit
   Auth-Server nicht wegen fehlender Anmeldung kicken.
-- **Befehlsbasierter Anti-Kick** – statt simulierter Bewegung wird periodisch ein Befehl
-  gesendet (`antiKickCommand`, Standard `/afk`). Das ist auf AFK-/SMP-Servern der
-  zuverlässige Weg gegen den Timeout-Kick und wird nicht als „Bewegungs-Bot" erkannt.
+- **Keep-Alive (Timeout-Schutz)** – periodische *stationäre* Positionspakete (gleiche
+  Koordinaten, keine Bewegung). Das verhindert `disconnect.timeout`, ohne den Spieler zu
+  bewegen, und wird nicht als „Bewegungs-Bot" erkannt. `/afk` hingegen schützt **nicht** vor
+  Kicks (nur Teleport in die AFK-Welt).
 - **Befehle nach Kick** – kommt es doch zu einem Kick, läuft nach dem erneuten Beitritt
   automatisch `onKickCommands` (z. B. wieder `/afk`).
 - **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
@@ -112,17 +117,15 @@ Code eingeben, fertig. Danach wird die Anmeldung gespeichert.
 java -jar hugoafkclient.jar [optionen] [host[:port]]
   --server <host[:port]>     Server-Adresse
   --no-reconnect             Auto-Reconnect deaktivieren
-  --no-antikick              Anti-Kick deaktivieren
-  --antikick-cmd <befehl>    Anti-Kick-Befehl (Standard: /afk)
-  --antikick-interval <sek>  Intervall des Anti-Kick-Befehls
+  --no-keepalive             Keep-Alive (Timeout-Schutz) deaktivieren
+  --keepalive-interval <ms>  Intervall des Keep-Alive-Pakets (Standard 1000)
   --auto-tpa                 TPA-Anfragen automatisch annehmen
   --mute                     eingehenden Chat ausblenden
   --no-filter                Chat-Spam-Filter deaktivieren
   -h, --help                 Hilfe
 ```
 
-> `--no-afk` und `--afk <sek>` funktionieren als Aliase weiter (= `--no-antikick` /
-> `--antikick-interval`).
+> `--no-afk` funktioniert als Alias für `--no-keepalive` weiter.
 
 ## Bedienung
 
@@ -136,12 +139,12 @@ java -jar hugoafkclient.jar [optionen] [host[:port]]
   - `:players` – Online-Spieler auflisten
   - `:server <ip>` – zu anderem Server wechseln
   - `:reconnect` – neu verbinden
-  - `:antikick on|off` – Anti-Kick ein/aus
-  - `:antikick cmd <befehl>` – Anti-Kick-Befehl setzen (z. B. `/afk`)
-  - `:antikick interval <sek>` – Intervall des Anti-Kick-Befehls
+  - `:keepalive on|off` – Keep-Alive (Timeout-Schutz) ein/aus
+  - `:keepalive interval <ms>` – Keep-Alive-Intervall setzen
   - `:tpa on|off` – TPA-Anfragen automatisch annehmen
   - `:reply on|off` / `:reply msg <text>` – Auto-Antwort auf private Nachrichten
   - `:filter on|off` – Chat-Spam-Filter; `:mute on|off` – gesamten Chat aus/ein
+  - `:periodic add <sek> <cmd>` – periodischen Befehl (z. B. `/afk`) hinzufügen
   - `:join` / `:kickcmd` / `:death` – Befehlslisten pflegen (`add|remove|clear|list`)
   - `:hide` / `:highlight` – Filter- bzw. Highlight-Wörter pflegen
   - `:set <key> <wert>` – Einzelwert zur Laufzeit ändern (Keys siehe `:config`)
@@ -156,7 +159,7 @@ Liegt unter `~/.config/hugoafk/`:
   | Bereich | Felder |
   | --- | --- |
   | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers` |
-  | Anti-Kick | `antiKickEnabled`, `antiKickCommand` (Std. `/afk`), `antiKickIntervalSeconds`, `antiKickToggle` |
+  | Keep-Alive | `keepAliveEnabled`, `keepAliveIntervalMs` (Std. 1000) |
   | Ereignis-Befehle | `onJoinCommands`, `onJoinDelaySeconds`, `onKickCommands`, `onKickDelaySeconds`, `onDeathCommands` |
   | Auto-TPA | `autoAcceptTpa`, `autoAcceptTpaWhitelist`, `tpaAcceptCommand`, `tpaRequestMarker` |
   | Auto-Antwort | `autoReplyEnabled`, `autoReplyMessage`, `autoReplyCommand`, `privateMessageMarker`, `autoReplyCooldownSeconds` |

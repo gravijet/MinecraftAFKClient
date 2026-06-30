@@ -1,4 +1,4 @@
-package com.hugoafk.ui;
+package net.gravijet.afk.ui;
 
 import org.jline.reader.EndOfFileException;
 import org.jline.reader.LineReader;

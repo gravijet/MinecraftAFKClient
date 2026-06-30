@@ -1,4 +1,4 @@
-package example.invalid;
+package net.gravijet.afk.net;
 
 import java.util.ArrayList;
 import java.util.Comparator;
