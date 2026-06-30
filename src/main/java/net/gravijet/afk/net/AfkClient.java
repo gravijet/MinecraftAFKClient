@@ -20,10 +20,20 @@ import org.geysermc.mcprotocollib.protocol.data.game.ClientCommand;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntryAction;
 import org.geysermc.mcprotocollib.protocol.data.game.ResourcePackStatus;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.player.Hand;
+import org.geysermc.mcprotocollib.protocol.data.game.entity.player.HandPreference;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.player.PositionElement;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.ChatVisibility;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.ParticleStatus;
+import org.geysermc.mcprotocollib.protocol.data.game.setting.SkinPart;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundKeepAlivePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundPingPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundResourcePackPushPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundStoreCookiePacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.clientbound.ClientboundTransferPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundClientInformationPacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundKeepAlivePacket;
+import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundPongPacket;
 import org.geysermc.mcprotocollib.protocol.packet.common.serverbound.ServerboundResourcePackPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.clientbound.ClientboundCookieRequestPacket;
 import org.geysermc.mcprotocollib.protocol.packet.cookie.serverbound.ServerboundCookieResponsePacket;
@@ -40,11 +50,13 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.Serverbound
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundClientCommandPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.level.ServerboundAcceptTeleportationPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosRotPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundSwingPacket;
 
 import java.net.InetSocketAddress;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
@@ -118,6 +130,8 @@ public class AfkClient {
     private final AtomicLong statTpaAccepted = new AtomicLong();
     private final AtomicLong statTriggers = new AtomicLong();
     private final AtomicLong statConnects = new AtomicLong();
+    /** Beantwortete Server-Keep-Alives (Schutz gegen disconnect.timeout). */
+    private final AtomicLong statKeepAlives = new AtomicLong();
     private final long startedAt = System.currentTimeMillis();
 
     private volatile ClientSession session;
@@ -131,6 +145,9 @@ public class AfkClient {
     private volatile long lastKeepAlive = 0;
     private volatile long lastInbound = 0;
     private volatile long lastRestart = 0;
+    private volatile long lastAntiAfk = 0;
+    /** Wechselt die Drehrichtung des "Umsehens", damit die Blickrichtung pendelt statt driftet. */
+    private boolean antiAfkLookFlip = false;
     private volatile String lastTpaSender = "";
     private volatile long lastTpaAt = 0;
     private volatile String lastDisconnectReason = "-";
@@ -160,9 +177,13 @@ public class AfkClient {
 
         // Ein 500-ms-Heartbeat steuert Keep-Alive (Timeout-Schutz) und periodische Befehle.
         // So wirken Aenderungen via :set sofort, ohne Neuplanung. 500 ms ist vernachlaessigbar guenstig.
-        scheduler.scheduleAtFixedRate(this::heartbeat, 500, 500, TimeUnit.MILLISECONDS);
+        // WICHTIG: in runSafely() kapseln - wirft eine periodische Aufgabe bei scheduleAtFixedRate
+        // eine Ausnahme, wird sie sonst STILL fuer immer abgebrochen (kein Keep-Alive mehr -> Timeout).
+        scheduler.scheduleAtFixedRate(() -> runSafely(this::heartbeat, "Heartbeat"),
+                500, 500, TimeUnit.MILLISECONDS);
         int chatDelay = Math.max(200, config.chatMinDelayMs);
-        scheduler.scheduleAtFixedRate(this::drainOutgoing, chatDelay, chatDelay, TimeUnit.MILLISECONDS);
+        scheduler.scheduleAtFixedRate(() -> runSafely(this::drainOutgoing, "Sende-Warteschlange"),
+                chatDelay, chatDelay, TimeUnit.MILLISECONDS);
     }
 
     public List<String> playerNames() {
@@ -188,7 +209,11 @@ public class AfkClient {
                     .setProtocol(protocol)
                     .create();
             client.setFlag(MinecraftConstants.SESSION_SERVICE_KEY, sessionService);
-            client.setFlag(MinecraftConstants.AUTOMATIC_KEEP_ALIVE_MANAGEMENT, true);
+            // Keep-Alive beantworten wir SELBST (siehe Listener) und schalten daher das
+            // automatische Management ab - sonst antworten beide und der Server kann die
+            // doppelte/unerwartete Antwort als Fehler werten. Eigene Behandlung heisst: die
+            // Antwort geht als allererstes raus, bevor Chat o. Ae. den Paket-Thread aufhaelt.
+            client.setFlag(MinecraftConstants.AUTOMATIC_KEEP_ALIVE_MANAGEMENT, false);
             // Transfers selbst behandeln, damit unser Listener erhalten bleibt.
             client.setFlag(MinecraftConstants.FOLLOW_TRANSFERS, false);
             client.addListener(new Listener());
@@ -374,6 +399,27 @@ public class AfkClient {
             current.send(new ServerboundMovePlayerPosRotPacket(true, false, posX, posY, posZ, yaw, pitch));
         }
 
+        // Aktiver Anti-AFK: subtile, anticheat-sichere Aktivitaet gegen serverseitige AFK-Kicks.
+        // Manche Netzwerke trennen einen regungslosen Spieler trotz Keep-Alive mit einer
+        // Timeout-Meldung - ihnen reicht die immer gleiche Position/Blickrichtung nicht. Ein
+        // leichtes Umsehen (pendelnde Yaw/Pitch) + gelegentlicher Arm-Schwung wirkt wie ein
+        // echter Spieler, ohne ihn von der Stelle zu bewegen.
+        if (config.antiAfkEnabled && havePosition
+                && now - lastAntiAfk >= Math.max(5, config.antiAfkIntervalSeconds) * 1000L) {
+            lastAntiAfk = now;
+            if (config.antiAfkYawDegrees > 0) {
+                antiAfkLookFlip = !antiAfkLookFlip;
+                float dir = antiAfkLookFlip ? 1f : -1f;
+                yaw = wrapDegrees(yaw + (float) config.antiAfkYawDegrees * dir);
+                pitch = clampPitch(pitch + 1.5f * dir);
+                lastKeepAlive = now;
+                current.send(new ServerboundMovePlayerPosRotPacket(true, false, posX, posY, posZ, yaw, pitch));
+            }
+            if (config.antiAfkSwing) {
+                current.send(new ServerboundSwingPacket(Hand.MAIN_HAND));
+            }
+        }
+
         // Watchdog: Kommt laenger kein Paket vom Server, ist die Verbindung evtl. "halb tot".
         if (config.inboundSilenceTimeoutSeconds > 0 && lastInbound > 0
                 && now - lastInbound >= config.inboundSilenceTimeoutSeconds * 1000L) {
@@ -407,6 +453,31 @@ public class AfkClient {
                 outgoing.add(pc.command);
             }
         }
+    }
+
+    /** Fuehrt eine periodische Aufgabe aus, ohne den Scheduler durch eine Ausnahme zu killen. */
+    private void runSafely(Runnable task, String name) {
+        try {
+            task.run();
+        } catch (Throwable t) {
+            console.error("Interner Fehler in " + name + ": " + t);
+        }
+    }
+
+    /** Normalisiert einen Yaw-Winkel auf [-180, 180). */
+    private static float wrapDegrees(float deg) {
+        float d = deg % 360f;
+        if (d >= 180f) {
+            d -= 360f;
+        } else if (d < -180f) {
+            d += 360f;
+        }
+        return d;
+    }
+
+    /** Begrenzt den Pitch auf den gueltigen Bereich [-90, 90]. */
+    private static float clampPitch(float p) {
+        return p > 90f ? 90f : (p < -90f ? -90f : p);
     }
 
     private void maybeAcknowledge() {
@@ -660,6 +731,10 @@ public class AfkClient {
         console.info("  Ping:           " + (ping >= 0 ? ping + " ms" : "?"));
         console.info("  Online:         " + playerList.size());
         console.info("  Keep-Alive:     " + (config.keepAliveEnabled ? "an (" + config.keepAliveIntervalMs + "ms)" : "aus"));
+        console.info("  Anti-AFK aktiv: " + (config.antiAfkEnabled
+                ? "an (alle " + config.antiAfkIntervalSeconds + "s, " + (int) config.antiAfkYawDegrees + "°"
+                        + (config.antiAfkSwing ? " + Schwung" : "") + ")"
+                : "aus"));
         console.info("  Auto-Reconnect: " + (config.autoReconnect ? "an" : "aus"));
         console.info("  Auto-Respawn:   " + (config.autoRespawn ? "an" : "aus"));
         console.info("  Auto-TPA:       " + (config.autoAcceptTpa ? "an" : "aus"));
@@ -681,6 +756,7 @@ public class AfkClient {
         console.info("  Aktuell online:   " + formatDuration(online));
         console.info("  Verbindungen:     " + statConnects.get());
         console.info("  Reconnects:       " + statReconnects.get());
+        console.info("  Keep-Alives:      " + statKeepAlives.get());
         console.info("  Kicks/Trennungen: " + statKicks.get());
         console.info("  Tode:             " + statDeaths.get());
         console.info("  TPA angenommen:   " + statTpaAccepted.get());
@@ -755,6 +831,26 @@ public class AfkClient {
         @Override
         public void packetReceived(Session ignored, Packet packet) {
             lastInbound = System.currentTimeMillis();
+            // Keep-Alive ZUERST und sofort beantworten - das ist der eigentliche Schutz gegen
+            // disconnect.timeout. Der Server trennt, wenn die Antwort nicht rechtzeitig kommt;
+            // deshalb antworten wir, bevor wir (potenziell langsamen) Chat o. Ae. verarbeiten.
+            if (packet instanceof ClientboundKeepAlivePacket keepAlive) {
+                ClientSession current = session;
+                if (current != null && current.isConnected()) {
+                    current.send(new ServerboundKeepAlivePacket(keepAlive.getPingId()));
+                    statKeepAlives.incrementAndGet();
+                }
+                return;
+            }
+            // Ping ebenfalls sofort mit Pong beantworten - genau wie ein echter Vanilla-Client.
+            // Manche Proxys/Anticheats senden diesen Ping und werten ein Ausbleiben als Timeout.
+            if (packet instanceof ClientboundPingPacket ping) {
+                ClientSession current = session;
+                if (current != null && current.isConnected()) {
+                    current.send(new ServerboundPongPacket(ping.getId()));
+                }
+                return;
+            }
             if (packet instanceof ClientboundLoginPacket) {
                 onJoin();
             } else if (packet instanceof ClientboundSystemChatPacket chat) {
@@ -807,6 +903,18 @@ public class AfkClient {
             String bell = config.bellOnDisconnect ? Console.BELL : "";
             console.error(bell + "Getrennt: " + reasonDisplay);
 
+            // Diagnose: War die Verbindung beim Trennen noch "gesund" (gerade erst ein Server-Paket
+            // empfangen) -> aktiver Kick (z. B. AFK-System/Anticheat). War sie lange still -> die
+            // Verbindung ist weggebrochen (Netz/Proxy). Das hilft, die Ursache einzugrenzen.
+            if (wasKick) {
+                long quietSec = lastInbound > 0 ? (System.currentTimeMillis() - lastInbound) / 1000 : -1;
+                console.info("  Diagnose: letztes Server-Paket vor " + quietSec + "s, "
+                        + statKeepAlives.get() + " Keep-Alives beantwortet"
+                        + (quietSec >= 0 && quietSec < 10
+                                ? " -> Verbindung war gesund, vermutlich aktiver (AFK-/Anticheat-)Kick."
+                                : " -> Verbindung war still, vermutlich Netz-/Proxy-Abbruch."));
+            }
+
             // Bei Bann/Whitelist o. Ae. NICHT endlos neu verbinden.
             if (wasKick && matchesNoReconnect(reasonPlain)) {
                 console.error("Trennungsursache deutet auf Bann/Whitelist hin - kein Auto-Reconnect."
@@ -846,6 +954,7 @@ public class AfkClient {
         lastKeepAlive = connectedAt;
         lastInbound = connectedAt;
         lastRestart = connectedAt;
+        lastAntiAfk = connectedAt;
         statConnects.incrementAndGet();
         unacknowledged.set(0);
         outgoing.clear();
@@ -853,6 +962,10 @@ public class AfkClient {
         havePosition = false;
         playerList.clear();
         console.info("Verbunden und im Spiel als " + auth.username() + ".");
+
+        // Wie ein echter Client beim Beitritt die Spieleinstellungen senden. Manche Server/
+        // Anticheats erwarten dieses Paket und behandeln einen Client ohne es als "nicht geladen".
+        sendClientSettings();
 
         // Beitrittsbefehle.
         if (!config.onJoinCommands.isEmpty()) {
@@ -866,6 +979,18 @@ public class AfkClient {
             scheduler.schedule(() -> queueCommands(config.onKickCommands, "Nach-Kick-Befehle"),
                     Math.max(0, config.onKickDelaySeconds), TimeUnit.SECONDS);
         }
+    }
+
+    /** Sendet die Spieleinstellungen (Sprache, Render-Distanz, Skin-Teile ...) wie ein echter Client. */
+    private void sendClientSettings() {
+        ClientSession current = session;
+        if (current == null || !current.isConnected()) {
+            return;
+        }
+        current.send(new ServerboundClientInformationPacket(
+                "de_DE", 10, ChatVisibility.FULL, true,
+                Arrays.asList(SkinPart.values()), HandPreference.RIGHT_HAND,
+                false, true, ParticleStatus.ALL));
     }
 
     private void queueCommands(List<String> commands, String label) {
