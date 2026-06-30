@@ -15,7 +15,9 @@ import java.util.function.Supplier;
 public class HugoCompleter implements Completer {
 
     private static final List<String> COMMANDS = List.of(
-            ":help", ":status", ":players", ":server", ":reconnect", ":afk", ":quit", ":exit");
+            ":help", ":status", ":stats", ":config", ":players", ":list", ":server",
+            ":reconnect", ":antikick", ":tpa", ":reply", ":filter", ":mute", ":join",
+            ":kickcmd", ":death", ":hide", ":highlight", ":set", ":quit", ":exit");
 
     private final Supplier<Collection<String>> playerNames;
 
