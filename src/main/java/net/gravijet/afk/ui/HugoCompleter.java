@@ -1,4 +1,4 @@
-package com.hugoafk.ui;
+package net.gravijet.afk.ui;
 
 import org.jline.reader.Candidate;
 import org.jline.reader.Completer;
@@ -15,7 +15,12 @@ import java.util.function.Supplier;
 public class HugoCompleter implements Completer {
 
     private static final List<String> COMMANDS = List.of(
-            ":help", ":status", ":players", ":server", ":reconnect", ":afk", ":quit", ":exit");
+            ":help", ":status", ":stats", ":config", ":players", ":list", ":server",
+            ":reconnect", ":keepalive", ":tpa", ":reply", ":filter", ":mute", ":periodic",
+            ":trigger", ":alias", ":in", ":ignore", ":showonly", ":norecon",
+            ":join", ":kickcmd", ":death", ":hide", ":highlight",
+            ":history", ":pos", ":coords", ":clear", ":cls", ":reload", ":save",
+            ":set", ":quit", ":exit");
 
     private final Supplier<Collection<String>> playerNames;
 

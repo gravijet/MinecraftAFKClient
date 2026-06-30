@@ -3,7 +3,7 @@ plugins {
     id("com.gradleup.shadow") version "8.3.5"
 }
 
-group = "com.hugoafk"
+group = "net.gravijet.afk"
 version = "1.0.0"
 
 val mcProtocolLibVersion: String by project
@@ -46,7 +46,7 @@ java {
 }
 
 application {
-    mainClass.set("com.hugoafk.Main")
+    mainClass.set("net.gravijet.afk.Main")
 }
 
 tasks.shadowJar {

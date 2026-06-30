@@ -1,4 +1,4 @@
-package com.hugoafk.net;
+package net.gravijet.afk.net;
 
 import java.util.ArrayList;
 import java.util.Comparator;
