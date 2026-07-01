@@ -1,252 +1,101 @@
 # HugoAFKClient
 
-Ein schlanker **CLI-AFK-Client für Minecraft Java Edition**. Anmeldung mit dem
-Microsoft-Account, Verbindung zu einem Server, **Chat empfangen und senden** – alles im
-Terminal. Hält die Verbindung mit einem echten **Keep-Alive** aktiv und verbindet bei
-Abbruch automatisch neu.
+Schlanker Minecraft-Java-AFK-Client für die Kommandozeile. Ziel: **verbunden bleiben, nicht
+gekickt werden, Chat und Befehle senden/empfangen** – bei minimalem RAM-/CPU-Verbrauch.
 
-> **Warum `disconnect.timeout` passierte – und wie es behoben ist:** Der frühere
-> bewegungsbasierte Anti-AFK (Arm-Schwung + Drehung) wurde **entfernt**. `/afk` schützt
-> **nicht** vor dem Kick – der Befehl teleportiert nur in die AFK-Welt. Der `disconnect.timeout`
-> ist ein **Verbindungs-Timeout**: Sobald der Client keine Pakete mehr sendet, trennt der
-> Server/Proxy. Ein echter, stehender Vanilla-Client sendet weiterhin laufend
-> **stationäre Positionspakete**. Genau das macht der Client jetzt automatisch
-> (`keepAliveEnabled`, Standard alle `1000 ms`) – **gleiche Koordinaten, keine Bewegung**.
-> Zusätzlich: **eigene Befehle nach einem Kick** (`onKickCommands`), TPA-Anfragen automatisch
-> annehmen, private Nachrichten beantworten und den Chat-Spam filtern. Wer trotzdem in die
-> AFK-Welt will, legt `/afk` in `onJoinCommands` oder als periodischen Befehl ab.
->
-> **Update 1 – KeepAlive-Protokollpaket:** Neben den stationären Positionspaketen beantwortet
-> der Server ein eigenes **KeepAlive-Protokollpaket**; kommt die Antwort zu spät, folgt
-> `disconnect.timeout`. Bei Chat-Spam blockierte das synchrone Schreiben ins Terminal kurz den
-> Netzwerk-Thread und verzögerte genau diese Antwort. Jetzt wird das KeepAlive **selbst und mit
-> Vorrang** beantwortet (vor jeder Chat-Verarbeitung) und die **Terminal-Ausgabe läuft
-> asynchron**, sodass der Netzwerk-Thread frei bleibt.
->
-> **Update 2 – aktiver Anti-AFK gegen serverseitige AFK-Kicks:** Ein *völlig* regungsloser
-> Spieler (immer exakt gleiche Position/Blickrichtung) wird von manchen Netzwerken trotz
-> KeepAlive als „AFK" gewertet und mit einer Timeout-Meldung getrennt. Der Client sendet daher
-> jetzt in größeren Abständen **subtile, anticheat-sichere Aktivität** – ein leichtes Umsehen
-> (pendelnde Yaw/Pitch) und gelegentlich einen Arm-Schwung, **ohne den Spieler von der Stelle
-> zu bewegen** (`antiAfkEnabled`, Standard alle `20s`). Zusätzlich nennt die Trennungsmeldung
-> jetzt **„letztes Server-Paket vor Xs"**: war die Verbindung gesund (kleiner Wert), war es ein
-> aktiver AFK-/Anticheat-Kick; war sie lange still, ist die Verbindung weggebrochen (Netz/Proxy).
-> Ein **Watchdog** (Standard 60s ohne Server-Paket) baut „halb tote" Verbindungen ohnehin neu auf.
+Bewusst reduziert: kein Anti-AFK-**Bewegen**, keine Auto-TPA/Trigger/Filter/History/Logging usw.
+Der Kick-Schutz ist rein protokollbasiert (genau das, was ein wartender Vanilla-Client tut):
+Server-`KeepAlive` sofort beantworten, `Ping`→`Pong`, Teleport bestätigen, erzwungene
+Resource-Packs bestätigen (nicht laden), beim Beitritt `ClientInformation` senden.
 
-Gebaut mit **Java 21 + [MCProtocolLib](https://github.com/GeyserMC/MCProtocolLib)** (GeyserMC)
-und **[MinecraftAuth](https://github.com/RaphiMC/MinecraftAuth)** (RaphiMC). Diese Bibliotheken
-folgen der neuesten Minecraft-Version sehr schnell und unterstützen Secure-Chat sowie das
-korrekte Bestätigen erzwungener Resource-Packs – genau die Punkte, an denen mineflayer /
-node-minecraft-protocol oft scheitern.
+## Drei Jars – eine je Version
 
-## Funktionen
+MCProtocolLib spricht pro Build nur **eine** Protokollversion. Darum entstehen aus einer
+Codebasis drei getrennte, schlanke Jars:
 
-- Microsoft-Login per **Device-Code** (kein Browser-Callback nötig); Anmeldung wird
-  zwischengespeichert und automatisch erneuert.
-- Chat **empfangen** (farbig, mit Zeitstempel) und **senden**; Serverbefehle mit `/...`.
-- **Resource-Pack** wird bestätigt (nicht heruntergeladen) → kein Kick auf Servern, die ein
-  Pack erzwingen.
-- **Teleport-Bestätigung** → kein Rubber-Banding / Kick beim Spawn.
-- **Auto-Respawn** beim Tod (bleibt nicht im Todesbildschirm hängen) + **Tod-Befehle**.
-- **Keep-Alive gegen Timeout-Kicks** (stationäre Positionspakete, keine Bewegung) +
-  **Auto-Reconnect mit Backoff** inkl. **Jitter** und **Fallback-Servern**.
-- **Befehle nach einem Kick** (`onKickCommands`): genau das, was man sonst manuell tippt
-  (z. B. wieder `/afk`), läuft nach erneutem Beitritt automatisch.
-- **Auto-TPA**: eingehende Teleport-Anfragen automatisch annehmen (optional mit Whitelist).
-- **Auto-Antwort** auf private Nachrichten (mit Cooldown pro Spieler).
-- **Auto-Responder** (`:trigger`): bei Stichwort im Chat automatisch antworten/Befehl senden.
-- **Chat-Spam-Filter**: nervige Broadcasts (RTP-Suche etc.) ausblenden; dazu **Nur-Anzeigen-
-  Modus** (`:showonly`), **Ignorierliste** (`:ignore`), **Duplikat-Unterdrückung** und `:mute`.
-- **Periodische eigene Befehle** (`:periodic`) und **einmalige verzögerte Befehle** (`:in`).
-- **Befehls-Aliase** (`:alias`): Kurzbefehle wie `:h` → `/home`.
-- **Ban/Whitelist-Erkennung**: kein sinnloses Dauer-Reconnecten bei Bann
-  (`dontReconnectOnReasons`).
-- **Verbindungs-Watchdog** (`inboundSilenceTimeoutSeconds`) und **geplanter Neustart**
-  (`scheduledRestartMinutes`) halten die Session frisch.
-- **Aktion bei niedrigem Leben** (`lowHealthCommands`, z. B. `/warp spawn`).
-- **Laufzeit-Statistik** (`:stats`): Verbindungen, beantwortete Keep-Alives, Kicks, Reconnects,
-  Tode, TPAs, Trigger, Chat-Zeilen, letzte Trennungsursache.
-- **Chat-Historie** (`:history`), **Koordinaten** (`:pos`), **Bildschirm leeren** (`:clear`).
-- **Asynchrones Chat-Log** mit Größenrotation (entlastet den Netzwerk-Thread).
-- **Spielerliste** (`:players`) und **Status** (`:status`: Leben, Hunger, Ping, Online-Zahl).
-- **Highlight + Glocke**, wenn dein Name oder ein Stichwort im Chat fällt.
-- **Serverwechsel zur Laufzeit** (`:server <ip>`), CLI-Optionen, sauberes Beenden (Ctrl-C).
-- **Laufzeit-Konfiguration** über `:set`, `:config`, `:reload`/`:save` und Listenbefehle.
-- **Farbe abschaltbar** (`colorOutput` / `:set color off`) für Logfiles/Pipes.
-- **Tab-Vervollständigung** für `:`-Befehle und Online-Spielernamen.
-- **Auto-Beitrittsbefehle** (z. B. `/login`, `/register`) nach dem Spawn.
+| Jar | Minecraft | Backend | Größe | RAM (Idle, ca.) |
+|---|---|---|---|---|
+| `hugoafk-1.21.11.jar` | 1.21.11 | nativ | ~12 MB | 40–70 MB |
+| `hugoafk-26.1.jar` | 26.1 | nativ | ~12 MB | 40–70 MB |
+| `hugoafk-1.8.9.jar` | 1.8.9 | ViaVersion-Übersetzung | größer | höher |
 
-## „Nie gekickt werden" – eingebaute Schutzmechanismen
+## Bauen
 
-Der Client antwortet auf **genau dieselben Pakete wie ein echter Vanilla-Client** – jedes
-Paket, dessen Ignorieren sonst zum Kick führt, wird korrekt beantwortet:
+Gradle 8.14.3 läuft **nicht** unter Java 25 – die Build-Skripte suchen automatisch ein
+JDK 21 (oder 17), um Gradle zu starten. Die fertigen Jars laufen unabhängig davon auf Java 25.
 
-- **KeepAlive** – wird **selbst und mit Vorrang** beantwortet: die Antwort geht raus,
-  _bevor_ eingehender (ggf. spammender) Chat verarbeitet wird, sodass sie nie zu spät kommt
-  (kein „Timed out" / `disconnect.timeout`). Die gesamte Terminal-Ausgabe läuft dafür
-  **asynchron** über einen eigenen Thread und blockiert den Netzwerk-Thread nicht mehr.
-- **Ping → Pong** – der In-Game-Ping (von Proxys/Anticheats genutzt) wird sofort beantwortet,
-  genau wie es ein echter Vanilla-Client tut.
-- **Spieleinstellungen** – beim Beitritt wird `ClientInformation` (Sprache, Render-Distanz,
-  Skin-Teile, Haupthand …) gesendet, wie ein echter Client; Server/Anticheats, die das
-  erwarten, sehen einen vollständig „geladenen" Spieler.
-- **Resource-Pack** – bestätigt, auch wenn es erzwungen wird.
-- **Teleport** – wird bestätigt (kein Rubber-Banding / „moved wrongly").
-- **Chat-Acknowledgement** – empfangene Nachrichten werden quittiert (kein
-  „chat validation error").
-- **Spam-Schutz** – eigene Nachrichten/Befehle werden rate-limitiert gesendet
-  (`chatMinDelayMs`), damit kein „kicked for spamming".
-- **Cookies & Transfer** – Netzwerk-Cookies werden beantwortet und Server-Transfers
-  gefolgt (Velocity/BungeeCord-Netzwerke).
-- **Auto-Login** – per `onJoinCommands` z. B. `/login <pass>` automatisch senden, damit
-  Auth-Server nicht wegen fehlender Anmeldung kicken.
-- **Keep-Alive (Timeout-Schutz)** – periodische *stationäre* Positionspakete (gleiche
-  Koordinaten, keine Bewegung). Das verhindert `disconnect.timeout`, ohne den Spieler zu
-  bewegen, und wird nicht als „Bewegungs-Bot" erkannt. `/afk` hingegen schützt **nicht** vor
-  Kicks (nur Teleport in die AFK-Welt).
-- **Aktiver Anti-AFK** (`antiAfkEnabled`, Standard an) – gegen Netzwerke, die einen regungslosen
-  Spieler trotz Keep-Alive als „AFK" werten: subtiles Umsehen (pendelnde Yaw/Pitch) + gelegentlicher
-  Arm-Schwung, alle `antiAfkIntervalSeconds` (Std. 20s). Bewegt den Spieler **nicht** von der
-  Stelle und ist anticheat-sicher. Abschaltbar mit `:set antiafk off`.
-- **Befehle nach Kick** – kommt es doch zu einem Kick, läuft nach dem erneuten Beitritt
-  automatisch `onKickCommands` (z. B. wieder `/afk`).
-- **Auto-Reconnect** mit Backoff + Jitter + Fallback-Servern; bei
-  „throttled/already logged in" wird länger gewartet.
-- **Verbindungs-Watchdog** – kommt `inboundSilenceTimeoutSeconds` lang kein Paket vom
-  Server, wird die evtl. „halb tote" Verbindung proaktiv neu aufgebaut (Standard 60s, 0 = aus).
-  Hilft gegen stilles Einfrieren / `disconnect.endOfStream`, das sonst nie als Trennung ankommt.
-- **Geplanter Neustart** – `scheduledRestartMinutes` baut die Verbindung regelmäßig neu
-  auf, um Session-Verfall vorzubeugen (0 = aus).
-- **Ban/Whitelist-Erkennung** – enthält die Trennungsursache z. B. „banned"/„whitelist"
-  (`dontReconnectOnReasons`), wird **nicht** endlos neu verbunden; `:reconnect` erzwingt es.
-
-> Hinweis: Manuelle Kicks (Ban, Whitelist, Server voll) oder erzwungener **signierter
-> Chat** (`enforce-secure-profile=true`) lassen sich client-seitig nicht umgehen.
-
-## Voraussetzungen: JDK 21 installieren
-
-**Debian 13 / Ubuntu 24.04:**
+```powershell
+# Windows
+.\build-all.ps1
+```
 ```bash
-sudo apt update
-sudo apt install -y openjdk-21-jdk
+# Linux/macOS/Git-Bash
+./build-all.sh
 ```
 
-**Ubuntu 22.04** (JDK 21 nicht in den Standard-Repos – Eclipse Temurin nutzen):
+Einzeln:  `./gradlew shadowJar -Pvariant=26.1`  (bzw. `1.21.11` / `1.8.9`).
+
+## Starten
+
+Der Launcher zeigt ein Versionsmenü und startet das passende Jar mit ressourcensparenden
+JVM-Argumenten (abgestimmt auf **AMD Ryzen 9 9950X3D + 32 GB DDR5**):
+
+```powershell
+.\hugoafk.ps1            # Windows
+```
 ```bash
-sudo apt install -y wget apt-transport-https gpg
-wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
-  | sudo tee /etc/apt/keyrings/adoptium.asc
-echo "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb \
-  $(awk -F= '/VERSION_CODENAME/{print$2}' /etc/os-release) main" \
-  | sudo tee /etc/apt/sources.list.d/adoptium.list
-sudo apt update
-sudo apt install -y temurin-21-jdk
+./hugoafk.sh             # Linux/macOS/Git-Bash
 ```
 
-## Bauen & Starten
+Danach: Konto wählen, Server-IP eingeben, verbinden.
 
-```bash
-git clone <repo-url>
-cd HugoAFKClient
-./gradlew shadowJar          # baut build/libs/hugoafkclient.jar
-./run.sh                      # startet den Client
-# optional direkt einen Server angeben:
-./run.sh mc.example.net
-./run.sh mc.example.net:25565
+### CLI-Befehle (im Spiel)
+
+- Text tippen = chatten, `/befehl` = Serverbefehl
+- `:account` – Konto wechseln/verwalten (mehrere Microsoft-Konten)
+- `:server <ip>` – Server wechseln · `:reconnect` – neu verbinden
+- `:clear` – Bildschirm leeren · `:quit` – beenden
+
+## Microsoft-Login & Konten wechseln
+
+Anmeldung per **Device-Code** (kein Browser-Callback). Es werden **mehrere Konten**
+unterstützt: jedes Konto liegt als eigene Datei unter `~/.config/hugoafk/accounts/<name>.json`.
+Im Menü `:account` kannst du zwischen Konten wechseln, per Microsoft-Login ein neues hinzufügen
+oder eines entfernen. Es ist immer nur das **aktive** Konto im Speicher – die Multi-Konto-Funktion
+kostet praktisch keinen zusätzlichen RAM. Eine alte einzelne `auth.json` wird beim ersten Start
+automatisch als erstes Konto übernommen.
+
+## JVM-Argumente (warum so sparsam)
+
+Vom Launcher gesetzt – optimiert für **eine** Verbindung und minimalen Fußabdruck:
+
+```
+-Xms16m -Xmx96m               kleiner Heap (1.8.9: -Xmx320m wegen Via-Mappings)
+-XX:+UseSerialGC              1 GC-Thread statt vieler paralleler
+-XX:TieredStopAtLevel=1       niedrige JIT-Last, kleiner Code-Cache
+-Xss512k                      kleine Thread-Stacks (nur wenige Threads)
+-Dio.netty.eventLoopThreads=1 EIN Netty-Thread statt ~64 auf 16C/32T!
+-Dio.netty.allocator.type=unpooled + numHeapArenas=1 + numDirectArenas=1
+-XX:MaxDirectMemorySize=32m   Direct-Memory begrenzen
+-XX:+UseCompactObjectHeaders  kompakte Header (JDK 24+, nur wenn unterstützt)
 ```
 
-Beim ersten Start erscheint ein **Microsoft-Login-Code**: die angezeigte URL öffnen, den
-Code eingeben, fertig. Danach wird die Anmeldung gespeichert.
-
-### CLI-Optionen
-
-```
-java -jar hugoafkclient.jar [optionen] [host[:port]]
-  --server <host[:port]>     Server-Adresse
-  --no-reconnect             Auto-Reconnect deaktivieren
-  --no-keepalive             Keep-Alive (Timeout-Schutz) deaktivieren
-  --keepalive-interval <ms>  Intervall des Keep-Alive-Pakets (Standard 1000)
-  --auto-tpa                 TPA-Anfragen automatisch annehmen
-  --mute                     eingehenden Chat ausblenden
-  --no-filter                Chat-Spam-Filter deaktivieren
-  -h, --help                 Hilfe
-```
-
-> `--no-afk` funktioniert als Alias für `--no-keepalive` weiter.
-
-## Bedienung
-
-- Text tippen + Enter → Chat-Nachricht senden.
-- `/befehl` → Serverbefehl (z. B. `/list`).
-- Interne Befehle:
-  - `:help` – Hilfe
-  - `:status` – Verbindung, Leben/Hunger, Ping, Online-Zahl, aktive Schalter
-  - `:stats` – Laufzeit-Statistik (Kicks, Reconnects, Tode, TPAs, Chat-Zeilen)
-  - `:config` – aktuelle Konfiguration anzeigen
-  - `:players` – Online-Spieler auflisten
-  - `:server <ip>` – zu anderem Server wechseln
-  - `:reconnect` – neu verbinden
-  - `:keepalive on|off` – Keep-Alive (Timeout-Schutz) ein/aus
-  - `:keepalive interval <ms>` – Keep-Alive-Intervall setzen
-  - `:tpa on|off` – TPA-Anfragen automatisch annehmen
-  - `:reply on|off` / `:reply msg <text>` – Auto-Antwort auf private Nachrichten
-  - `:filter on|off` – Chat-Spam-Filter; `:mute on|off` – gesamten Chat aus/ein
-  - `:periodic add <sek> <cmd>` – periodischen Befehl (z. B. `/afk`) hinzufügen
-  - `:in <sek> <cmd>` – Befehl/Chat einmalig verzögert senden
-  - `:trigger add <auslöser> | <antwort>` – Auto-Responder (Stichwort → Antwort/Befehl)
-  - `:alias add <name> <cmd>` – Kurzbefehl, danach z. B. `:h` → `/home`
-  - `:ignore add|remove|list` – Spieler im Chat ausblenden
-  - `:showonly add|…` – nur Zeilen mit diesen Texten anzeigen (Whitelist-Modus)
-  - `:norecon add|…` – Trennungsgründe, bei denen NICHT neu verbunden wird
-  - `:join` / `:kickcmd` / `:death` – Befehlslisten pflegen (`add|remove|clear|list`)
-  - `:hide` / `:highlight` – Filter- bzw. Highlight-Wörter pflegen
-  - `:history [n]` – letzte n Chat-Zeilen · `:pos` – Koordinaten · `:clear` – Bildschirm leeren
-  - `:reload` / `:save` – Konfiguration neu laden / speichern
-  - `:set <key> <wert>` – Einzelwert zur Laufzeit ändern (Keys siehe `:config`)
-  - `:quit` – beenden
+Der Client selbst nutzt zusätzlich nur wenige Threads (1× Netty, 1× Paketverarbeitung,
+1× Konsolen-Ausgabe, 1× Sender), keinen Dauer-Timer.
 
 ## Konfiguration
 
-Liegt unter `~/.config/hugoafk/`:
-- `config.json` – alle Einstellungen. Die Datei wird beim ersten Start mit Standardwerten
-  angelegt und bei Schema-Erweiterungen automatisch ergänzt. Wichtige Felder:
+`~/.config/hugoafk/`:
+- `config.json` – Server, aktives Konto, Reconnect-Verhalten, Farben, Chat-Delay
+- `accounts/` – gespeicherte Microsoft-Konten
 
-  | Bereich | Felder |
-  | --- | --- |
-  | Verbindung | `lastServer`, `autoReconnect`, `reconnectDelaySeconds`, `maxReconnectAttempts`, `maxBackoffSeconds`, `reconnectJitterMs`, `fallbackServers`, `dontReconnectOnReasons`, `scheduledRestartMinutes`, `inboundSilenceTimeoutSeconds` |
-  | Keep-Alive | `keepAliveEnabled`, `keepAliveIntervalMs` (Std. 1000) |
-  | Anti-AFK | `antiAfkEnabled` (Std. an), `antiAfkIntervalSeconds` (Std. 20), `antiAfkYawDegrees` (Std. 12), `antiAfkSwing` |
-  | Ereignis-Befehle | `onJoinCommands`, `onJoinDelaySeconds`, `onKickCommands`, `onKickDelaySeconds`, `onDeathCommands` |
-  | Periodisch / Trigger | `periodicCommands` (`{enabled, command, intervalSeconds}`), `triggers` (`{enabled, contains, response, cooldownSeconds}`) |
-  | Auto-TPA | `autoAcceptTpa`, `autoAcceptTpaWhitelist`, `tpaAcceptCommand`, `tpaRequestMarker` |
-  | Auto-Antwort | `autoReplyEnabled`, `autoReplyMessage`, `autoReplyCommand`, `privateMessageMarker`, `autoReplyCooldownSeconds` |
-  | Chat-Filter | `chatFilterEnabled`, `chatHideFilters`, `chatShowOnly`, `ignoredPlayers`, `collapseDuplicates`, `muteChat` |
-  | Aliase | `commandAliases` (Map `name` → Befehl/Text) |
-  | Gesundheit | `autoRespawn`, `lowHealthActionEnabled`, `lowHealthThreshold`, `lowHealthCommands` |
-  | Anzeige | `showTimestamps`, `logChat`, `colorOutput`, `chatHistorySize`, `maxLogBytes`, `highlightUsername`, `highlightKeywords`, `bellOnHighlight`, `bellOnDisconnect`, `announcePlayerJoinLeave` |
-  | Spam-Schutz | `chatMinDelayMs` |
+## 1.8.9-Status
 
-  Beispiel `onJoinCommands`: `["/login meinPasswort"]` ·
-  Beispiel `onKickCommands`: `["/afk"]` ·
-  Beispiel `periodicCommands`: `[{"enabled":true,"command":"/hub","intervalSeconds":600}]` ·
-  Beispiel `triggers`: `[{"enabled":true,"contains":"hilfe?","response":"/spawn","cooldownSeconds":30}]` ·
-  Beispiel `commandAliases`: `{"h":"/home","s":"/spawn"}`
-- `auth.json` – zwischengespeicherte Anmeldung (enthält Tokens; nicht weitergeben).
-- `chat.log` – mitgeschriebener Chat, asynchron geschrieben und bei `maxLogBytes`
-  rotiert (`chat.log.1`); abschaltbar via `logChat`.
+1.8.9 hat **keine** native Client-Bibliothek; die Verbindung läuft über den
+ViaVersion-Übersetzungs-Stack (nativ 1.21.11 → 1.8.9). Dieses Jar ist daher größer und
+ressourcenhungriger als die nativen Jars. Der Launcher listet es nur, wenn es gebaut wurde.
 
-## Minecraft-Version anpassen
+## Voraussetzungen
 
-Der Client bündelt **eine** Protokollversion. Standard ist die neueste
-(`mcProtocolLibVersion=26.1-1` in `gradle.properties`). Bei einem
-„Outdated client/server"-Disconnect die Version passend zum Server setzen, z. B.
-`1.21.11-1` für Minecraft 1.21.11, dann neu bauen. Verfügbare Versionen:
-<https://repo.opencollab.dev/maven-releases/org/geysermc/mcprotocollib/protocol/>
-
-## Hinweise
-
-- Chat wird **unsigniert** gesendet. Das funktioniert auf Servern mit
-  `enforce-secure-profile=false` (bei Plugin-/Modding-Servern üblich). Erzwingt ein Server
-  signierten Chat, kommen eigene Nachrichten ggf. nicht an – Empfang und AFK bleiben
-  unberührt.
-- Nur für Server gedacht, auf denen du spielen darfst.
+- **Laufzeit:** Java 21+ (getestet mit Java 25)
+- **Build:** zusätzlich ein JDK 21/17 für Gradle (automatisch gefunden)
