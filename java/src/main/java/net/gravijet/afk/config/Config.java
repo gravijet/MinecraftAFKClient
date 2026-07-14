@@ -36,6 +36,13 @@ public class Config {
     /** Mindestabstand zwischen zwei ausgehenden Nachrichten in ms (gegen Spam-Kick). */
     public int chatMinDelayMs = 1000;
 
+    /** Nach einem echten Beitritt (Proxy-Login) automatisch einen Befehl senden. */
+    public boolean autoCommandEnabled = true;
+    /** Automatisch zu sendender Befehl nach dem Beitritt (z. B. "/afk"). Leer = aus. */
+    public String autoCommand = "/afk";
+    /** Verzögerung in Sekunden zwischen Beitritt und dem Auto-Befehl. */
+    public int autoCommandDelaySeconds = 4;
+
     private transient Path file;
 
     public static Config load(Path file) {
@@ -64,6 +71,8 @@ public class Config {
         if (reconnectDelaySeconds < 1) reconnectDelaySeconds = 1;
         if (maxBackoffSeconds < 1) maxBackoffSeconds = 1;
         if (chatMinDelayMs < 200) chatMinDelayMs = 200;
+        if (autoCommand == null) autoCommand = "";
+        if (autoCommandDelaySeconds < 0) autoCommandDelaySeconds = 0;
     }
 
     public void save() {
