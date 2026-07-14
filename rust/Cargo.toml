@@ -1,0 +1,43 @@
+[package]
+name = "hugoafk"
+version = "1.0.0"
+edition = "2021"
+description = "Schlanker Minecraft-AFK-Client (nur MC 26.1, Protokoll 775) – minimaler RAM-/CPU-Verbrauch"
+
+[[bin]]
+name = "hugoafk"
+path = "src/main.rs"
+
+[dependencies]
+# HTTPS nur für Login/Token-Refresh und den Sitzungs-Join (kurze Bursts, danach wieder frei).
+# native-tls statt rustls: nutzt unter Windows das eingebaute SChannel – kein C-Compiler nötig
+# (rustls zöge `ring` nach) und kein mitgeschleppter Wurzelzertifikat-Speicher im RAM.
+ureq = { version = "2", default-features = false, features = ["json", "native-tls", "gzip"] }
+native-tls = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Paket-Kompression (zlib) – reine Rust-Implementierung, kein C.
+flate2 = "1"
+# AES-128 als Blockchiffre; CFB8 ist in conn.rs von Hand implementiert (spart eine Abhängigkeit).
+aes = "0.8"
+# RSA/PKCS1v15 für das Verschlüsselungs-Handshake mit dem Server.
+rsa = "0.9"
+sha1 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# Nur um beim Anlegen eines NEUEN Kontos ein deviceKeyPair zu erzeugen, das der Java-Client lesen kann.
+p256 = { version = "0.13", features = ["pkcs8"] }
+# Rohmodus-Terminal: Chat kann eintrudeln, während man tippt.
+crossterm = "0.28"
+
+[target.'cfg(windows)'.dependencies]
+# Nur für SetConsoleOutputCP(UTF-8) – ohne das zerlegt die Windows-Konsole jeden Umlaut.
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+# Auf minimalen Fußabdruck getrimmt: kleine Binary, ein Codegen-Unit, kein Unwind-Tabellen-Ballast.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
