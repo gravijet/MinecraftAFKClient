@@ -12,7 +12,7 @@ use crate::auth::{self, Account};
 use crate::buf::{Reader, Writer};
 use crate::config::Config;
 use crate::conn::{self, PacketReader, PacketWriter};
-use crate::console::Console;
+use crate::console::{Console, Link};
 use crate::proto::{config as cfg, game, handshake, login, pack_status, State};
 use crate::proto::{MINECRAFT_VERSION, PROTOCOL_VERSION};
 use crate::{dns, nbt};
@@ -23,13 +23,17 @@ use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Ab so vielen empfangenen Chat-Nachrichten wird ungefragt quittiert (wie im Vanilla-Client).
-const ACK_THRESHOLD: u32 = 20;
+/// Ab so vielen unquittierten **signierten** Nachrichten wird ungefragt quittiert – derselbe
+/// Schwellwert wie im Vanilla-Client (der Server trennt erst bei 4096).
+const ACK_THRESHOLD: u32 = 64;
+/// Längengrenzen des Servers: Chat-Nachricht 256 Zeichen, Befehl 32500.
+const MAX_MESSAGE_CHARS: usize = 256;
+const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
 
 /// Warteschlange ausgehender Nachrichten – mit `clear()`, damit nach einem Reconnect keine
@@ -49,15 +53,31 @@ pub struct Shared {
     cookies: Mutex<HashMap<String, Vec<u8>>>,
     queue: Queue,
 
+    /// Weckt den Befehls-Planer, sobald die Verbindung endet oder die Liste sich ändert –
+    /// sonst schläft er blockierend bis zum nächsten Termin (0 % CPU im Leerlauf).
+    idle: (Mutex<()>, Condvar),
+
     in_game: AtomicBool,
     running: AtomicBool,
     shutting_down: AtomicBool,
     /// Trennung wurde von uns ausgelöst (:reconnect, :server, Kontowechsel) -> ohne Backoff neu verbinden.
     intentional: AtomicBool,
-    /// Zählt Verbindungs-Generationen: ein wartender Auto-Befehl erkennt daran, dass „seine"
+    /// Zählt Verbindungs-Generationen: ein wartender Befehl erkennt daran, dass „seine"
     /// Verbindung längst tot ist, und feuert dann nicht mehr.
     generation: AtomicU32,
+    /// Zählt Änderungen an der Befehlsliste – ein laufender Planer beendet sich dadurch.
+    command_epoch: AtomicU32,
+    /// Empfangene signierte Nachrichten, die der Server noch quittiert haben will.
     unacked: AtomicU32,
+    /// Zeitstempel der letzten gesendeten Nachricht; der Server verlangt monotone Zeit.
+    last_chat_ms: AtomicI64,
+}
+
+/// Ausweis eines Befehls-Planers: gilt nur für „seine" Verbindung und „seine" Befehlsliste.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Ticket {
+    generation: u32,
+    epoch: u32,
 }
 
 pub struct Client {
@@ -77,13 +97,17 @@ impl Client {
                 items: Mutex::new(VecDeque::new()),
                 signal: Condvar::new(),
             },
+            idle: (Mutex::new(()), Condvar::new()),
             in_game: AtomicBool::new(false),
             running: AtomicBool::new(true),
             shutting_down: AtomicBool::new(false),
             intentional: AtomicBool::new(false),
             generation: AtomicU32::new(0),
+            command_epoch: AtomicU32::new(0),
             unacked: AtomicU32::new(0),
+            last_chat_ms: AtomicI64::new(0),
         });
+        shared.update_status(Link::Offline);
 
         let net = Arc::clone(&shared);
         thread::Builder::new()
@@ -121,16 +145,27 @@ impl Client {
     /// Konto wechseln und mit dem neuen Konto sofort neu verbinden.
     pub fn set_account(&self, account: Account) {
         *self.shared.account.lock().unwrap() = account;
-        self.shared.console.info("Konto gewechselt – verbinde neu ...");
+        self.shared.console.note("Konto gewechselt – verbinde neu ...");
         self.shared.drop_connection(true);
     }
 
     pub fn switch_server(&self, host: String, port: u16, srv: bool) {
         self.shared
             .console
-            .info(&format!("Wechsle zu {}:{} ...", host, port));
+            .note(&format!("Wechsle zu {}:{} ...", host, port));
         *self.shared.target.lock().unwrap() = (host, port, srv);
         self.shared.drop_connection(true);
+    }
+
+    /// Geänderte Konfiguration übernehmen. Läuft gerade ein Befehls-Planer, wird er beendet
+    /// und – wenn wir im Spiel sind – mit der neuen Liste neu gestartet.
+    pub fn update_config(&self, config: Config) {
+        *self.shared.config.lock().unwrap() = config;
+        self.shared.command_epoch.fetch_add(1, Ordering::SeqCst);
+        self.shared.wake();
+        if self.shared.in_game.load(Ordering::Relaxed) {
+            start_commands(&self.shared);
+        }
     }
 
     pub fn shutdown(&self) {
@@ -138,6 +173,7 @@ impl Client {
         self.shared.running.store(false, Ordering::SeqCst);
         self.shared.intentional.store(true, Ordering::SeqCst);
         self.shared.queue.signal.notify_all();
+        self.shared.wake();
         if let Some(writer) = self.shared.writer.lock().unwrap().as_ref() {
             writer.shutdown();
         }
@@ -170,8 +206,89 @@ impl Shared {
         }
     }
 
+    /// Chat-/Serverzeile anzeigen (mit Uhrzeit davor).
     fn display(&self, text: &str) {
-        self.console.print(text);
+        self.console.chat(text);
+    }
+
+    /// Zustandszeile unter dem Eingabefeld nachziehen.
+    fn update_status(&self, link: Link) {
+        let account = self.account.lock().unwrap().name.clone();
+        let (host, port, _) = self.target.lock().unwrap().clone();
+        let server = if host.is_empty() {
+            "kein Server".to_string()
+        } else if port == DEFAULT_PORT {
+            host
+        } else {
+            format!("{}:{}", host, port)
+        };
+        let state = match link {
+            Link::Online => "verbunden",
+            Link::Connecting => "verbinde",
+            Link::Offline => "getrennt",
+        };
+        self.console.set_status(
+            link,
+            &format!("{}  ·  {}  ·  {}  ·  :help", state, server, account),
+        );
+    }
+
+    /// Zeitstempel für die nächste Nachricht – nie kleiner als der vorige, sonst trennt der
+    /// Server mit `out_of_order_chat`.
+    fn next_chat_time(&self) -> i64 {
+        let now = now_ms();
+        let mut last = self.last_chat_ms.load(Ordering::Relaxed);
+        loop {
+            let stamp = now.max(last + 1);
+            match self.last_chat_ms.compare_exchange_weak(
+                last,
+                stamp,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return stamp,
+                Err(current) => last = current,
+            }
+        }
+    }
+
+    fn ticket(&self) -> Ticket {
+        Ticket {
+            generation: self.generation.load(Ordering::SeqCst),
+            epoch: self.command_epoch.load(Ordering::SeqCst),
+        }
+    }
+
+    fn valid(&self, ticket: Ticket) -> bool {
+        self.running.load(Ordering::Relaxed) && self.ticket() == ticket
+    }
+
+    /// Höchstens `duration` warten, ohne zu pollen. `false` = Verbindung beendet, Programm
+    /// beendet oder Befehlsliste geändert: der Aufrufer soll aufhören.
+    fn wait(&self, duration: Duration, ticket: Ticket) -> bool {
+        let mut left = duration;
+        let mut guard = self.idle.0.lock().unwrap();
+        loop {
+            if !self.valid(ticket) {
+                return false;
+            }
+            if left.is_zero() {
+                return true;
+            }
+            let started = Instant::now();
+            let (next, result) = self.idle.1.wait_timeout(guard, left).unwrap();
+            guard = next;
+            if result.timed_out() {
+                return self.valid(ticket);
+            }
+            left = left.saturating_sub(started.elapsed());
+        }
+    }
+
+    /// Alle Wartenden wecken (Verbindung beendet, Liste geändert, Programmende).
+    fn wake(&self) {
+        let _guard = self.idle.0.lock().unwrap();
+        self.idle.1.notify_all();
     }
 }
 
@@ -197,28 +314,67 @@ fn sender_loop(shared: Arc<Shared>) {
             continue; // gerade nicht verbunden: still verwerfen
         }
 
-        let offset = shared.unacked.swap(0, Ordering::Relaxed);
-        shared.send(chat_packet(&input, offset));
+        // Erst säubern, dann senden: sonst könnte eine Nachricht wegfallen, deren
+        // Quittungs-Offset schon verbraucht wäre.
+        let Some(outgoing) = prepare(&input) else {
+            continue;
+        };
+        match outgoing {
+            // Befehle tragen KEINE Quittung (das Paket hat kein lastSeenMessages-Feld),
+            // der Offset darf hier also nicht verbraucht werden.
+            Outgoing::Command(command) => {
+                let mut w = Writer::packet(game::SB_CHAT_COMMAND);
+                w.string(&command);
+                shared.send(w);
+            }
+            Outgoing::Message(message) => {
+                let offset = shared.unacked.swap(0, Ordering::Relaxed);
+                shared.send(chat_packet(&shared, &message, offset));
+            }
+        }
 
         let delay = shared.config.lock().unwrap().chat_min_delay_ms.max(200);
         thread::sleep(Duration::from_millis(delay));
     }
 }
 
-fn chat_packet(input: &str, offset: u32) -> Writer {
+enum Outgoing {
+    Command(String),
+    Message(String),
+}
+
+/// Eingabe in ein sendbares Paket übersetzen. `None`, wenn nach dem Säubern nichts übrig ist.
+fn prepare(input: &str) -> Option<Outgoing> {
     if let Some(command) = input.strip_prefix('/') {
-        let mut w = Writer::packet(game::SB_CHAT_COMMAND);
-        w.string(command);
-        return w;
+        let command = sanitize(command, MAX_COMMAND_CHARS);
+        return (!command.is_empty()).then_some(Outgoing::Command(command));
     }
+    let message = sanitize(input, MAX_MESSAGE_CHARS);
+    (!message.is_empty()).then_some(Outgoing::Message(message))
+}
+
+/// Zeichen entfernen, die der Server verbietet (§, Steuerzeichen, DEL), und auf die
+/// erlaubte Länge kürzen. Ohne das trennt er mit `illegal_chat_characters` bzw. der
+/// Paket-Decoder bricht ab.
+fn sanitize(input: &str, limit: usize) -> String {
+    input
+        .chars()
+        .filter(|c| *c != '\u{a7}' && *c >= ' ' && *c != '\u{7f}')
+        .take(limit)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
     let mut w = Writer::packet(game::SB_CHAT);
-    w.string(input);
-    w.i64(now_ms());
+    w.string(message);
+    w.i64(shared.next_chat_time());
     w.i64(0); // salt
     w.bool(false); // keine Signatur (unsignierter Chat)
     w.var_int(offset as i32);
     w.raw(&[0, 0, 0]); // Bitset der zuletzt gesehenen Nachrichten (20 Bit = 3 Byte)
-    w.u8(0); // checksum
+    w.u8(0); // Prüfsumme 0 = „bitte nicht prüfen"
     w
 }
 
@@ -233,10 +389,13 @@ fn net_loop(shared: Arc<Shared>) {
         shared.in_game.store(false, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         *shared.writer.lock().unwrap() = None;
+        // Wartende Befehls-Planer erkennen an der neuen Generation, dass sie fertig sind.
+        shared.wake();
 
         if shared.shutting_down.load(Ordering::Relaxed) {
             return;
         }
+        shared.update_status(Link::Offline);
         if let Err(e) = result {
             shared.console.error(&format!("Getrennt: {}", e));
         }
@@ -255,7 +414,9 @@ fn net_loop(shared: Arc<Shared>) {
             )
         };
         if !auto {
-            shared.console.info("Auto-Reconnect ist aus – mit :reconnect neu verbinden.");
+            shared
+                .console
+                .warn("Auto-Reconnect ist aus – mit :reconnect neu verbinden.");
             return;
         }
 
@@ -264,7 +425,7 @@ fn net_loop(shared: Arc<Shared>) {
         let delay = (base.saturating_mul(1 << exponent)).clamp(1, max);
         shared
             .console
-            .info(&format!("Reconnect-Versuch {} in {}s ...", attempts, delay));
+            .info(&format!("Reconnect-Versuch {} in {} s ...", attempts, delay));
 
         // In Sekundenschritten schlafen, damit :quit nicht bis zu 60 s hängt.
         for _ in 0..delay {
@@ -287,7 +448,8 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         (host.clone(), port)
     };
 
-    shared.console.info(&format!(
+    shared.update_status(Link::Connecting);
+    shared.console.note(&format!(
         "Verbinde zu {}:{} (MC {}) ...",
         real_host, real_port, MINECRAFT_VERSION
     ));
@@ -320,6 +482,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         joined: false,
         position: None,
         dead: false,
+        last_signature: None,
     };
 
     let mut packet: Vec<u8> = Vec::with_capacity(1024);
@@ -359,6 +522,9 @@ struct Session {
     joined: bool,
     position: Option<(f64, f64, f64, f32, f32)>,
     dead: bool,
+    /// Signatur der letzten gezählten Nachricht. Der Server zählt zwei gleiche Signaturen
+    /// direkt hintereinander nur einmal – der Vanilla-Client macht es genauso.
+    last_signature: Option<Box<[u8; 256]>>,
 }
 
 // ===================== Login-Phase =====================
@@ -527,11 +693,20 @@ fn handle_game(
             }
         }
         game::CB_PLAYER_CHAT => {
-            if let Some(line) = parse_player_chat(shared, r) {
-                shared.unacked.fetch_add(1, Ordering::Relaxed);
-                shared.display(&line);
-                maybe_acknowledge(shared);
+            let chat = parse_player_chat(shared, r);
+            // Nur SIGNIERTE Nachrichten führt der Server in seiner Quittungsliste. Zählte man
+            // unsignierte mit (Plugin-/Proxy-Chat!), wäre unser Offset größer als das, was der
+            // Server erwartet – und er trennt mit „chat_validation_failed".
+            if let Some(signature) = chat.signature {
+                if session.last_signature.as_deref() != Some(signature.as_ref()) {
+                    session.last_signature = Some(signature);
+                    shared.unacked.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            if let Some(line) = chat.line {
+                shared.display(&line);
+            }
+            maybe_acknowledge(shared);
         }
         game::CB_PLAYER_POSITION => handle_position(shared, session, r)?,
         game::CB_SET_HEALTH => {
@@ -569,22 +744,25 @@ fn handle_game(
 }
 
 /// Beitritt verarbeiten. `first_join` = erstes Login-Paket dieser Verbindung, also der echte
-/// Beitritt zum (Velocity/BungeeCord-)Proxy. Nur dann läuft der Auto-Befehl.
+/// Beitritt zum (Velocity/BungeeCord-)Proxy. Nur dann starten die Befehle.
 fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     shared.in_game.store(true, Ordering::SeqCst);
+    // Der Server beginnt mit einer frischen Quittungsliste – unser Zähler muss mit.
     shared.unacked.store(0, Ordering::Relaxed);
     shared.queue.clear();
     session.position = None;
     session.dead = false;
+    session.last_signature = None;
 
     shared.send(client_information(game::SB_CLIENT_INFORMATION));
+    shared.update_status(Link::Online);
 
     if first_join {
         let name = shared.account.lock().unwrap().name.clone();
         shared
             .console
-            .info(&format!("Verbunden und im Spiel als {}.", name));
-        schedule_auto_command(shared);
+            .ok(&format!("Verbunden und im Spiel als {}.", name));
+        start_commands(shared);
     } else {
         shared
             .console
@@ -592,33 +770,68 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     }
 }
 
-/// Auto-Befehl (z. B. `/afk`) nach dem echten Beitritt – über einen kurzlebigen Thread statt
-/// eines dauerhaften Schedulers: im Leerlauf kostet das Feature 0 Threads und 0 RAM.
-fn schedule_auto_command(shared: &Arc<Shared>) {
-    let (enabled, command, delay) = {
-        let config = shared.config.lock().unwrap();
-        (
-            config.auto_command_enabled,
-            config.auto_command.trim().to_string(),
-            config.auto_command_delay_seconds,
-        )
-    };
-    if !enabled || command.is_empty() {
+/// Wiederkehrende Befehle nach dem echten Beitritt.
+///
+/// **Ein** Thread für alle Einträge: er schläft blockierend bis zum nächsten Termin (kein
+/// Polling, 0 % CPU im Leerlauf) und beendet sich, sobald die Verbindung endet oder die Liste
+/// geändert wird. Ohne Befehle wird gar kein Thread gestartet.
+fn start_commands(shared: &Arc<Shared>) {
+    let list = shared.config.lock().unwrap().active_commands();
+    if list.is_empty() {
         return;
     }
-
-    let generation = shared.generation.load(Ordering::SeqCst);
+    let ticket = shared.ticket();
     let shared = Arc::clone(shared);
     thread::Builder::new()
-        .name("hugoafk-autocmd".into())
+        .name("hugoafk-cmds".into())
         .spawn(move || {
-            thread::sleep(Duration::from_secs(delay));
-            // Gehört der Befehl noch zur selben, lebenden Verbindung?
-            if shared.generation.load(Ordering::SeqCst) == generation
-                && shared.in_game.load(Ordering::Relaxed)
-            {
-                shared.console.info(&format!("Auto-Befehl: {}", command));
-                shared.queue.push(command);
+            let start = Instant::now();
+            // Nächster Termin je Eintrag, gemessen ab dem Beitritt. `None` = erledigt.
+            let mut due: Vec<Option<Duration>> = list
+                .iter()
+                .map(|c| Some(Duration::from_secs(c.delay_seconds)))
+                .collect();
+
+            loop {
+                // Frühesten offenen Termin nehmen; gibt es keinen mehr, ist der Thread fertig.
+                let Some((index, at)) = due
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, due)| due.map(|at| (i, at)))
+                    .min_by_key(|(_, at)| *at)
+                else {
+                    return;
+                };
+
+                if !shared.wait(at.saturating_sub(start.elapsed()), ticket) {
+                    return;
+                }
+                // Serverwechsel o. Ä.: kurz warten, statt ins Leere zu senden.
+                if !shared.in_game.load(Ordering::Relaxed) {
+                    if !shared.wait(Duration::from_secs(2), ticket) {
+                        return;
+                    }
+                    continue;
+                }
+
+                let command = &list[index];
+                shared.console.note(&format!("Befehl: {}", command.command));
+                shared.queue.push(command.command.clone());
+
+                due[index] = match command.repeat_seconds {
+                    0 => None,
+                    repeat => {
+                        // Verpasste Termine überspringen (z. B. nach einem Standby des Rechners),
+                        // damit nicht mehrere Wiederholungen auf einmal nachfeuern.
+                        let repeat = Duration::from_secs(repeat);
+                        let elapsed = start.elapsed();
+                        let mut next = at + repeat;
+                        while next <= elapsed {
+                            next += repeat;
+                        }
+                        Some(next)
+                    }
+                };
             }
         })
         .ok();
@@ -674,15 +887,44 @@ fn handle_position(shared: &Arc<Shared>, session: &mut Session, r: &mut Reader) 
     Ok(())
 }
 
-/// Signierten Spieler-Chat lesen. Wir prüfen keine Signaturen (wir sind nur Zuhörer), müssen die
-/// Felder aber vollständig durchlaufen, um an Name und Inhalt zu kommen.
-fn parse_player_chat(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
-    r.var_int().ok()?; // globalIndex
-    r.uuid().ok()?; // sender
-    r.var_int().ok()?; // index
-    if r.bool().ok()? {
-        r.bytes(256).ok()?; // Signatur
+/// Ergebnis eines Spieler-Chat-Pakets.
+struct PlayerChat {
+    /// Signatur, falls die Nachricht signiert war – nur solche Nachrichten muss man quittieren.
+    signature: Option<Box<[u8; 256]>>,
+    /// Fertig gerenderte Anzeigezeile; `None`, wenn das Paket nicht lesbar war.
+    line: Option<String>,
+}
+
+/// Spieler-Chat lesen. Wir prüfen keine Signaturen (wir sind nur Zuhörer), müssen die Felder
+/// aber vollständig durchlaufen, um an Name und Inhalt zu kommen.
+///
+/// Der Kopf (bis einschließlich Signatur) wird getrennt gelesen: Selbst wenn der Rest des
+/// Pakets nicht verstanden wird, bleibt die Quittungszählung dadurch korrekt.
+fn parse_player_chat(shared: &Arc<Shared>, r: &mut Reader) -> PlayerChat {
+    let mut chat = PlayerChat {
+        signature: None,
+        line: None,
+    };
+    if r.var_int().is_err() || r.uuid().is_err() || r.var_int().is_err() {
+        return chat; // globalIndex, Absender, index
     }
+    match r.bool() {
+        Ok(true) => match r.bytes(256) {
+            Ok(bytes) => {
+                let mut signature = Box::new([0u8; 256]);
+                signature.copy_from_slice(bytes);
+                chat.signature = Some(signature);
+            }
+            Err(_) => return chat,
+        },
+        Ok(false) => {}
+        Err(_) => return chat,
+    }
+    chat.line = parse_chat_body(shared, r);
+    chat
+}
+
+fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
     let content = r.string().ok()?;
     r.i64().ok()?; // timestamp
     r.i64().ok()?; // salt
@@ -807,4 +1049,37 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// § und Steuerzeichen führen sonst zum Kick „illegal_chat_characters".
+    #[test]
+    fn verbotene_zeichen_fallen_weg() {
+        assert_eq!(sanitize("hallo §cwelt", MAX_MESSAGE_CHARS), "hallo cwelt");
+        assert_eq!(sanitize("a\u{7f}b\u{1}c", MAX_MESSAGE_CHARS), "abc");
+        assert_eq!(sanitize("  abstand  ", MAX_MESSAGE_CHARS), "abstand");
+        assert_eq!(sanitize("äöü", MAX_MESSAGE_CHARS), "äöü");
+    }
+
+    /// Der Server liest genau 256 Zeichen – längere Nachrichten lassen den Decoder abbrechen.
+    #[test]
+    fn nachricht_wird_auf_serverlaenge_gekuerzt() {
+        let long = "ä".repeat(400);
+        assert_eq!(
+            sanitize(&long, MAX_MESSAGE_CHARS).chars().count(),
+            MAX_MESSAGE_CHARS
+        );
+    }
+
+    #[test]
+    fn befehle_und_nachrichten_werden_unterschieden() {
+        assert!(matches!(prepare("/afk"), Some(Outgoing::Command(c)) if c == "afk"));
+        assert!(matches!(prepare("hallo"), Some(Outgoing::Message(m)) if m == "hallo"));
+        // Nichts Sendbares übrig: darf keinen Quittungs-Offset verbrauchen.
+        assert!(prepare("/").is_none());
+        assert!(prepare("   ").is_none());
+    }
 }

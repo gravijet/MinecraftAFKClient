@@ -101,6 +101,12 @@ java {
     }
 }
 
+// Die Quellen enthalten Umlaute und Rahmenzeichen. Ohne diese Angabe liest javac sie in der
+// Standard-Kodierung der JVM – unter Windows/JDK 17 ist das windows-1252, und der Build bricht ab.
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
+}
+
 application {
     mainClass.set("net.gravijet.afk.Main")
     // Zur Laufzeit an den Client durchgereicht, damit das Menü die Version anzeigt.

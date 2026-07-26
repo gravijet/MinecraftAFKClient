@@ -10,9 +10,16 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")" && pwd)"
 libs="$root/java/build/libs"
-rust_bin="$root/rust/target/release/hugoafk"
-[ -f "$rust_bin.exe" ] && rust_bin="$rust_bin.exe"
 java_versions=(1.21.11 26.1 1.8.9)
+
+# Erstes vorhandenes Rust-Binary nehmen: normaler Build, Windows-Build, statischer musl-Build.
+rust_bin=""
+for candidate in "$root/rust/target/release/hugoafk" \
+                 "$root/rust/target/release/hugoafk.exe" \
+                 "$root/rust/target/x86_64-unknown-linux-gnu/release/hugoafk" \
+                 "$root/rust/target/x86_64-unknown-linux-musl/release/hugoafk"; do
+    if [ -x "$candidate" ]; then rust_bin="$candidate"; break; fi
+done
 
 # Testet, ob die JVM die angegebenen Flags akzeptiert.
 jvm_supports() {
@@ -23,7 +30,7 @@ kinds=()
 labels=()
 values=()
 
-if [ -x "$rust_bin" ]; then
+if [ -n "$rust_bin" ]; then
     kinds+=(rust); values+=("$rust_bin"); labels+=("Minecraft 26.1   (Rust – nativ, ~1 MB RAM)")
 fi
 for v in "${java_versions[@]}"; do

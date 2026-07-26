@@ -6,6 +6,7 @@
 mod auth;
 mod buf;
 mod client;
+mod clock;
 mod config;
 mod conn;
 mod console;
@@ -14,8 +15,8 @@ mod nbt;
 mod proto;
 
 use crate::client::Client;
-use crate::config::Config;
-use crate::console::{Console, BOLD, CYAN, GRAY};
+use crate::config::{AutoCommand, Config};
+use crate::console::{Console, Link, BOLD, CYAN, GRAY, GREEN};
 use crate::proto::MINECRAFT_VERSION;
 use std::path::{Path, PathBuf};
 
@@ -257,9 +258,17 @@ fn pre_connect_menu(
     account: &mut auth::Account,
     mut server: String,
 ) -> Option<String> {
+    print_menu(console, config, account, &server);
     loop {
-        print_menu(console, account, &server);
-        let line = console.read_line("> ")?;
+        console.set_status(
+            Link::Offline,
+            &format!(
+                "nicht verbunden  ·  {}  ·  {}",
+                if server.is_empty() { "kein Server" } else { &server },
+                account.name
+            ),
+        );
+        let line = console.read_line("❯ ")?;
         let line = line.trim().to_string();
 
         if line.is_empty() {
@@ -285,8 +294,11 @@ fn pre_connect_menu(
                         server = arg;
                     }
                 }
-                "help" => {}
-                other => console.error(&format!("Unbekannt: :{}", other)),
+                "cmd" | "cmds" | "befehle" => {
+                    commands_menu(console, config, &arg);
+                }
+                "help" => print_menu(console, config, account, &server),
+                other => console.error(&format!("Unbekannt: :{} (siehe :help)", other)),
             }
         } else {
             return Some(line);
@@ -318,7 +330,7 @@ fn account_menu(
             "  n) neues Konto (Microsoft-Login)   r <nr>) entfernen   [Enter] zurück",
         ));
 
-        let line = console.read_line("Konto> ")?.trim().to_string();
+        let line = console.read_line("Konto ❯ ")?.trim().to_string();
         if line.is_empty() {
             return None;
         }
@@ -358,10 +370,137 @@ fn account_menu(
     }
 }
 
+// ===================== Befehlsliste =====================
+
+/// Wiederkehrende Befehle verwalten. `true`, wenn sich etwas geändert hat.
+fn commands_menu(console: &Console, config: &mut Config, arg: &str) -> bool {
+    if !arg.is_empty() {
+        return edit_commands(console, config, arg);
+    }
+    let mut changed = false;
+    loop {
+        print_commands(console, config);
+        let Some(line) = console.read_line("Befehle ❯ ") else {
+            return changed;
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return changed;
+        }
+        changed |= edit_commands(console, config, &line);
+    }
+}
+
+/// Ein Bearbeitungsschritt: `add <sek> <befehl>`, `del <nr>`, `on|off <nr>`, `delay <nr> <sek>`.
+fn edit_commands(console: &Console, config: &mut Config, input: &str) -> bool {
+    let (verb, rest) = split_command(input);
+    let count = config.commands.len();
+
+    let changed = match verb.as_str() {
+        "add" | "neu" | "+" => {
+            let (interval, command) = split_command(&rest);
+            match (interval.parse::<u64>(), command.is_empty()) {
+                (Ok(seconds), false) => {
+                    config.commands.push(AutoCommand::new(&command, 4, seconds));
+                    console.ok(&format!(
+                        "Hinzugefügt: {}",
+                        config.commands.last().map(AutoCommand::describe).unwrap_or_default()
+                    ));
+                    true
+                }
+                _ => {
+                    console.error("Nutzung: add <sekunden> <befehl>    z. B. add 300 /afk");
+                    console.info("Sekunden = Wiederholungsintervall, 0 = nur einmal je Beitritt.");
+                    false
+                }
+            }
+        }
+        "del" | "rm" | "r" | "-" => match parse_index(&rest, count) {
+            Some(index) => {
+                let removed = config.commands.remove(index);
+                console.info(&format!("Entfernt: {}", removed.command));
+                true
+            }
+            None => {
+                console.error("Nutzung: del <nr>");
+                false
+            }
+        },
+        "on" | "off" | "an" | "aus" => match parse_index(&rest, count) {
+            Some(index) => {
+                let enabled = matches!(verb.as_str(), "on" | "an");
+                config.commands[index].enabled = enabled;
+                console.info(&format!(
+                    "{}: {}",
+                    if enabled { "Aktiv" } else { "Aus" },
+                    config.commands[index].command
+                ));
+                true
+            }
+            None => {
+                console.error("Nutzung: on <nr>   bzw.   off <nr>");
+                false
+            }
+        },
+        "delay" | "start" => {
+            let (number, seconds) = split_command(&rest);
+            match (parse_index(&number, count), seconds.trim().parse::<u64>()) {
+                (Some(index), Ok(seconds)) => {
+                    config.commands[index].delay_seconds = seconds;
+                    console.info(&format!(
+                        "Startverzögerung: {}",
+                        config.commands[index].describe()
+                    ));
+                    true
+                }
+                _ => {
+                    console.error("Nutzung: delay <nr> <sekunden>");
+                    false
+                }
+            }
+        }
+        "list" | "" => false,
+        other => {
+            console.error(&format!("Unbekannt: {}", other));
+            false
+        }
+    };
+
+    if changed {
+        config.save();
+    }
+    changed
+}
+
+fn print_commands(console: &Console, config: &Config) {
+    console.print("");
+    console.print(&console.paint(BOLD, "  Wiederkehrende Befehle"));
+    if config.commands.is_empty() {
+        console.print(&console.paint(GRAY, "    (keine – mit  add <sekunden> <befehl>  anlegen)"));
+    }
+    for (index, command) in config.commands.iter().enumerate() {
+        let mark = if command.enabled {
+            console.paint(GREEN, "●")
+        } else {
+            console.paint(GRAY, "○")
+        };
+        console.print(&format!(
+            "    {} {})  {}",
+            mark,
+            index + 1,
+            command.describe()
+        ));
+    }
+    console.print(&console.paint(
+        GRAY,
+        "    add <sek> <befehl>   del <nr>   on|off <nr>   delay <nr> <sek>   [Enter] zurück",
+    ));
+}
+
 // ===================== Eingabeschleife =====================
 
 fn input_loop(console: &Console, client: &Client, base: &Path, config: &mut Config) {
-    while let Some(line) = console.read_line("> ") {
+    while let Some(line) = console.read_line("❯ ") {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -388,6 +527,12 @@ fn input_loop(console: &Console, client: &Client, base: &Path, config: &mut Conf
             "account" => {
                 if let Some(account) = account_menu(console, base, config, &client.account_name()) {
                     client.set_account(account);
+                }
+            }
+            "cmd" | "cmds" | "befehle" => {
+                if commands_menu(console, config, &arg) {
+                    // Der Client hält eine eigene Kopie – sonst liefe der Planer weiter alt.
+                    client.update_config(config.clone());
                 }
             }
             "clear" | "cls" => console.clear_screen(),
@@ -462,49 +607,75 @@ fn config_dir() -> PathBuf {
 // ===================== Ausgabe =====================
 
 fn print_header(console: &Console) {
+    // Rahmenbreite aus dem Text berechnen – so sitzt er immer bündig, egal wie lang die
+    // Versionsnummer ist.
+    let suffix = format!("   ·   Rust   ·   Minecraft {}", MINECRAFT_VERSION);
+    let bar = "─".repeat("HugoAFKClient".len() + suffix.chars().count() + 4);
     console.print("");
-    console.print(&console.paint(CYAN, "  ┌─────────────────────────────────────────────┐"));
+    console.print(&console.paint(CYAN, &format!("  ╭{}╮", bar)));
     console.print(&format!(
-        "{}{}{}{}",
+        "{}  {}{}  {}",
         console.paint(CYAN, "  │"),
-        console.paint(BOLD, "  HugoAFKClient"),
-        console.paint(
-            GRAY,
-            &format!("   ·   Rust   ·   Minecraft {}      ", MINECRAFT_VERSION)
-        ),
+        console.paint(BOLD, "HugoAFKClient"),
+        console.paint(GRAY, &suffix),
         console.paint(CYAN, "│")
     ));
-    console.print(&console.paint(CYAN, "  └─────────────────────────────────────────────┘"));
+    console.print(&console.paint(CYAN, &format!("  ╰{}╯", bar)));
 }
 
-fn print_menu(console: &Console, account: &auth::Account, server: &str) {
-    console.print("");
-    console.print(&format!(
-        "{}{}{}{}",
-        console.paint(GRAY, "  Konto  : "),
-        account.name,
-        console.paint(GRAY, "     Version: "),
-        MINECRAFT_VERSION
-    ));
+fn print_menu(console: &Console, config: &Config, account: &auth::Account, server: &str) {
     let shown = if server.is_empty() {
         console.paint(GRAY, "(keiner)")
     } else {
         server.to_string()
     };
-    console.print(&format!("{}{}", console.paint(GRAY, "  Server : "), shown));
+    console.print("");
+    console.print(&format!(
+        "{} {}",
+        console.paint(GRAY, "  Konto   "),
+        account.name
+    ));
+    console.print(&format!("{} {}", console.paint(GRAY, "  Server  "), shown));
+    let commands = config.active_commands();
+    let summary = if commands.is_empty() {
+        console.paint(GRAY, "(keine)")
+    } else {
+        commands
+            .iter()
+            .map(|c| c.command.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    console.print(&format!("{} {}", console.paint(GRAY, "  Befehle "), summary));
+    console.print("");
     console.print(&console.paint(
         GRAY,
-        "  [Enter] verbinden   <ip> verbinden   :account Konten   :server <ip>   :quit",
+        "  [Enter] verbinden   <ip> verbinden   :account   :server <ip>   :cmd   :quit",
     ));
 }
 
 fn print_help(console: &Console) {
-    console.info("Nachricht tippen = chatten | /befehl = Serverbefehl");
-    console.info("  :reconnect   neu verbinden");
-    console.info("  :server <ip> Server wechseln");
-    console.info("  :account     Konto wechseln/verwalten");
-    console.info("  :clear       Bildschirm leeren");
-    console.info("  :quit        beenden");
+    console.print("");
+    console.print(&console.paint(BOLD, "  Bedienung"));
+    let row = |key: &str, text: &str| {
+        console.print(&format!(
+            "    {}  {}",
+            console.paint(CYAN, &format!("{:<14}", key)),
+            console.paint(GRAY, text)
+        ));
+    };
+    row("<text>", "in den Chat schreiben");
+    row("/befehl", "Serverbefehl senden");
+    row(":cmd", "wiederkehrende Befehle (z. B. /afk alle 5 min)");
+    row(":reconnect", "neu verbinden");
+    row(":server <ip>", "Server wechseln");
+    row(":account", "Konto wechseln/verwalten");
+    row(":clear", "Bildschirm leeren");
+    row(":quit", "beenden");
+    console.print(&console.paint(
+        GRAY,
+        "    ↑↓ Verlauf · Strg+U Zeile löschen · Strg+W Wort löschen · Strg+L Bildschirm",
+    ));
 }
 
 fn print_usage() {
@@ -516,6 +687,8 @@ fn print_usage() {
          Optionen:\n\
          \x20 --server <host[:port]>   Server-Adresse\n\
          \x20 --account <name>         Startkonto wählen\n\
+         \x20 --check                  Selbsttest (Konto, SRV, Erreichbarkeit)\n\
+         \x20 --headless               ohne Terminal-Eingabe (Dienst-/Hintergrundbetrieb)\n\
          \x20 -h, --help               diese Hilfe\n\
          \n\
          Konfiguration: ~/.config/hugoafk/ (config.json, accounts/) – dieselbe wie beim Java-Client.",

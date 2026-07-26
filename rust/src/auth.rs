@@ -15,20 +15,26 @@ use rand::RngCore;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Ein einziger HTTP-Agent für alle Aufrufe: hält Verbindungen offen und spart Handshakes.
-/// TLS kommt von SChannel (Windows) bzw. der System-TLS des Betriebssystems.
+///
+/// TLS kommt unter Windows von SChannel (`native-tls`), sonst von rustls – so braucht der
+/// Linux-Build weder OpenSSL-Header noch `pkg-config` (siehe Cargo.toml).
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
-        let mut builder = ureq::builder()
+        let builder = ureq::builder()
             .timeout_connect(Duration::from_secs(15))
             .timeout(Duration::from_secs(30));
-        if let Ok(tls) = native_tls::TlsConnector::new() {
-            builder = builder.tls_connector(Arc::new(tls));
-        }
+
+        #[cfg(windows)]
+        let builder = match native_tls::TlsConnector::new() {
+            Ok(tls) => builder.tls_connector(std::sync::Arc::new(tls)),
+            Err(_) => builder,
+        };
+
         builder.build()
     })
 }

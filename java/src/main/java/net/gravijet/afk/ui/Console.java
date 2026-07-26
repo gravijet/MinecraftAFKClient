@@ -26,6 +26,7 @@ public class Console {
     public static final String RESET = "[0m";
     public static final String GRAY = "[90m";
     public static final String RED = "[91m";
+    public static final String GREEN = "[92m";
     public static final String CYAN = "[96m";
     public static final String BOLD = "[1m";
 
