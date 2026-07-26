@@ -117,6 +117,7 @@ public class Main {
                         if (!arg.isBlank()) server = arg;
                         else console.error("Nutzung: :server <host[:port]>");
                     }
+                    case "cmd", "cmds", "befehle" -> commandsMenu(console, config, arg);
                     case "help" -> printMenu(console, auth, bridge, server);
                     default -> console.error("Unbekannt: :" + cmd);
                 }
@@ -177,6 +178,112 @@ public class Main {
         }
     }
 
+    // ===================== Befehlsliste =====================
+
+    /** Wiederkehrende Befehle verwalten. true, wenn sich etwas geändert hat. */
+    private static boolean commandsMenu(Console console, Config config, String arg) {
+        if (!arg.isBlank()) {
+            return editCommands(console, config, arg);
+        }
+        boolean changed = false;
+        while (true) {
+            printCommands(console, config);
+            String line = console.readLine("Befehle> ");
+            if (line == null || line.isBlank()) return changed;
+            changed |= editCommands(console, config, line.trim());
+        }
+    }
+
+    /** Ein Bearbeitungsschritt: {@code add <sek> <befehl>}, {@code del <nr>}, {@code on|off <nr>}, {@code delay <nr> <sek>}. */
+    private static boolean editCommands(Console console, Config config, String input) {
+        String[] parts = input.split("\\s+", 2);
+        String verb = parts[0].toLowerCase();
+        String rest = parts.length > 1 ? parts[1].trim() : "";
+        int count = config.commands.size();
+        boolean changed = false;
+
+        switch (verb) {
+            case "add", "neu", "+" -> {
+                String[] p = rest.split("\\s+", 2);
+                Integer seconds = p.length > 1 ? parseInt(p[0]) : null;
+                String command = p.length > 1 ? p[1].trim() : "";
+                if (seconds == null || command.isEmpty()) {
+                    console.error("Nutzung: add <sekunden> <befehl>    z. B. add 300 /afk");
+                    console.info("Sekunden = Wiederholungsintervall, 0 = nur einmal je Beitritt.");
+                } else {
+                    Config.AutoCommand added = new Config.AutoCommand(command, 4, seconds);
+                    config.commands.add(added);
+                    console.info("Hinzugefügt: " + added.describe());
+                    changed = true;
+                }
+            }
+            case "del", "rm", "r", "-" -> {
+                Integer index = parseIndex(rest, count);
+                if (index == null) {
+                    console.error("Nutzung: del <nr>");
+                } else {
+                    console.info("Entfernt: " + config.commands.remove((int) index).command);
+                    changed = true;
+                }
+            }
+            case "on", "off", "an", "aus" -> {
+                Integer index = parseIndex(rest, count);
+                if (index == null) {
+                    console.error("Nutzung: on <nr>   bzw.   off <nr>");
+                } else {
+                    boolean enabled = verb.equals("on") || verb.equals("an");
+                    config.commands.get(index).enabled = enabled;
+                    console.info((enabled ? "Aktiv: " : "Aus: ") + config.commands.get(index).command);
+                    changed = true;
+                }
+            }
+            case "delay", "start" -> {
+                String[] p = rest.split("\\s+", 2);
+                Integer index = parseIndex(p[0], count);
+                Integer seconds = p.length > 1 ? parseInt(p[1]) : null;
+                if (index == null || seconds == null) {
+                    console.error("Nutzung: delay <nr> <sekunden>");
+                } else {
+                    config.commands.get(index).delaySeconds = seconds;
+                    console.info("Startverzögerung: " + config.commands.get(index).describe());
+                    changed = true;
+                }
+            }
+            case "list" -> {
+            }
+            default -> console.error("Unbekannt: " + verb);
+        }
+
+        if (changed) {
+            config.save();
+        }
+        return changed;
+    }
+
+    private static void printCommands(Console console, Config config) {
+        console.print("");
+        console.print(console.color(Console.BOLD, "  Wiederkehrende Befehle"));
+        if (config.commands.isEmpty()) {
+            console.print(console.color(Console.GRAY, "    (keine – mit  add <sekunden> <befehl>  anlegen)"));
+        }
+        for (int i = 0; i < config.commands.size(); i++) {
+            Config.AutoCommand command = config.commands.get(i);
+            String mark = command.enabled ? console.color(Console.GREEN, "●") : console.color(Console.GRAY, "○");
+            console.print("    " + mark + " " + (i + 1) + ")  " + command.describe());
+        }
+        console.print(console.color(Console.GRAY,
+                "    add <sek> <befehl>   del <nr>   on|off <nr>   delay <nr> <sek>   [Enter] zurück"));
+    }
+
+    private static Integer parseInt(String text) {
+        try {
+            int value = Integer.parseInt(text.trim());
+            return value >= 0 ? value : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     /** Wandelt eine 1-basierte Nummer in einen gültigen 0-basierten Index um (sonst null). */
     private static Integer parseIndex(String text, int size) {
         try {
@@ -232,6 +339,11 @@ public class Main {
                     client.reconnectNow();
                 }
             }
+            case "cmd", "cmds", "befehle" -> {
+                if (commandsMenu(console, config, arg)) {
+                    client.reloadCommands();
+                }
+            }
             case "clear", "cls" -> console.clearScreen();
             case "help" -> printHelp(console);
             default -> console.error("Unbekannter Befehl: :" + cmd + " (siehe :help)");
@@ -267,6 +379,7 @@ public class Main {
 
     private static void printHelp(Console console) {
         console.info("Nachricht tippen = chatten | /befehl = Serverbefehl");
+        console.info("  :cmd         wiederkehrende Befehle (z. B. /afk alle 5 min)");
         console.info("  :reconnect   neu verbinden");
         console.info("  :server <ip> Server wechseln");
         console.info("  :account     Konto wechseln/verwalten");
