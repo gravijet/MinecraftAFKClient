@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 # HTTPS nur für Login/Token-Refresh und den Sitzungs-Join (kurze Bursts, danach wieder frei).
-# native-tls statt rustls: nutzt unter Windows das eingebaute SChannel – kein C-Compiler nötig
-# (rustls zöge `ring` nach) und kein mitgeschleppter Wurzelzertifikat-Speicher im RAM.
-ureq = { version = "2", default-features = false, features = ["json", "native-tls", "gzip"] }
-native-tls = "0.2"
+# Der TLS-Anbieter wird pro Zielplattform gewählt (siehe [target...] weiter unten):
+#   Windows      -> native-tls = SChannel: kein C-Compiler, keine Wurzelzertifikate im Binary
+#   Linux/macOS  -> rustls:     kein OpenSSL und keine libssl-dev nötig, statisch linkbar (musl)
+ureq = { version = "2", default-features = false, features = ["json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Paket-Kompression (zlib) – reine Rust-Implementierung, kein C.
@@ -31,8 +31,22 @@ p256 = { version = "0.13", features = ["pkcs8"] }
 crossterm = "0.28"
 
 [target.'cfg(windows)'.dependencies]
-# Nur für SetConsoleOutputCP(UTF-8) – ohne das zerlegt die Windows-Konsole jeden Umlaut.
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+# TLS über SChannel (im System vorhanden) – spart den Wurzelzertifikat-Speicher im Binary.
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+# Für SetConsoleOutputCP(UTF-8) – ohne das zerlegt die Windows-Konsole jeden Umlaut –
+# und GetLocalTime für die Uhrzeit in der Konsole.
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+# Linux/macOS: rustls statt OpenSSL. Beim Bauen wird dadurch KEIN libssl-dev/pkg-config
+# gebraucht, und das Ergebnis ist gegen musl auch vollständig statisch linkbar.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Nur für localtime_r (Zeitzone der Konsolen-Uhrzeit); libc steckt ohnehin im Abhängigkeitsbaum.
+libc = "0.2"
 
 # Auf minimalen Fußabdruck getrimmt: kleine Binary, ein Codegen-Unit, kein Unwind-Tabellen-Ballast.
 [profile.release]

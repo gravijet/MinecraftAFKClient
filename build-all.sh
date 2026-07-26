@@ -6,7 +6,13 @@
 # Gradle 8.14.3 läuft NICHT unter Java 25 – dieses Skript sucht daher ein JDK 21 (oder 17),
 # um Gradle zu starten. Die fertigen Jars laufen davon unabhängig auf Java 25.
 #
-# Aufruf:  ./build-all.sh [java|rust]
+# Aufruf:  ./build-all.sh [java|rust|rust-linux|rust-musl|both]
+#
+#   rust        nativ für das laufende System (Linux, macOS, Git-Bash)
+#   rust-linux  wie rust, aber mit explizitem Ziel x86_64-unknown-linux-gnu. Gedacht für den
+#               Aufruf aus WSL auf einen Windows-Quellbaum: die Artefakte landen unter
+#               target/x86_64-unknown-linux-gnu/ und kollidieren nicht mit dem Windows-Build.
+#   rust-musl   voll statisches Linux-Binary (läuft auf jeder Distribution, auch ohne glibc)
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 cd "$root"
@@ -53,23 +59,81 @@ build_java() {
     done
 }
 
+need_cargo() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo nicht gefunden. Rust installieren:" >&2
+        echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" >&2
+        exit 1
+    fi
+}
+
+# Auf Linux braucht `ring` (über rustls) einen C-Compiler. OpenSSL/libssl-dev ist NICHT nötig.
+need_cc() {
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "Kein C-Compiler gefunden (für die TLS-Bibliothek nötig). Installieren mit:" >&2
+    echo "  Debian/Ubuntu:  sudo apt install build-essential" >&2
+    echo "  Fedora:         sudo dnf install gcc" >&2
+    echo "  Arch:           sudo pacman -S base-devel" >&2
+    exit 1
+}
+
 build_rust() {
     echo
     echo "=== Rust-Modul (MC 26.1) ==="
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "cargo nicht gefunden. Rust installieren: https://rustup.rs" >&2
+    need_cargo
+    [ "$(uname -s)" = "Linux" ] && need_cc
+    (cd "$root/rust" && cargo build --release)
+}
+
+build_rust_linux() {
+    echo
+    echo "=== Rust-Modul (MC 26.1, Ziel x86_64-unknown-linux-gnu) ==="
+    need_cargo
+    need_cc
+    local target=x86_64-unknown-linux-gnu
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+        echo "Ziel $target fehlt – hole es nach ..."
+        rustup target add "$target"
+    fi
+    (cd "$root/rust" && cargo build --release --target "$target")
+}
+
+# Statisches Linux-Binary: keine glibc-Bindung, läuft auf jeder Distribution und in
+# schlanken Containern.
+build_rust_musl() {
+    echo
+    echo "=== Rust-Modul (MC 26.1, statisch für Linux/musl) ==="
+    need_cargo
+    local target=x86_64-unknown-linux-musl
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
+        echo "Ziel $target fehlt – hole es nach ..."
+        rustup target add "$target"
+    fi
+    if ! command -v musl-gcc >/dev/null 2>&1; then
+        echo "musl-gcc nicht gefunden (Linker für das statische Ziel). Installieren mit:" >&2
+        echo "  Debian/Ubuntu:  sudo apt install musl-tools" >&2
+        echo "  Fedora:         sudo dnf install musl-gcc" >&2
         exit 1
     fi
-    (cd "$root/rust" && cargo build --release)
+    (cd "$root/rust" && cargo build --release --target "$target")
 }
 
 case "$only" in
     java) build_java ;;
     rust) build_rust ;;
-    *) build_java; build_rust ;;
+    rust-linux|linux) build_rust_linux ;;
+    rust-musl|musl) build_rust_musl ;;
+    both) build_java; build_rust ;;
+    *) echo "Aufruf: ./build-all.sh [java|rust|rust-linux|rust-musl|both]" >&2; exit 1 ;;
 esac
 
 echo
 echo "=== Ergebnisse ==="
 ls -lh java/build/libs/hugoafk-*.jar 2>/dev/null | awk '{print $5, "java  ", $9}' || true
-ls -lh rust/target/release/hugoafk 2>/dev/null | awk '{print $5, "rust  ", $9}' || true
+for bin in rust/target/release/hugoafk rust/target/release/hugoafk.exe \
+           rust/target/x86_64-unknown-linux-gnu/release/hugoafk \
+           rust/target/x86_64-unknown-linux-musl/release/hugoafk; do
+    ls -lh "$bin" 2>/dev/null | awk '{print $5, "rust  ", $9}' || true
+done
