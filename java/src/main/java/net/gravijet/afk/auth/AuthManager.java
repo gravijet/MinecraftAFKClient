@@ -22,7 +22,7 @@ import java.util.stream.Stream;
  * Microsoft-Login per Device-Code-Flow (ideal für die CLI: kein Browser-Callback nötig)
  * mit Unterstützung für <b>mehrere Konten</b>.
  *
- * <p>Jedes Konto liegt als eigene JSON-Datei unter {@code ~/.config/hugoafk/accounts/<name>.json}
+ * <p>Jedes Konto liegt als eigene JSON-Datei unter {@code ~/.config/afksystems/accounts/<name>.json}
  * (Format von {@link JavaAuthManager#toJson}). Es wird immer nur das <em>aktive</em> Konto in den
  * Speicher geladen – das Auflisten der Konten liest nur Dateinamen. Dadurch kostet die
  * Multi-Konto-Funktion praktisch keinen zusätzlichen RAM.
@@ -57,7 +57,11 @@ public class AuthManager {
         migrateLegacy(out);
 
         List<String> accounts = listAccounts();
-        String target = (preferred != null && !preferred.isBlank() && Files.exists(accountFile(preferred)))
+        if (preferred != null && !preferred.isBlank() && !Files.exists(accountFile(preferred))) {
+            throw new IllegalArgumentException("Konto '" + preferred + "' gibt es nicht. Vorhanden: "
+                    + (accounts.isEmpty() ? "keins (mit --login anlegen)" : String.join(", ", accounts)));
+        }
+        String target = (preferred != null && !preferred.isBlank())
                 ? preferred
                 : (accounts.isEmpty() ? null : accounts.get(0));
 
@@ -151,24 +155,7 @@ public class AuthManager {
         return name;
     }
 
-    /** Entfernt ein gespeichertes Konto. */
-    public boolean removeAccount(String name) {
-        try {
-            return Files.deleteIfExists(accountFile(name));
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
     // ===================== Zugriff für den Client =====================
-
-    public String currentAccount() {
-        return currentName;
-    }
-
-    public boolean isLoggedIn() {
-        return manager != null;
-    }
 
     public GameProfile gameProfile() throws Exception {
         MinecraftProfile profile = manager.getMinecraftProfile().getUpToDate();

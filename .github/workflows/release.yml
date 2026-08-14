@@ -1,0 +1,129 @@
+name: Build und latest-Release
+
+# Bei JEDEM Push: alles bauen und das Release "latest" durch den frischen Stand ersetzen.
+# Soll nur der Hauptzweig veröffentlichen, hier   branches: [main]   eintragen.
+on:
+  push:
+  workflow_dispatch:
+
+# Ein neuer Push macht einen noch laufenden Build überflüssig.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  java:
+    name: Jars (alle vier Minecraft-Versionen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Bauen
+        run: |
+          chmod +x gradlew
+          for v in 1.21.1 1.21.11 26.1 26.2; do
+            ./gradlew :java:shadowJar -Pmc=$v --console=plain
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jars
+          path: java/build/libs/afk-*.jar
+          if-no-files-found: error
+
+  rust:
+    name: Binary (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            built: rust/target/release/afk
+            artifact: afk-linux
+          - os: windows-latest
+            name: windows
+            built: rust/target/release/afk.exe
+            artifact: afk-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Bauen
+        working-directory: rust
+        run: cargo build --release
+
+      - name: Tests
+        working-directory: rust
+        run: cargo test --release
+
+      - name: Umbenennen
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "${{ matrix.built }}" "out/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.name }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: latest-Release ersetzen
+    needs: [java, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloads
+
+      - name: Dateien sammeln
+        run: |
+          mkdir -p dist
+          find downloads -type f -exec cp {} dist/ \;
+          chmod +x dist/afk-linux
+          ls -lh dist
+
+      - name: Beschreibung schreiben
+        run: |
+          # Als Datei statt als Argument: so bleibt die Markdown-Formatierung heil.
+          cat > notes.md <<EOF
+          Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7}).
+
+          | Datei | Was |
+          | --- | --- |
+          | \`afk-1.21.1.jar\` … \`afk-26.2.jar\` | Java-Client, je ein Jar pro Minecraft-Version: \`java -jar afk-26.1.jar <server>\` |
+          | \`afk-windows.exe\` | Rust-Client für Windows – spricht alle vier Versionen, Auswahl über \`--mc\` |
+          | \`afk-linux\` | dasselbe für Linux |
+
+          Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
+          EOF
+
+      - name: Release "latest" neu setzen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Das alte Release samt Tag weg, damit "latest" wirklich der frische Stand ist.
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/* \
+            --target "$GITHUB_SHA" \
+            --title "AFKSystems – latest" \
+            --notes-file notes.md
