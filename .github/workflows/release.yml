@@ -14,14 +14,55 @@ concurrency:
 permissions:
   contents: write
 
+# Kein upload-artifact: Artefakte wären hier nur ein Zwischenlager zwischen den Jobs, kosten aber
+# Speicher-Quota (die kontoweit gilt und den Build sonst mitreißt, wenn ein ganz anderes Repo sie
+# vollmacht). Stattdessen lädt jeder Job direkt in ein unveröffentlichtes Sammel-Release; erst wenn
+# alles gebaut ist, wird daraus "latest". Bricht ein Build ab, bleibt das alte "latest" unangetastet.
+env:
+  ENTWURF: latest-entwurf
+
 jobs:
-  java:
-    name: Jars (alle vier Minecraft-Versionen)
+  vorbereiten:
+    name: Sammel-Release anlegen
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-java@v4
+      - name: Entwurf neu anlegen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Reste eines abgebrochenen Laufs weg (Entwürfe haben keinen Tag, daher || true).
+          gh release delete "$ENTWURF" --yes --cleanup-tag || true
+
+          # Als Datei statt als Argument: so bleibt die Markdown-Formatierung heil.
+          cat > notes.md <<EOF
+          Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7}).
+
+          | Datei | Was |
+          | --- | --- |
+          | \`afk-1.21.1.jar\` … \`afk-26.2.jar\` | Java-Client, je ein Jar pro Minecraft-Version: \`java -jar afk-26.1.jar <server>\` |
+          | \`afk-windows.exe\` | Rust-Client für Windows – spricht alle vier Versionen, Auswahl über \`--mc\` |
+          | \`afk-linux\` | dasselbe für Linux |
+
+          Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
+          EOF
+
+          gh release create "$ENTWURF" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "AFKSystems – latest" \
+            --notes-file notes.md
+
+  java:
+    name: Jars (alle vier Minecraft-Versionen)
+    needs: vorbereiten
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -34,14 +75,17 @@ jobs:
             ./gradlew :java:shadowJar -Pmc=$v --console=plain
           done
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jars
-          path: java/build/libs/afk-*.jar
-          if-no-files-found: error
+      - name: Hochladen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -lh java/build/libs/afk-*.jar   # bricht ab, wenn nichts gebaut wurde
+          gh release upload "$ENTWURF" java/build/libs/afk-*.jar --clobber
 
   rust:
     name: Binary (${{ matrix.name }})
+    needs: vorbereiten
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -56,7 +100,7 @@ jobs:
             built: rust/target/release/afk.exe
             artifact: afk-windows.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -72,58 +116,29 @@ jobs:
         working-directory: rust
         run: cargo test --release
 
-      - name: Umbenennen
+      - name: Hochladen
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p out
           cp "${{ matrix.built }}" "out/${{ matrix.artifact }}"
+          gh release upload "$ENTWURF" "out/${{ matrix.artifact }}" --clobber
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: binary-${{ matrix.name }}
-          path: out/${{ matrix.artifact }}
-          if-no-files-found: error
-
-  release:
+  veroeffentlichen:
     name: latest-Release ersetzen
     needs: [java, rust]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: downloads
-
-      - name: Dateien sammeln
-        run: |
-          mkdir -p dist
-          find downloads -type f -exec cp {} dist/ \;
-          chmod +x dist/afk-linux
-          ls -lh dist
-
-      - name: Beschreibung schreiben
-        run: |
-          # Als Datei statt als Argument: so bleibt die Markdown-Formatierung heil.
-          cat > notes.md <<EOF
-          Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7}).
-
-          | Datei | Was |
-          | --- | --- |
-          | \`afk-1.21.1.jar\` … \`afk-26.2.jar\` | Java-Client, je ein Jar pro Minecraft-Version: \`java -jar afk-26.1.jar <server>\` |
-          | \`afk-windows.exe\` | Rust-Client für Windows – spricht alle vier Versionen, Auswahl über \`--mc\` |
-          | \`afk-linux\` | dasselbe für Linux |
-
-          Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
-          EOF
-
-      - name: Release "latest" neu setzen
+      - name: Aus dem Entwurf wird "latest"
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          # Das alte Release samt Tag weg, damit "latest" wirklich der frische Stand ist.
+          # Erst jetzt das alte Release samt Tag weg – bis hierhin blieb es abrufbar.
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest dist/* \
-            --target "$GITHUB_SHA" \
-            --title "AFKSystems – latest" \
-            --notes-file notes.md
+          # Umbenennen und veröffentlichen in einem Schritt: GitHub setzt dabei den Tag "latest"
+          # auf den gebauten Commit.
+          gh release edit "$ENTWURF" --tag latest --draft=false --latest
+          gh release view latest --json tagName,assets --jq '{tag: .tagName, dateien: [.assets[].name]}'
