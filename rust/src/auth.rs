@@ -1,6 +1,6 @@
 //! Microsoft-Login (Device-Code) und Kontoverwaltung – **dateikompatibel zum Java-Client**.
 //!
-//! Die Konten liegen in denselben Dateien `~/.config/hugoafk/accounts/<name>.json` im Format von
+//! Die Konten liegen in denselben Dateien `~/.config/afksystems/accounts/<name>.json` im Format von
 //! MinecraftAuth (`JavaAuthManager.toJson`). Beim Speichern wird die vorhandene JSON-Struktur
 //! übernommen und nur das angefasst, was wir wirklich erneuern (MSA-Token, Minecraft-Token,
 //! Profil). Die Xbox-Device-/Title-Token des Java-Clients bleiben unangetastet – so kann der
@@ -96,9 +96,6 @@ pub fn migrate_legacy(base: &Path) -> Option<String> {
     Some(name)
 }
 
-pub fn remove(base: &Path, name: &str) -> bool {
-    std::fs::remove_file(account_file(base, name)).is_ok()
-}
 
 fn account_file(base: &Path, name: &str) -> PathBuf {
     accounts_dir(base).join(format!("{}.json", name))

@@ -1,447 +1,248 @@
 package net.gravijet.afk;
 
 import net.gravijet.afk.auth.AuthManager;
-import net.gravijet.afk.config.Config;
 import net.gravijet.afk.net.AfkClient;
-import net.gravijet.afk.net.ProtocolBridge;
 import net.gravijet.afk.ui.Console;
 
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
 
 /**
- * Einstiegspunkt: Microsoft-Login (mit Konto-Wechsel) -> Menü -> verbinden -> Chat-Loop.
+ * AFKSystems (Java) – schlanker Minecraft-AFK-Client.
  *
- * Aufruf:  java -jar hugoafk-&lt;version&gt;.jar [optionen] [host[:port]]
+ * <p>Ein Jar je Minecraft-Version ({@code afk-26.1.jar}, {@code afk-1.21.1.jar} ...), weil
+ * MCProtocolLib pro Build nur eine Protokollversion spricht. Welche es ist, steht im Manifest und
+ * unten in der Hilfe.
+ *
+ * <p>Kein Menü, keine Konfigurationsdatei: alles steht im Startbefehl. Der Client meldet sich an,
+ * tritt bei und gibt danach ausschließlich Chat auf der Standardausgabe aus – Statusmeldungen
+ * gehen auf die Standardfehlerausgabe, Eingabezeilen gehen als Chat raus.
+ *
+ * <pre>java -jar afk-26.1.jar mc.example.net -c 300:/afk</pre>
  */
 public class Main {
 
-    public static void main(String[] args) throws Exception {
-        Path baseDir = configDir();
-        Config config = Config.load(baseDir.resolve("config.json"));
+    public static void main(String[] args) {
+        // Alles in UTF-8 ausgeben – sonst zerlegt die Windows-Konsole jeden Umlaut und ein
+        // Programm, das den Chat weiterverarbeitet, bekommt Zeichen in wechselnder Kodierung.
+        System.setOut(new PrintStream(new FileOutputStream(FileDescriptor.out), false, StandardCharsets.UTF_8));
+        System.setErr(new PrintStream(new FileOutputStream(FileDescriptor.err), true, StandardCharsets.UTF_8));
 
-        String serverArg = null;
-        String accountArg = null;
-        for (int i = 0; i < args.length; i++) {
-            String a = args[i];
-            switch (a) {
-                case "-h", "--help" -> {
-                    printUsage();
-                    return;
-                }
-                case "--server" -> {
-                    if (i + 1 < args.length) serverArg = args[++i];
-                }
-                case "--account" -> {
-                    if (i + 1 < args.length) accountArg = args[++i];
-                }
-                default -> {
-                    if (!a.startsWith("-")) serverArg = a;
-                }
-            }
-        }
+        String version = minecraftVersion();
 
-        String variant = System.getProperty("hugoafk.variant", "?");
-        ProtocolBridge bridge = ProtocolBridge.load(variant);
-        bridge.init();
-
-        Console console = new Console();
-        console.setColor(config.colorOutput);
-
-        printHeader(console, bridge.targetVersion());
-
-        AuthManager auth = new AuthManager(baseDir);
-        String preferred = accountArg != null ? accountArg : config.activeAccount;
+        Options options;
         try {
-            auth.loginInteractive(preferred, console::print);
-        } catch (Exception e) {
-            console.error("Login fehlgeschlagen: " + e.getMessage());
-            console.close();
+            options = Options.parse(args, version);
+        } catch (IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.exit(2);
             return;
         }
-        config.activeAccount = auth.currentAccount();
-        config.save();
 
-        String server = preConnectMenu(console, auth, config, bridge,
-                serverArg != null ? serverArg : config.lastServer);
-        if (server == null) {
-            console.close();
-            return; // :quit
+        switch (options.mode) {
+            case HELP -> printUsage(version);
+            case ACCOUNTS -> printAccounts();
+            case LOGIN -> addAccount();
+            case RUN -> run(options, version);
         }
-        server = server.trim();
-        config.lastServer = server;
-        config.save();
-
-        int[] portHolder = new int[1];
-        String host = parseHost(server, portHolder, console);
-        int port = portHolder[0];
-
-        AfkClient client = new AfkClient(auth, config, console, bridge);
-        Runtime.getRuntime().addShutdownHook(new Thread(client::shutdown, "hugoafk-shutdown"));
-
-        printHelp(console);
-        client.connect(host, port);
-        runInputLoop(console, client, auth, config);
-
-        client.shutdown();
-        console.close();
-        System.out.println("Tschuess!");
     }
 
-    // ===================== Menüs =====================
+    private static void run(Options options, String version) {
+        Console console = new Console(options.color, options.quiet);
+        migrateConfigDir();
 
-    /** Vor-Verbindungs-Menü: Server wählen/eingeben, Konten verwalten. */
-    private static String preConnectMenu(Console console, AuthManager auth, Config config,
-                                         ProtocolBridge bridge, String server) {
-        while (true) {
-            printMenu(console, auth, bridge, server);
-            String line = console.readLine("> ");
-            if (line == null) return null;
+        AuthManager auth = new AuthManager(configDir());
+        try {
+            auth.loginInteractive(options.account, console::print);
+        } catch (Exception e) {
+            console.error("Login fehlgeschlagen: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        int[] portHolder = {25565};
+        String host = parseHost(options.server, portHolder);
+
+        AfkClient client = new AfkClient(auth, options, console, version);
+        client.connect(host, portHolder[0]);
+
+        // Jede Eingabezeile geht in den Chat. Nur im Bewegungs-Jar werden ':'-Befehle vorher
+        // abgefangen; im schlanken Jar gibt es keine, dort ist jede Zeile Chat.
+        boolean movement = client.mover().available();
+        String line;
+        while ((line = console.readLine()) != null) {
             line = line.trim();
             if (line.isEmpty()) {
-                if (server != null && !server.isBlank()) return server;
-                console.error("Keine Server-IP. Gib host[:port] ein oder :quit.");
                 continue;
             }
-            if (line.startsWith(":")) {
-                String[] p = line.substring(1).split("\\s+", 2);
-                String cmd = p[0].toLowerCase();
-                String arg = p.length > 1 ? p[1].trim() : "";
-                switch (cmd) {
-                    case "quit", "exit" -> {
-                        return null;
-                    }
-                    case "account" -> accountMenu(console, auth, config);
-                    case "server" -> {
-                        if (!arg.isBlank()) server = arg;
-                        else console.error("Nutzung: :server <host[:port]>");
-                    }
-                    case "cmd", "cmds", "befehle" -> commandsMenu(console, config, arg);
-                    case "help" -> printMenu(console, auth, bridge, server);
-                    default -> console.error("Unbekannt: :" + cmd);
+            if (movement && line.startsWith(":")) {
+                String[] parts = line.substring(1).split("\\s+", 2);
+                if (client.mover().command(parts[0].toLowerCase(), parts.length > 1 ? parts[1].trim() : "")) {
+                    continue;
                 }
-            } else {
-                return line; // eingegebene IP -> direkt verbinden
+                console.error("Unbekannter Befehl: " + line);
+                continue;
             }
+            client.sendChatInput(line);
         }
+
+        // Standardeingabe zu Ende (Dienstbetrieb, Pipe, kein Terminal): der Client läuft weiter,
+        // die Netz-Threads arbeiten. Beendet wird er von außen.
+        parkForever();
     }
 
-    private static void accountMenu(Console console, AuthManager auth, Config config) {
+    private static void parkForever() {
         while (true) {
-            List<String> accounts = auth.listAccounts();
-            console.print("");
-            console.print(console.color(Console.BOLD, "=== Konten ==="));
-            for (int i = 0; i < accounts.size(); i++) {
-                String n = accounts.get(i);
-                boolean active = n.equals(auth.currentAccount());
-                console.print("  " + (i + 1) + ") " + n + (active ? console.color(Console.CYAN, "  (aktiv)") : ""));
-            }
-            console.print(console.color(Console.GRAY, "  n) neues Konto (Microsoft-Login)   r <nr>) entfernen   [Enter] zurück"));
-            String line = console.readLine("Konto> ");
-            if (line == null) return;
-            line = line.trim();
-            if (line.isEmpty()) return;
-            if (line.equalsIgnoreCase("n")) {
-                try {
-                    String name = auth.addAccount(console::print);
-                    config.activeAccount = name;
-                    config.save();
-                    console.info("Aktives Konto: " + name);
-                    return;
-                } catch (Exception e) {
-                    console.error("Login fehlgeschlagen: " + e.getMessage());
-                }
-            } else if (line.toLowerCase().startsWith("r")) {
-                Integer idx = parseIndex(line.substring(1).trim(), accounts.size());
-                if (idx != null) {
-                    String name = accounts.get(idx);
-                    if (auth.removeAccount(name)) console.info("Entfernt: " + name);
-                } else {
-                    console.error("Nutzung: r <nr>");
-                }
-            } else {
-                Integer idx = parseIndex(line, accounts.size());
-                if (idx != null) {
-                    String name = accounts.get(idx);
-                    if (auth.switchTo(name)) {
-                        config.activeAccount = name;
-                        config.save();
-                        console.info("Aktives Konto: " + name);
-                        return;
-                    }
-                    console.error("Konto ließ sich nicht anmelden: " + name);
-                } else {
-                    console.error("Ungültige Eingabe.");
-                }
+            try {
+                Thread.sleep(Long.MAX_VALUE);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
             }
         }
     }
 
-    // ===================== Befehlsliste =====================
+    // ===================== Konten =====================
 
-    /** Wiederkehrende Befehle verwalten. true, wenn sich etwas geändert hat. */
-    private static boolean commandsMenu(Console console, Config config, String arg) {
-        if (!arg.isBlank()) {
-            return editCommands(console, config, arg);
-        }
-        boolean changed = false;
-        while (true) {
-            printCommands(console, config);
-            String line = console.readLine("Befehle> ");
-            if (line == null || line.isBlank()) return changed;
-            changed |= editCommands(console, config, line.trim());
-        }
-    }
-
-    /** Ein Bearbeitungsschritt: {@code add <sek> <befehl>}, {@code del <nr>}, {@code on|off <nr>}, {@code delay <nr> <sek>}. */
-    private static boolean editCommands(Console console, Config config, String input) {
-        String[] parts = input.split("\\s+", 2);
-        String verb = parts[0].toLowerCase();
-        String rest = parts.length > 1 ? parts[1].trim() : "";
-        int count = config.commands.size();
-        boolean changed = false;
-
-        switch (verb) {
-            case "add", "neu", "+" -> {
-                String[] p = rest.split("\\s+", 2);
-                Integer seconds = p.length > 1 ? parseInt(p[0]) : null;
-                String command = p.length > 1 ? p[1].trim() : "";
-                if (seconds == null || command.isEmpty()) {
-                    console.error("Nutzung: add <sekunden> <befehl>    z. B. add 300 /afk");
-                    console.info("Sekunden = Wiederholungsintervall, 0 = nur einmal je Beitritt.");
-                } else {
-                    Config.AutoCommand added = new Config.AutoCommand(command, 4, seconds);
-                    config.commands.add(added);
-                    console.info("Hinzugefügt: " + added.describe());
-                    changed = true;
-                }
-            }
-            case "del", "rm", "r", "-" -> {
-                Integer index = parseIndex(rest, count);
-                if (index == null) {
-                    console.error("Nutzung: del <nr>");
-                } else {
-                    console.info("Entfernt: " + config.commands.remove((int) index).command);
-                    changed = true;
-                }
-            }
-            case "on", "off", "an", "aus" -> {
-                Integer index = parseIndex(rest, count);
-                if (index == null) {
-                    console.error("Nutzung: on <nr>   bzw.   off <nr>");
-                } else {
-                    boolean enabled = verb.equals("on") || verb.equals("an");
-                    config.commands.get(index).enabled = enabled;
-                    console.info((enabled ? "Aktiv: " : "Aus: ") + config.commands.get(index).command);
-                    changed = true;
-                }
-            }
-            case "delay", "start" -> {
-                String[] p = rest.split("\\s+", 2);
-                Integer index = parseIndex(p[0], count);
-                Integer seconds = p.length > 1 ? parseInt(p[1]) : null;
-                if (index == null || seconds == null) {
-                    console.error("Nutzung: delay <nr> <sekunden>");
-                } else {
-                    config.commands.get(index).delaySeconds = seconds;
-                    console.info("Startverzögerung: " + config.commands.get(index).describe());
-                    changed = true;
-                }
-            }
-            case "list" -> {
-            }
-            default -> console.error("Unbekannt: " + verb);
-        }
-
-        if (changed) {
-            config.save();
-        }
-        return changed;
-    }
-
-    private static void printCommands(Console console, Config config) {
-        console.print("");
-        console.print(console.color(Console.BOLD, "  Wiederkehrende Befehle"));
-        if (config.commands.isEmpty()) {
-            console.print(console.color(Console.GRAY, "    (keine – mit  add <sekunden> <befehl>  anlegen)"));
-        }
-        for (int i = 0; i < config.commands.size(); i++) {
-            Config.AutoCommand command = config.commands.get(i);
-            String mark = command.enabled ? console.color(Console.GREEN, "●") : console.color(Console.GRAY, "○");
-            console.print("    " + mark + " " + (i + 1) + ")  " + command.describe());
-        }
-        console.print(console.color(Console.GRAY,
-                "    add <sek> <befehl>   del <nr>   on|off <nr>   delay <nr> <sek>   [Enter] zurück"));
-    }
-
-    private static Integer parseInt(String text) {
+    /** {@code --login}: nur anmelden und beenden. */
+    private static void addAccount() {
+        Console console = new Console(true, false);
+        migrateConfigDir();
         try {
-            int value = Integer.parseInt(text.trim());
-            return value >= 0 ? value : null;
-        } catch (NumberFormatException e) {
-            return null;
+            String name = new AuthManager(configDir()).addAccount(console::print);
+            System.out.println(name);
+            System.out.flush();
+        } catch (Exception e) {
+            console.error("Login fehlgeschlagen: " + e.getMessage());
+            System.exit(1);
         }
     }
 
-    /** Wandelt eine 1-basierte Nummer in einen gültigen 0-basierten Index um (sonst null). */
-    private static Integer parseIndex(String text, int size) {
-        try {
-            int n = Integer.parseInt(text.trim()) - 1;
-            return (n >= 0 && n < size) ? n : null;
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
-
-    // ===================== Chat-Loop =====================
-
-    private static void runInputLoop(Console console, AfkClient client, AuthManager auth, Config config) {
-        String line;
-        while ((line = console.readLine("> ")) != null) {
-            line = line.trim();
-            if (line.isEmpty()) continue;
-            if (line.startsWith(":")) {
-                if (handleCommand(line, console, client, auth, config)) return;
-            } else {
-                client.sendChatInput(line);
-            }
-        }
-    }
-
-    /** Behandelt die wenigen internen ':'-Befehle. true = beenden. */
-    private static boolean handleCommand(String line, Console console, AfkClient client,
-                                         AuthManager auth, Config config) {
-        String[] p = line.substring(1).split("\\s+", 2);
-        String cmd = p[0].toLowerCase();
-        String arg = p.length > 1 ? p[1].trim() : "";
-        switch (cmd) {
-            case "quit", "exit" -> {
-                return true;
-            }
-            case "reconnect" -> client.reconnectNow();
-            case "server" -> {
-                if (arg.isBlank()) {
-                    console.error("Nutzung: :server <host[:port]>");
-                } else {
-                    int[] holder = new int[1];
-                    String h = parseHost(arg, holder, console);
-                    config.lastServer = arg;
-                    config.save();
-                    client.switchServer(h, holder[0]);
-                }
-            }
-            case "account" -> {
-                String before = auth.currentAccount();
-                accountMenu(console, auth, config);
-                if (!before.equals(auth.currentAccount())) {
-                    console.info("Konto gewechselt – verbinde neu ...");
-                    client.reconnectNow();
-                }
-            }
-            case "cmd", "cmds", "befehle" -> {
-                if (commandsMenu(console, config, arg)) {
-                    client.reloadCommands();
-                }
-            }
-            case "clear", "cls" -> console.clearScreen();
-            case "help" -> printHelp(console);
-            default -> console.error("Unbekannter Befehl: :" + cmd + " (siehe :help)");
-        }
-        return false;
-    }
-
-    // ===================== Ausgabe-Helfer =====================
-
-    private static void printHeader(Console console, String version) {
-        console.print("");
-        console.print(console.color(Console.CYAN, "  ┌─────────────────────────────────────────────┐"));
-        console.print(console.color(Console.CYAN, "  │") + console.color(Console.BOLD, "  HugoAFKClient")
-                + console.color(Console.GRAY, "   ·   Minecraft " + version) + pad(version) + console.color(Console.CYAN, "│"));
-        console.print(console.color(Console.CYAN, "  └─────────────────────────────────────────────┘"));
-    }
-
-    private static String pad(String version) {
-        int used = "  HugoAFKClient   ·   Minecraft ".length() + version.length();
-        int total = 47;
-        int n = Math.max(1, total - used);
-        return " ".repeat(n);
-    }
-
-    private static void printMenu(Console console, AuthManager auth, ProtocolBridge bridge, String server) {
-        console.print("");
-        console.print(console.color(Console.GRAY, "  Konto  : ") + auth.username()
-                + console.color(Console.GRAY, "     Version: ") + bridge.targetVersion());
-        console.print(console.color(Console.GRAY, "  Server : ")
-                + (server == null || server.isBlank() ? console.color(Console.GRAY, "(keiner)") : server));
-        console.print(console.color(Console.GRAY, "  [Enter] verbinden   <ip> verbinden   :account Konten   :server <ip>   :quit"));
-    }
-
-    private static void printHelp(Console console) {
-        console.info("Nachricht tippen = chatten | /befehl = Serverbefehl");
-        console.info("  :cmd         wiederkehrende Befehle (z. B. /afk alle 5 min)");
-        console.info("  :reconnect   neu verbinden");
-        console.info("  :server <ip> Server wechseln");
-        console.info("  :account     Konto wechseln/verwalten");
-        console.info("  :clear       Bildschirm leeren");
-        console.info("  :quit        beenden");
-    }
-
-    private static void printUsage() {
-        System.out.println("""
-                HugoAFKClient - schlanker Minecraft-AFK-Client
-
-                Aufruf: java -jar hugoafk-<version>.jar [optionen] [host[:port]]
-
-                Optionen:
-                  --server <host[:port]>   Server-Adresse
-                  --account <name>         Startkonto wählen
-                  -h, --help               diese Hilfe
-
-                Konfiguration: ~/.config/hugoafk/ (config.json, accounts/)
-                Version je Jar; Auswahl über den Launcher (hugoafk.ps1 / hugoafk.sh).
-                """);
+    /** {@code --accounts}: gespeicherte Konten auflisten (eines je Zeile). */
+    private static void printAccounts() {
+        migrateConfigDir();
+        new AuthManager(configDir()).listAccounts().forEach(System.out::println);
+        System.out.flush();
     }
 
     // ===================== Host/Port =====================
 
-    private static String parseHost(String input, int[] holder, Console console) {
-        holder[0] = 25565;
+    /** {@code host}, {@code host:port} oder {@code [::1]:port} zerlegen. */
+    private static String parseHost(String input, int[] holder) {
         String value = input.trim();
         if (value.startsWith("[")) { // IPv6: [::1]:25565
             int end = value.indexOf(']');
             if (end > 0) {
-                String host = value.substring(1, end);
                 int colon = value.indexOf(':', end);
-                if (colon > 0) parsePort(value.substring(colon + 1), holder, console);
-                return host;
+                if (colon > 0) {
+                    holder[0] = port(value.substring(colon + 1), holder[0]);
+                }
+                return value.substring(1, end);
             }
             return value;
         }
         int colon = value.lastIndexOf(':');
         if (colon > -1 && value.indexOf(':') == colon) {
-            parsePort(value.substring(colon + 1), holder, console);
+            holder[0] = port(value.substring(colon + 1), holder[0]);
             return value.substring(0, colon);
         }
         return value;
     }
 
-    private static void parsePort(String text, int[] holder, Console console) {
+    private static int port(String text, int fallback) {
         try {
-            holder[0] = Integer.parseInt(text.trim());
+            return Integer.parseInt(text.trim());
         } catch (NumberFormatException e) {
-            console.error("Ungültiger Port – benutze 25565.");
+            System.err.println("Ungültiger Port – benutze " + fallback + ".");
+            return fallback;
         }
     }
 
-    private static Path configDir() {
-        String xdg = System.getenv("XDG_CONFIG_HOME");
-        Path base;
-        if (xdg != null && !xdg.isBlank()) {
-            base = Paths.get(xdg);
-        } else {
-            base = Paths.get(System.getProperty("user.home"), ".config");
+    // ===================== Verzeichnis / Version =====================
+
+    /**
+     * Verzeichnis mit {@code accounts/} (und {@code movement.json} im Bewegungs-Jar). Reine
+     * Pfadauskunft: liegt nur das alte {@code hugoafk}-Verzeichnis vor, wird dessen Pfad geliefert.
+     */
+    public static Path configDir() {
+        Path base = configBase();
+        Path dir = base.resolve("afksystems");
+        Path legacy = base.resolve("hugoafk");
+        if (!Files.exists(dir) && Files.isDirectory(legacy)) {
+            return legacy;
         }
-        return base.resolve("hugoafk");
+        return dir;
+    }
+
+    /**
+     * Einmalige Umbenennung {@code hugoafk} -> {@code afksystems}, damit bestehende Anmeldungen
+     * erhalten bleiben. Schlägt sie fehl, arbeitet {@link #configDir()} am alten Ort weiter.
+     */
+    private static void migrateConfigDir() {
+        Path base = configBase();
+        Path dir = base.resolve("afksystems");
+        Path legacy = base.resolve("hugoafk");
+        if (!Files.exists(dir) && Files.isDirectory(legacy)) {
+            try {
+                Files.move(legacy, dir);
+            } catch (Exception ignored) {
+                // Nicht schlimm – dann bleibt es beim alten Verzeichnis.
+            }
+        }
+    }
+
+    private static Path configBase() {
+        String xdg = System.getenv("XDG_CONFIG_HOME");
+        if (xdg != null && !xdg.isBlank()) {
+            return Paths.get(xdg);
+        }
+        return Paths.get(System.getProperty("user.home"), ".config");
+    }
+
+    /** Die Minecraft-Version dieses Jars – vom Build ins Manifest geschrieben. */
+    private static String minecraftVersion() {
+        String version = Main.class.getPackage().getImplementationVersion();
+        return version != null && !version.isBlank() ? version : "?";
+    }
+
+    // ===================== Hilfe =====================
+
+    private static void printUsage(String version) {
+        System.out.println("""
+                AFKSystems – schlanker Minecraft-AFK-Client für Minecraft %s
+
+                Aufruf:  java -jar afk-%s.jar <host[:port]> [optionen]
+
+                Optionen:
+                  -s, --server <host[:port]>  Serveradresse (geht auch ohne -s als erstes Argument)
+                  -a, --account <name>        gespeichertes Konto (Standard: das erste)
+                  -m, --mc <version>          muss zu diesem Jar passen (%s)
+                  -c, --cmd [sek:]<befehl>    Befehl nach dem Beitritt, mehrfach angebbar.
+                                              Ohne 'sek:' einmalig, sonst alle 'sek' Sekunden.
+                                              Beispiel: -c 300:/afk
+                      --join-delay <sek>      Wartezeit nach dem Beitritt vor dem ersten Befehl (4)
+                      --no-reconnect          nach einem Abbruch nicht neu verbinden
+                      --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)
+                      --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)
+                      --chat-delay <ms>       Mindestabstand ausgehender Nachrichten (1000)
+                      --no-color              keine Farben
+                  -q, --quiet                 keine Statusmeldungen, nur Chat
+                      --login                 Microsoft-Konto anmelden und beenden
+                      --accounts              gespeicherte Konten auflisten und beenden
+                  -h, --help                  diese Hilfe
+
+                Beispiel:
+                  java -jar afk-%s.jar mc.example.net -c 300:/afk
+
+                Ausgabe: Chat auf der Standardausgabe, alles andere auf der Standardfehlerausgabe.
+                Eingabe: jede Zeile geht als Chat raus, mit '/' vorn als Serverbefehl.
+                Konten:  %s
+                """.formatted(version, version, version, version, configDir()));
+        System.out.flush();
     }
 }
