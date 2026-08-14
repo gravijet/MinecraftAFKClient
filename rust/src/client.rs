@@ -21,6 +21,7 @@ use crate::console::Console;
 use crate::options::Options;
 use crate::proto::{config as cfg, handshake, login, pack_status, In, Protocol, State};
 use crate::proto::CLIENT_COMMAND_RESPAWN;
+use crate::rules::{Event, Rules};
 use crate::{dns, nbt};
 
 use rand::RngCore;
@@ -63,6 +64,8 @@ pub struct Shared {
     target: Mutex<(String, u16, bool)>,
     cookies: Mutex<HashMap<String, Vec<u8>>>,
     queue: Queue,
+    /// Makros aus `--on`. Ohne Regeln kostet das je Ereignis einen `is_empty()`-Test.
+    rules: Rules,
 
     /// Weckt den Befehls-Planer, sobald die Verbindung endet – sonst schläft er blockierend bis
     /// zum nächsten Termin (0 % CPU im Leerlauf).
@@ -75,6 +78,14 @@ pub struct Shared {
     /// Gesteuerte Bewegung (`:go`, `:look`, `:home`) – nur im Build mit `--features movement`.
     #[cfg(feature = "movement")]
     pub(crate) mover: crate::movement::Mover,
+
+    /// Anzeigetafel, Tab-Liste, Menüs, Anti-AFK – nur im Premium-Build.
+    #[cfg(feature = "premium")]
+    pub(crate) premium: crate::premium::Premium,
+
+    /// Eigene Entitäts-Nummer aus dem Login-Paket. Das Schleich-Paket von 1.21.1 braucht sie.
+    #[cfg(feature = "premium")]
+    pub(crate) entity_id: std::sync::atomic::AtomicI32,
 
     pub(crate) in_game: AtomicBool,
     /// Solange `true`, arbeiten Netz-, Sende- und Bewegungs-Threads weiter.
@@ -99,10 +110,10 @@ impl Client {
     pub fn new(console: Console, options: Options, account: Account) -> Client {
         let (host, port, srv) = parse_host(&options.server);
         let proto = options.protocol;
+        let rules = Rules::new(options.rules.clone(), options.rule_cooldown_seconds);
         let shared = Arc::new(Shared {
             console,
             proto,
-            options,
             account: Mutex::new(account),
             writer: Mutex::new(None),
             target: Mutex::new((host, port, srv)),
@@ -111,10 +122,16 @@ impl Client {
                 items: Mutex::new(VecDeque::new()),
                 signal: Condvar::new(),
             },
+            rules,
             idle: (Mutex::new(()), Condvar::new()),
             position: Mutex::new(None),
             #[cfg(feature = "movement")]
             mover: crate::movement::Mover::new(),
+            #[cfg(feature = "premium")]
+            premium: crate::premium::Premium::new(&options),
+            #[cfg(feature = "premium")]
+            entity_id: std::sync::atomic::AtomicI32::new(0),
+            options,
             in_game: AtomicBool::new(false),
             running: AtomicBool::new(true),
             intentional: AtomicBool::new(false),
@@ -151,9 +168,14 @@ impl Client {
         self.shared.queue.push(input.to_string());
     }
 
-    /// Bewegungsbefehl aus der Eingabeschleife (`:go`, `:look`, `:home`, `:stop`, `:pos`).
+    /// Örtlicher Befehl aus der Eingabeschleife (alles mit `:` vorn). Im Premium-Build bekommen
+    /// dessen Befehle zuerst die Gelegenheit; alles Übrige geht an die Bewegung.
     #[cfg(feature = "movement")]
-    pub fn movement_command(&self, verb: &str, arg: &str) {
+    pub fn local_command(&self, verb: &str, arg: &str) {
+        #[cfg(feature = "premium")]
+        if crate::premium::command(&self.shared, verb, arg) {
+            return;
+        }
         crate::movement::command(&self.shared, verb, arg);
     }
 }
@@ -184,9 +206,27 @@ impl Shared {
         *self.position.lock().unwrap() = Some(position);
     }
 
-    /// Chat-/Serverzeile anzeigen.
+    /// Chat-/Serverzeile anzeigen – und, falls es Chat-Regeln gibt, gegen sie halten.
     fn display(&self, text: &str) {
         self.console.chat(text);
+        if self.rules.watches_chat() {
+            self.run_rules(&Event::Chat(text));
+        }
+    }
+
+    /// Ereignis melden (`--events`) und passende `--on`-Regeln auslösen.
+    fn trigger(&self, event: Event, detail: &str) {
+        self.console.event(event.name(), detail);
+        self.run_rules(&event);
+    }
+
+    /// Aktionen der passenden Regeln in die normale Sendewarteschlange stellen – damit gelten
+    /// für sie derselbe Mindestabstand und dieselben Längengrenzen wie für Eingaben.
+    fn run_rules(&self, event: &Event) {
+        for action in self.rules.fire(event) {
+            self.console.info(&format!("Regel ({}): {}", event.name(), action));
+            self.queue.push(action);
+        }
     }
 
     /// Zeitstempel für die nächste Nachricht – nie kleiner als der vorige, sonst trennt der
@@ -210,7 +250,7 @@ impl Shared {
 
     /// Höchstens `duration` warten, ohne zu pollen. `false` = Verbindung beendet oder Programm
     /// beendet: der Aufrufer soll aufhören.
-    fn wait(&self, duration: Duration, generation: u32) -> bool {
+    pub(crate) fn wait(&self, duration: Duration, generation: u32) -> bool {
         let mut left = duration;
         let mut guard = self.idle.0.lock().unwrap();
         loop {
@@ -342,11 +382,18 @@ fn net_loop(shared: Arc<Shared>) {
         *shared.position.lock().unwrap() = None;
         // Wartende Befehls-Planer erkennen an der neuen Generation, dass sie fertig sind.
         shared.wake();
+        shared.rules.reset();
         #[cfg(feature = "movement")]
         crate::movement::on_disconnect(&shared);
+        #[cfg(feature = "premium")]
+        crate::premium::on_disconnect(&shared);
 
-        if let Err(e) = result {
-            shared.console.error(&format!("Getrennt: {}", e));
+        match &result {
+            Err(e) => {
+                shared.console.error(&format!("Getrennt: {}", e));
+                shared.console.event("disconnect", e);
+            }
+            Ok(()) => shared.console.event("disconnect", ""),
         }
 
         if shared.intentional.swap(false, Ordering::SeqCst) {
@@ -369,6 +416,9 @@ fn net_loop(shared: Arc<Shared>) {
         shared
             .console
             .info(&format!("Reconnect-Versuch {} in {} s ...", attempts, delay));
+        shared
+            .console
+            .event("reconnect", &format!("versuch={} in={}s", attempts, delay));
 
         // In Sekundenschritten schlafen, damit ein Abbruch nicht bis zu 60 s hängt.
         for _ in 0..delay {
@@ -391,13 +441,24 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         (host.clone(), port)
     };
 
+    let proxy = shared.options.proxy.as_ref();
     shared.console.note(&format!(
-        "Verbinde zu {}:{} (MC {}) ...",
-        real_host, real_port, shared.proto.name
+        "Verbinde zu {}:{} (MC {}){} ...",
+        real_host,
+        real_port,
+        shared.proto.name,
+        match proxy {
+            Some(proxy) => format!(" über {}", proxy.describe()),
+            None => String::new(),
+        }
     ));
+    shared.console.event(
+        "connecting",
+        &format!("host={} port={} mc={}", real_host, real_port, shared.proto.name),
+    );
 
     let (mut reader, writer) =
-        conn::connect(&format!("{}:{}", real_host, real_port)).map_err(|e| e.to_string())?;
+        conn::connect(&real_host, real_port, proxy).map_err(|e| e.to_string())?;
     *shared.writer.lock().unwrap() = Some(writer);
     shared.cookies.lock().unwrap().clear();
 
@@ -407,10 +468,20 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         (account.name.clone(), account.profile_id)
     };
 
+    // Im Handshake steht die Adresse, unter der wir den Server ansprechen. Normalerweise ist das
+    // das echte Ziel; mit --fakehost steht dort etwas anderes (manche Proxys leiten danach weiter,
+    // und genau dafür gibt es die Option). Die TCP-Verbindung geht davon unberührt zum echten Ziel.
+    let (handshake_host, handshake_port) = match &shared.options.fakehost {
+        // Port 0 heißt „nicht angegeben" – dann bleibt der echte.
+        Some((host, 0)) => (host.clone(), real_port),
+        Some((host, port)) => (host.clone(), *port),
+        None => (real_host.clone(), real_port),
+    };
+
     let mut intention = Writer::packet(handshake::SB_INTENTION);
     intention.var_int(shared.proto.version);
-    intention.string(&real_host);
-    intention.u16(real_port);
+    intention.string(&handshake_host);
+    intention.u16(handshake_port);
     intention.var_int(handshake::INTENT_LOGIN);
     shared.send(intention);
 
@@ -609,7 +680,7 @@ fn handle_game(
     r: &mut Reader,
 ) -> Result<bool, String> {
     let game = &shared.proto.game;
-    match game.incoming(id) {
+    match shared.proto.incoming(id) {
         // KeepAlive zuerst und sofort beantworten – das ist der eigentliche Schutz gegen
         // disconnect.timeout. Alles andere (Anzeige o. Ä.) kommt danach.
         In::KeepAlive => {
@@ -625,9 +696,26 @@ fn handle_game(
             shared.send(w);
         }
         In::Login => {
+            // Erstes Feld ist die eigene Entitäts-Nummer. Der schlanke Client braucht sie nicht,
+            // das Schleich-Paket von 1.21.1 dagegen schon.
+            #[cfg(feature = "premium")]
+            if let Ok(entity) = r.i32() {
+                shared
+                    .entity_id
+                    .store(entity, std::sync::atomic::Ordering::Relaxed);
+            }
             let first_join = !session.joined;
             session.joined = true;
             on_join(shared, session, first_join);
+        }
+        // Ein Respawn ist entweder die Wiedergeburt nach dem Tod oder ein Weltwechsel. Beides
+        // unterscheiden wir am eigenen Zustand statt am Paketinhalt: dessen Aufbau ist in jeder
+        // Version ein anderer, `session.dead` dagegen ist eindeutig – und kostet nichts.
+        In::Respawn => {
+            if !session.dead {
+                shared.console.info("Welt gewechselt.");
+                shared.trigger(Event::World, "");
+            }
         }
         In::SystemChat => {
             let component = nbt::read_network(r).map_err(|e| e.to_string())?;
@@ -661,6 +749,7 @@ fn handle_game(
                 let mut w = Writer::packet(game.sb_client_command);
                 w.var_int(CLIENT_COMMAND_RESPAWN);
                 shared.send(w);
+                shared.trigger(Event::Death, "");
             } else if health > 0.0 {
                 session.dead = false;
             }
@@ -682,6 +771,13 @@ fn handle_game(
         }
         In::Transfer => return transfer(shared, r),
         In::Disconnect => return Err(disconnect_reason(shared, r)),
+
+        // Alles Weitere gibt es nur im Premium-Build; dort landet es bei der Anzeigetafel bzw.
+        // beim Menü. Im schlanken Build existieren diese Zweige gar nicht.
+        #[cfg(feature = "premium")]
+        other => crate::premium::incoming(shared, other, r),
+
+        #[cfg(not(feature = "premium"))]
         In::Ignored => {}
     }
     Ok(false)
@@ -708,16 +804,21 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
             .console
             .ok(&format!("Verbunden und im Spiel als {}.", name));
         start_commands(shared);
+        shared.trigger(Event::Join, &format!("name={}", name));
     } else {
         shared
             .console
             .info("Unterserver gewechselt (zählt nicht als neuer Beitritt).");
+        // Ein anderer Unterserver ist eine andere Welt – für `--on world` zählt das.
+        shared.trigger(Event::World, "grund=unterserver");
     }
 
     // Heimatposition nach JEDEM Beitritt – anders als bei den Befehlen zählt hier auch der
     // Unterserver-Wechsel, denn dort landen wir in einer anderen Welt an einer anderen Stelle.
     #[cfg(feature = "movement")]
     crate::movement::on_join(shared);
+    #[cfg(feature = "premium")]
+    crate::premium::on_join(shared);
 }
 
 /// Wiederkehrende Befehle (`--cmd`) nach dem echten Beitritt.
@@ -1092,7 +1193,8 @@ mod tests {
     fn paket_ids_sind_je_version_eindeutig() {
         for p in crate::proto::PROTOCOLS {
             let g = &p.game;
-            let ids = [
+            #[allow(unused_mut)]
+            let mut ids = vec![
                 g.cb_cookie_request,
                 g.cb_disconnect,
                 g.cb_keep_alive,
@@ -1101,17 +1203,37 @@ mod tests {
                 g.cb_player_chat,
                 g.cb_player_position,
                 g.cb_resource_pack_push,
+                g.cb_respawn,
                 g.cb_set_health,
                 g.cb_start_configuration,
                 g.cb_store_cookie,
                 g.cb_system_chat,
                 g.cb_transfer,
             ];
+            // Die Premium-IDs müssen sich in dieselbe Menge einreihen: eine Überschneidung mit
+            // einem der obigen Pakete würde still das falsche Paket verarbeiten.
+            #[cfg(feature = "premium")]
+            {
+                let e = &p.extra;
+                ids.extend_from_slice(&[
+                    e.cb_container_close,
+                    e.cb_container_set_content,
+                    e.cb_container_set_slot,
+                    e.cb_open_screen,
+                    e.cb_player_info_remove,
+                    e.cb_player_info_update,
+                    e.cb_reset_score,
+                    e.cb_set_display_objective,
+                    e.cb_set_objective,
+                    e.cb_set_player_team,
+                    e.cb_set_score,
+                ]);
+            }
             for (i, a) in ids.iter().enumerate() {
                 for b in &ids[i + 1..] {
                     assert_ne!(a, b, "doppelte Paket-ID in {}", p.name);
                 }
-                assert_ne!(g.incoming(*a), In::Ignored, "unbekannte ID in {}", p.name);
+                assert_ne!(p.incoming(*a), In::Ignored, "unbekannte ID in {}", p.name);
             }
         }
     }

@@ -6,22 +6,35 @@
 //! gehen auf die Standardfehlerausgabe, Eingabezeilen gehen als Chat raus. Damit lässt er sich
 //! ohne Terminal betreiben und von einem anderen Programm (z. B. einer Website) fernsteuern.
 //!
-//! Zwei Bauformen aus derselben Quelle:
+//! Drei Bauformen aus derselben Quelle:
 //! * `cargo build --release` – der schlanke AFK-Client, ohne jede Bewegung.
 //! * `cargo build --release --features movement` – zusätzlich gesteuerte Bewegung
 //!   (`:go`, `:look`, `:home`, `:route`, `:stop`, `:pos`), siehe [`movement`].
+//! * `cargo build --release --features premium` – zusätzlich Anzeigetafel, Tab-Liste, Menüs,
+//!   Anti-AFK und Schleichen, siehe [`premium`]. Das ist der „Premium-AFK-Client"; alles darin
+//!   hält Zustand oder braucht einen Zeitgeber und gehört deshalb nicht in den schlanken Build.
 
+#[cfg(feature = "premium")]
+mod antiafk;
 mod auth;
+#[cfg(feature = "premium")]
+mod board;
 mod buf;
 mod client;
 mod conn;
 mod console;
 mod dns;
+#[cfg(feature = "premium")]
+mod menu;
 #[cfg(feature = "movement")]
 mod movement;
 mod nbt;
 mod options;
+#[cfg(feature = "premium")]
+mod premium;
 mod proto;
+mod proxy;
+mod rules;
 
 use crate::client::Client;
 use crate::console::Console;
@@ -47,15 +60,34 @@ fn main() {
 }
 
 fn run(options: Options) {
-    let console = Console::new(options.color, options.quiet);
-    options::migrate();
-    let base = options::dir();
+    let console = Console::new(options.color, options.quiet, options.events);
+    warn_about_unused_options(&console, &options);
 
-    let account = match sign_in(&console, &base, options.account.as_deref()) {
-        Ok(account) => account,
-        Err(e) => {
-            console.error(&format!("Login fehlgeschlagen: {}", e));
-            std::process::exit(1);
+    // Offline-Konten sind reine Rechenarbeit: kein Microsoft-Login, kein Verzeichnis, keine
+    // gespeicherte Datei. Deshalb wird hier auch nichts migriert oder geladen.
+    let account = if let Some(name) = &options.offline {
+        match auth::offline(name) {
+            Ok(account) => {
+                console.info(&format!(
+                    "Offline-Modus als '{}' (nur auf Servern ohne Konto-Prüfung).",
+                    account.name
+                ));
+                account
+            }
+            Err(e) => {
+                console.error(&format!("Offline-Name abgelehnt: {}", e));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        options::migrate();
+        let base = options::dir();
+        match sign_in(&console, &base, options.account.as_deref()) {
+            Ok(account) => account,
+            Err(e) => {
+                console.error(&format!("Login fehlgeschlagen: {}", e));
+                std::process::exit(1);
+            }
         }
     };
 
@@ -73,7 +105,7 @@ fn run(options: Options) {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let verb = parts.next().unwrap_or("").to_lowercase();
             let arg = parts.next().unwrap_or("").trim();
-            client.movement_command(&verb, arg);
+            client.local_command(&verb, arg);
             continue;
         }
         client.send_chat(line);
@@ -82,6 +114,24 @@ fn run(options: Options) {
     loop {
         std::thread::park();
     }
+}
+
+/// Das Panel schickt allen Bauformen dieselben Argumente. Damit `--antiafk` im schlanken Build
+/// nicht still verpufft, wird hier einmal gesagt, was dieser Build nicht kann.
+fn warn_about_unused_options(console: &Console, options: &Options) {
+    #[cfg(feature = "premium")]
+    let _ = options;
+    #[cfg(not(feature = "premium"))]
+    {
+        if options.antiafk_seconds > 0 {
+            console.warn("--antiafk kann nur der Premium-Client (premium-afk); wird ignoriert.");
+        }
+        if options.sneak {
+            console.warn("--sneak kann nur der Premium-Client (premium-afk); wird ignoriert.");
+        }
+    }
+    #[cfg(feature = "premium")]
+    let _ = console;
 }
 
 // ===================== Anmeldung =====================
@@ -142,7 +192,7 @@ fn device_code_login(console: &Console, base: &Path) -> auth::Res<auth::Account>
 
 /// `--login`: nur anmelden und beenden.
 fn add_account_only() {
-    let console = Console::new(true, false);
+    let console = Console::new(true, false, false);
     options::migrate();
     match device_code_login(&console, &options::dir()) {
         Ok(account) => println!("{}", account.name),
@@ -165,40 +215,68 @@ fn print_accounts() {
 
 fn print_usage() {
     println!(
-        "AFKSystems {} – schlanker Minecraft-AFK-Client\n\
+        "AFKSystems {} – {}\n\
          \n\
          Aufruf:  afk <host[:port]> [optionen]\n\
          \n\
-         Optionen:\n\
+         Konto:\n\
+         \x20 -a, --account <name>        gespeichertes Microsoft-Konto (Standard: das erste)\n\
+         \x20     --offline <name>        Offline-/Cracked-Konto (nur ohne Konto-Prüfung)\n\
+         \x20     --login                 Microsoft-Konto anmelden und beenden\n\
+         \x20     --accounts              gespeicherte Konten auflisten und beenden\n\
+         \n\
+         Verbindung:\n\
          \x20 -s, --server <host[:port]>  Serveradresse (geht auch ohne -s als erstes Argument)\n\
-         \x20 -a, --account <name>        gespeichertes Konto (Standard: das erste)\n\
          \x20 -m, --mc <version>          Protokoll: {}  (Standard: {})\n\
+         \x20     --proxy <adresse>       socks5://[nutzer:pass@]host:port oder http://...\n\
+         \x20     --fakehost <host[:port]> diese Adresse im Handshake statt der echten\n\
+         \x20     --no-reconnect          nach einem Abbruch nicht neu verbinden\n\
+         \x20     --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)\n\
+         \x20     --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)\n\
+         \n\
+         Befehle und Makros:\n\
          \x20 -c, --cmd [sek:]<befehl>    Befehl nach dem Beitritt, mehrfach angebbar.\n\
          \x20                             Ohne 'sek:' einmalig, sonst alle 'sek' Sekunden.\n\
          \x20                             Beispiel: -c 300:/afk\n\
          \x20     --join-delay <sek>      Wartezeit nach dem Beitritt vor dem ersten Befehl (4)\n\
-         \x20     --no-reconnect          nach einem Abbruch nicht neu verbinden\n\
-         \x20     --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)\n\
-         \x20     --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)\n\
+         \x20     --on <ausloeser>=<aktion>  join | world | death | chat:<text>\n\
+         \x20                             Beispiel: --on chat:du bist afk=/lobby\n\
+         \x20     --on-cooldown <sek>     Sperrzeit je Regel (3)\n\
          \x20     --chat-delay <ms>       Mindestabstand ausgehender Nachrichten (1000)\n\
+         \n\
+         Ausgabe:\n\
          \x20     --no-color              keine Farben\n\
          \x20 -q, --quiet                 keine Statusmeldungen, nur Chat\n\
-         \x20     --login                 Microsoft-Konto anmelden und beenden\n\
-         \x20     --accounts              gespeicherte Konten auflisten und beenden\n\
+         \x20     --events                zusaetzlich '@event ...'-Zeilen zum Mitlesen\n\
          \x20 -h, --help                  diese Hilfe\n\
-         \n\
+         {}\n\
          Beispiel:\n\
-         \x20 afk mc.example.net --mc 26.1 -c 300:/afk\n\
+         \x20 afk mc.example.net --mc 26.1 -c 300:/afk --on death=/spawn\n\
          \n\
          Ausgabe: Chat auf der Standardausgabe, alles andere auf der Standardfehlerausgabe.\n\
          Eingabe: jede Zeile geht als Chat raus, mit '/' vorn als Serverbefehl.\n\
          Konten:  {}{}",
         env!("CARGO_PKG_VERSION"),
+        if cfg!(feature = "premium") {
+            "Premium-AFK-Client fuer Minecraft"
+        } else if cfg!(feature = "movement") {
+            "Minecraft-AFK-Client mit Bewegung"
+        } else {
+            "schlanker Minecraft-AFK-Client"
+        },
         Protocol::names(),
         proto::DEFAULT.name,
+        if cfg!(feature = "premium") {
+            "\nPremium:\n\
+             \x20     --antiafk <sek>         alle <sek> eine kleine Bewegung (min. 15, 0 = aus)\n\
+             \x20     --sneak                 beim Beitritt geduckt bleiben\n"
+        } else {
+            ""
+        },
         options::dir().display(),
         if cfg!(feature = "movement") {
-            "\nBewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis."
+            "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf.\n\
+             Bewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis."
         } else {
             ""
         }

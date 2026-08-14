@@ -661,7 +661,7 @@ fn turn_to(
 }
 
 /// Position senden **und** den eigenen Zustand mitziehen – der Server rechnet ab jetzt mit ihr.
-fn send_move(shared: &Shared, position: Position) {
+pub(crate) fn send_move(shared: &Shared, position: Position) {
     send_move_ground(shared, position, true);
 }
 
@@ -811,6 +811,7 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) {
             shared.mover.stop();
             shared.console.info("Bewegung gestoppt.");
         }
+        "help" | "hilfe" | "?" => help(shared),
         "pos" | "position" => match shared.position() {
             Some((x, y, z, yaw, pitch)) => shared.console.info(&format!(
                 "x={:.2}  y={:.2}  z={:.2}  ·  Blick {:.1}° ({}) / {:.1}°",
@@ -1301,6 +1302,34 @@ fn print_route(shared: &Arc<Shared>) {
 }
 
 // ===================== Hilfen =====================
+
+/// `:help` – alle örtlichen Befehle. Was der Build nicht kann, steht auch nicht dabei.
+fn help(shared: &Arc<Shared>) {
+    let console = &shared.console;
+    console.print("");
+    console.print(&console.paint(BOLD, "  Befehle (alles mit ':' vorn, alles andere geht in den Chat)"));
+    for line in [
+        ":go vor|zurück|links|rechts [blöcke]   laufen (Richtung relativ zum Blick)",
+        ":look <gier> [neigung] · nord|ost|…    Kopf drehen",
+        ":jump [richtung]  ·  :fall             springen · fallen lassen",
+        ":home set|on|off|go|delay|speed        Heimatposition",
+        ":route rec|stop|add|del|go|clear       Wegpunkte zur Heimatposition",
+        ":pos  ·  :stop                         Position anzeigen · Bewegung abbrechen",
+    ] {
+        console.print(&format!("    {}", line));
+    }
+    #[cfg(feature = "premium")]
+    for line in [
+        ":board  ·  :tab                        Seitenleiste · Spielerliste",
+        ":menu  ·  :click <feld> [rechts|shift] ·  :close",
+        ":sneak [on|off]  ·  :sprint [on|off]   Schleichen · Sprinten",
+        ":swing  ·  :use  ·  :hand <1-9>        Arm · Rechtsklick · Schnellleiste",
+        ":antiafk [on|off|<sek>]                automatische kleine Bewegung",
+    ] {
+        console.print(&format!("    {}", line));
+    }
+    console.print(&console.paint(GRAY, "    /befehl geht als Serverbefehl raus, alles andere als Chat."));
+}
 
 fn usage_go(console: &Console) {
     console.error("Nutzung: :go vor|zurück|links|rechts [blöcke]     z. B.  :go vor 5");

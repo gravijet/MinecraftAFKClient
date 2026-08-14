@@ -47,6 +47,10 @@ jobs:
           | \`afk-1.21.1.jar\` … \`afk-26.2.jar\` | Java-Client, je ein Jar pro Minecraft-Version: \`java -jar afk-26.1.jar <server>\` |
           | \`afk-windows.exe\` | Rust-Client für Windows – spricht alle vier Versionen, Auswahl über \`--mc\` |
           | \`afk-linux\` | dasselbe für Linux |
+          | \`premium-afk-windows.exe\` / \`premium-afk-linux\` | Premium-Client: alles vom schlanken plus Bewegung, Anzeigetafel, Tab-Liste, Menüs, Anti-AFK |
+
+          Wer nur AFK stehen will, nimmt \`afk-…\` – der ist kleiner und braucht weniger Speicher.
+          Was welcher Client kann, steht in [FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md).
 
           Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
           EOF
@@ -97,10 +101,14 @@ jobs:
             name: linux
             built: rust/target/release/afk
             artifact: afk-linux
+            premium_built: rust/target/premium/release/afk
+            premium_artifact: premium-afk-linux
           - os: windows-latest
             name: windows
             built: rust/target/release/afk.exe
             artifact: afk-windows.exe
+            premium_built: rust/target/premium/release/afk.exe
+            premium_artifact: premium-afk-windows.exe
     steps:
       - uses: actions/checkout@v5
 
@@ -114,9 +122,16 @@ jobs:
         working-directory: rust
         run: cargo build --release
 
+      # Eigenes Zielverzeichnis: sonst überschriebe der Premium-Build die schlanke Datei.
+      - name: Premium bauen
+        working-directory: rust
+        run: cargo build --release --features premium --target-dir target/premium
+
       - name: Tests
         working-directory: rust
-        run: cargo test --release
+        run: |
+          cargo test --release
+          cargo test --release --features premium --target-dir target/premium
 
       - name: Hochladen
         shell: bash
@@ -126,7 +141,10 @@ jobs:
         run: |
           mkdir -p out
           cp "${{ matrix.built }}" "out/${{ matrix.artifact }}"
-          gh release upload "$ENTWURF" "out/${{ matrix.artifact }}" --clobber
+          cp "${{ matrix.premium_built }}" "out/${{ matrix.premium_artifact }}"
+          gh release upload "$ENTWURF" \
+            "out/${{ matrix.artifact }}" \
+            "out/${{ matrix.premium_artifact }}" --clobber
 
   veroeffentlichen:
     name: latest-Release ersetzen

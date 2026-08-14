@@ -59,6 +59,8 @@ pub struct Account {
     json: Value,
     token: String,
     expires_at_ms: i64,
+    /// `false` bei `--offline`: es gibt kein Token, also auch keinen Sitzungs-Join.
+    online: bool,
 }
 
 // ===================== Kontenverwaltung =====================
@@ -116,6 +118,7 @@ pub fn load(base: &Path, name: &str) -> Res<Account> {
         json,
         token: String::new(),
         expires_at_ms: 0,
+        online: true,
     };
     account.adopt_cached();
     account.ensure_fresh()?;
@@ -155,11 +158,122 @@ pub fn add(base: &Path, on_code: impl Fn(&DeviceCode)) -> Res<Account> {
         json,
         token: String::new(),
         expires_at_ms: 0,
+        online: true,
     };
     account.refresh_from_msa()?;
     account.file = account_file(base, &account.name);
     account.save();
     Ok(account)
+}
+
+// ===================== Offline-/Cracked-Konto =====================
+
+/// Konto ohne Microsoft: nur ein Name, dazu die UUID, die ein Server im Offline-Modus selbst
+/// berechnen würde – MD5 über `OfflinePlayer:<name>`, als UUID der Version 3.
+///
+/// Damit kommt man auf Server, die `online-mode=false` fahren (und auf Proxys, die davor
+/// stehen). Verlangt der Server eine echte Sitzung, bricht der Login mit einer klaren Meldung ab:
+/// ohne Microsoft-Token kann niemand die Sitzung anmelden.
+pub fn offline(name: &str) -> Res<Account> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 16 {
+        return Err("Offline-Name muss 1 bis 16 Zeichen lang sein.".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Offline-Name darf nur Buchstaben, Ziffern und '_' enthalten.".to_string());
+    }
+
+    Ok(Account {
+        name: name.to_string(),
+        profile_id: offline_uuid(name),
+        file: PathBuf::new(),
+        json: Value::Null,
+        token: String::new(),
+        expires_at_ms: 0,
+        online: false,
+    })
+}
+
+/// `UUID.nameUUIDFromBytes("OfflinePlayer:<name>")` – genau das rechnet auch der Server.
+fn offline_uuid(name: &str) -> [u8; 16] {
+    let mut bytes = md5(format!("OfflinePlayer:{}", name).as_bytes());
+    bytes[6] = (bytes[6] & 0x0F) | 0x30; // Version 3 (namensbasiert, MD5)
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // Variante RFC 4122
+    bytes
+}
+
+/// MD5 (RFC 1321) – von Hand, wie das CFB8 in `conn.rs`: fünfzig Zeilen statt einer weiteren
+/// Abhängigkeit. Läuft genau einmal je Programmstart und nur mit `--offline`.
+///
+/// Bewusst **nicht** für Sicherheitszwecke: MD5 steht hier ausschließlich, weil Minecraft die
+/// Offline-UUID so und nicht anders bildet.
+fn md5(input: &[u8]) -> [u8; 16] {
+    /// Rundenkonstanten: floor(|sin(i+1)| * 2^32), fest wie in RFC 1321.
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    /// Linksrotation je Runde.
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    // Nachricht auffüllen: 0x80, Nullen, danach die Bitlänge als 64-Bit-Zahl (little endian).
+    let mut data = input.to_vec();
+    let bit_length = (input.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_length.to_le_bytes());
+
+    let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+    for chunk in data.chunks_exact(64) {
+        let mut m = [0u32; 16];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            m[i] = u32::from_le_bytes(word.try_into().unwrap());
+        }
+
+        let [mut a, mut b, mut c, mut d] = state;
+        for i in 0..64 {
+            let (f, g) = match i / 16 {
+                0 => ((b & c) | (!b & d), i),
+                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                2 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | !d), (7 * i) % 16),
+            };
+            let tmp = d;
+            d = c;
+            c = b;
+            b = b.wrapping_add(
+                a.wrapping_add(f)
+                    .wrapping_add(K[i])
+                    .wrapping_add(m[g])
+                    .rotate_left(S[i]),
+            );
+            a = tmp;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    let mut out = [0u8; 16];
+    for (i, word) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 // ===================== Account =====================
@@ -173,6 +287,13 @@ impl Account {
 
     /// Meldet die Sitzung bei Mojang an – Pflicht vor dem verschlüsselten Login.
     pub fn join_server(&mut self, server_hash: &str) -> Res<()> {
+        if !self.online {
+            return Err(
+                "Der Server verlangt eine echte Microsoft-Sitzung – mit --offline geht das nicht \
+                 (der Server läuft nicht im Offline-Modus)."
+                    .to_string(),
+            );
+        }
         let token = self.token()?.to_string();
         let profile = hex(&self.profile_id);
         let response = agent().post("https://sessionserver.mojang.com/session/minecraft/join")
@@ -526,5 +647,50 @@ fn short(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, _) => format!("HTTP {}", code),
         ureq::Error::Transport(t) => format!("Netzwerkfehler ({})", t.kind()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Prüfsummen aus RFC 1321 – stimmt die Implementierung hier nicht, stimmt keine Offline-UUID.
+    #[test]
+    fn md5_rechnet_richtig() {
+        assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(hex(&md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            hex(&md5(b"The quick brown fox jumps over the lazy dog")),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        // Genau ein Block mehr als die Auffüllgrenze (56 Byte) – hier verrechnen sich
+        // MD5-Implementierungen erfahrungsgemäß.
+        assert_eq!(
+            hex(&md5(&b"a".repeat(56))),
+            "3b0c8ac703f828b04c6c197006d17218"
+        );
+    }
+
+    /// Die Vergleichswerte kommen aus `UUID.nameUUIDFromBytes("OfflinePlayer:<name>")` –
+    /// genau der Rechnung, die auch ein Server im Offline-Modus anstellt.
+    #[test]
+    fn offline_uuid_wie_beim_server() {
+        let check = |name: &str, expected: &str| {
+            assert_eq!(uuid_to_dashed(&offline_uuid(name)), expected, "{}", name);
+        };
+        check("Notch", "b50ad385-829d-3141-a216-7e7d7539ba7f");
+        check("Hugo", "551dd0fd-f25e-3199-8165-b6cd2cea11b6");
+        check("hugo_afk", "d3d05406-9c20-36d4-98dd-770552b8353c");
+        check("Steve", "5627dd98-e6be-3c21-b8a8-e92344183641");
+    }
+
+    #[test]
+    fn offline_namen_werden_geprueft() {
+        assert!(offline("Hugo").is_ok());
+        assert!(offline("").is_err());
+        assert!(offline("viel_zu_langer_name").is_err());
+        assert!(offline("mit leerzeichen").is_err());
+        // Ohne Microsoft-Token darf kein Sitzungs-Join versucht werden.
+        assert!(offline("Hugo").unwrap().join_server("abc").is_err());
     }
 }

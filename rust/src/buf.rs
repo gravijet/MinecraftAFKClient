@@ -112,6 +112,22 @@ impl<'a> Reader<'a> {
     pub fn uuid(&mut self) -> io::Result<[u8; 16]> {
         Ok(self.bytes(16)?.try_into().unwrap())
     }
+
+    /// Feld überspringen, ohne es zu kopieren. Der Premium-Client läuft damit durch Felder,
+    /// die er nicht braucht (Skin-Texturen sind je Spieler ein paar Kilobyte).
+    #[cfg(feature = "premium")]
+    pub fn skip(&mut self, n: usize) -> io::Result<()> {
+        self.bytes(n).map(|_| ())
+    }
+
+    #[cfg(feature = "premium")]
+    pub fn skip_string(&mut self) -> io::Result<()> {
+        let len = self.var_int()?;
+        if len < 0 || len > 1024 * 1024 {
+            return Err(err("String-Laenge unplausibel"));
+        }
+        self.skip(len as usize)
+    }
 }
 
 // ===================== Schreiben =====================

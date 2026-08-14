@@ -198,8 +198,18 @@ impl PacketWriter {
 
 /// Verbindet und liefert Lese- und Schreibseite getrennt (je eigener Chiffre-Zustand,
 /// CFB8 läuft richtungsgetrennt).
-pub fn connect(addr: &str) -> io::Result<(PacketReader, PacketWriter)> {
-    let stream = TcpStream::connect(addr)?;
+///
+/// Mit `proxy` läuft der Aufbau über SOCKS5 bzw. HTTP-CONNECT; danach ist der Socket ein
+/// gewöhnlicher TCP-Strom und alles Weitere unverändert.
+pub fn connect(
+    host: &str,
+    port: u16,
+    proxy: Option<&crate::proxy::Proxy>,
+) -> io::Result<(PacketReader, PacketWriter)> {
+    let stream = match proxy {
+        Some(proxy) => proxy.connect(host, port)?,
+        None => TcpStream::connect((host, port))?,
+    };
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let write_half = stream.try_clone()?;

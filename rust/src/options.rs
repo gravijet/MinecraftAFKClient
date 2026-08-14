@@ -3,12 +3,16 @@
 //! Microsoft-Konten unter `~/.config/afksystems/accounts/`.
 
 use crate::proto::{Protocol, DEFAULT};
+use crate::proxy::Proxy;
+use crate::rules::{Spec, Trigger};
 use std::path::PathBuf;
 
 /// Untergrenze für Wiederholungen: schneller löst nur der Spam-Schutz des Servers aus.
 const MIN_REPEAT_SECONDS: u64 = 5;
 /// Untergrenze für den Abstand zweier ausgehender Nachrichten.
 const MIN_CHAT_DELAY_MS: u64 = 200;
+/// Untergrenze für die Anti-AFK-Aktionen: häufiger ist kein Zappeln mehr, sondern auffällig.
+const MIN_ANTIAFK_SECONDS: u64 = 15;
 
 /// Verzeichnis mit `accounts/` (und `movement.json` im Bewegungs-Build). Reine Pfadauskunft:
 /// liegt nur das alte `hugoafk`-Verzeichnis vor, wird dessen Pfad geliefert.
@@ -62,17 +66,36 @@ pub struct AutoCommand {
 pub struct Options {
     pub server: String,
     pub account: Option<String>,
+    /// Name für den Offline-Modus („Cracked"). Schließt `account` aus.
+    pub offline: Option<String>,
     pub protocol: &'static Protocol,
     pub commands: Vec<AutoCommand>,
+
+    /// Proxy nur für die Spielverbindung.
+    pub proxy: Option<Proxy>,
+    /// Was im Handshake als Zieladresse steht, falls es nicht der echte Server sein soll.
+    pub fakehost: Option<(String, u16)>,
 
     pub auto_reconnect: bool,
     pub reconnect_delay_seconds: u64,
     pub max_backoff_seconds: u64,
 
+    /// Makros: Auslöser -> Aktion.
+    pub rules: Vec<Spec>,
+    /// Sperrzeit je Regel, damit eine Regel sich nicht selbst nachtriggert.
+    pub rule_cooldown_seconds: u64,
+
     pub color: bool,
     /// Keine Statusmeldungen – nur noch Chat auf der Standardausgabe.
     pub quiet: bool,
+    /// Maschinenlesbare `@event`-Zeilen auf der Fehlerausgabe.
+    pub events: bool,
     pub chat_min_delay_ms: u64,
+
+    /// Sekunden zwischen zwei Anti-AFK-Aktionen; 0 = aus. Nur im Premium-Build wirksam.
+    pub antiafk_seconds: u64,
+    /// Dauerhaft geduckt beitreten. Nur im Premium-Build wirksam.
+    pub sneak: bool,
 }
 
 impl Default for Options {
@@ -80,14 +103,22 @@ impl Default for Options {
         Options {
             server: String::new(),
             account: None,
+            offline: None,
             protocol: DEFAULT,
             commands: Vec::new(),
+            proxy: None,
+            fakehost: None,
             auto_reconnect: true,
             reconnect_delay_seconds: 5,
             max_backoff_seconds: 60,
+            rules: Vec::new(),
+            rule_cooldown_seconds: 3,
             color: true,
             quiet: false,
+            events: false,
             chat_min_delay_ms: 1000,
+            antiafk_seconds: 0,
+            sneak: false,
         }
     }
 }
@@ -124,6 +155,24 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
 
             "-s" | "--server" => o.server = value("--server")?,
             "-a" | "--account" => o.account = Some(value("--account")?),
+            "--offline" | "--cracked" => o.offline = Some(value("--offline")?),
+            "--proxy" => o.proxy = Some(Proxy::parse(&value("--proxy")?)?),
+            "--fakehost" => o.fakehost = Some(parse_fakehost(&value("--fakehost")?)?),
+            "--on" => o.rules.push(parse_rule(&value("--on")?)?),
+            "--on-cooldown" => {
+                o.rule_cooldown_seconds = number(&value("--on-cooldown")?, "--on-cooldown")?
+            }
+            "--events" => o.events = true,
+            "--antiafk" => {
+                // 0 heißt ausdrücklich „aus"; alles andere bekommt die Untergrenze.
+                let seconds = number(&value("--antiafk")?, "--antiafk")?;
+                o.antiafk_seconds = if seconds == 0 {
+                    0
+                } else {
+                    seconds.max(MIN_ANTIAFK_SECONDS)
+                };
+            }
+            "--sneak" => o.sneak = true,
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
                 o.protocol = Protocol::find(&name).ok_or_else(|| {
@@ -155,11 +204,78 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
     if o.server.trim().is_empty() {
         return Err("Kein Server angegeben. Beispiel: afk --server mc.example.net".to_string());
     }
+    if o.account.is_some() && o.offline.is_some() {
+        return Err(
+            "--account und --offline schließen sich aus: entweder Microsoft-Konto oder Offline-Name."
+                .to_string(),
+        );
+    }
     o.server = o.server.trim().to_string();
     for command in &mut o.commands {
         command.delay_seconds = join_delay;
     }
     Ok(Command::Run(Box::new(o)))
+}
+
+/// `--fakehost lobby.example.net` oder `--fakehost lobby.example.net:25565`.
+///
+/// Steht kein Port dabei, wird der des echten Servers eingesetzt – das erledigt der Client,
+/// hier steht dann die 0.
+fn parse_fakehost(input: &str) -> Result<(String, u16), String> {
+    let text = input.trim();
+    let (host, port) = match text.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("--fakehost: Port ist keine Zahl: '{}'", port))?,
+        ),
+        None => (text, 0),
+    };
+    if host.trim().is_empty() {
+        return Err("--fakehost braucht einen Namen, z. B. --fakehost play.example.net".to_string());
+    }
+    Ok((host.trim().to_string(), port))
+}
+
+/// `--on <auslöser>=<aktion>`, z. B. `--on join=/afk`, `--on tod=/spawn`,
+/// `--on chat:du bist afk=/lobby`.
+fn parse_rule(input: &str) -> Result<Spec, String> {
+    let (head, action) = input.split_once('=').ok_or_else(|| {
+        format!(
+            "--on braucht <auslöser>=<aktion>, z. B. --on join=/afk. Bekommen: '{}'",
+            input
+        )
+    })?;
+    let action = action.trim();
+    if action.is_empty() {
+        return Err("--on braucht eine Aktion hinter dem '=', z. B. --on join=/afk".to_string());
+    }
+    let head = head.trim();
+    let trigger = match head.to_ascii_lowercase().as_str() {
+        "join" | "beitritt" => Trigger::Join,
+        "world" | "welt" | "server" => Trigger::World,
+        "death" | "tod" => Trigger::Death,
+        _ => match head.split_once(':') {
+            Some((kind, text)) if matches!(kind.trim().to_ascii_lowercase().as_str(), "chat") => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err("--on chat: braucht einen Text, auf den gewartet wird.".to_string());
+                }
+                Trigger::Chat(text.to_ascii_lowercase())
+            }
+            _ => {
+                return Err(format!(
+                    "Unbekannter Auslöser '{}'. Möglich: join, world, death, chat:<text>",
+                    head
+                ))
+            }
+        },
+    };
+    Ok(Spec {
+        trigger,
+        action: action.to_string(),
+    })
 }
 
 /// `--cmd /afk` (einmalig) oder `--cmd 300:/afk` (alle 300 s).
@@ -255,5 +371,85 @@ mod tests {
     #[test]
     fn wiederholung_hat_eine_untergrenze() {
         assert_eq!(options(&["x", "-c", "1:/afk"]).commands[0].repeat_seconds, 5);
+    }
+
+    #[test]
+    fn offline_und_konto_zugleich_geht_nicht() {
+        assert_eq!(options(&["x", "--offline", "Hugo"]).offline.unwrap(), "Hugo");
+        assert!(parse_args(&["x", "--offline", "Hugo", "-a", "user@example.invalid"]).is_err());
+    }
+
+    #[test]
+    fn proxy_wird_uebernommen() {
+        let o = options(&["x", "--proxy", "socks5://192.0.2.1:1080"]);
+        assert_eq!(o.proxy.unwrap().describe(), "socks5://192.0.2.1:1080");
+        assert!(parse_args(&["x", "--proxy", "ftp://192.0.2.1:21"]).is_err());
+    }
+
+    /// Ohne Port steht hier die 0 – den echten setzt der Client ein.
+    #[test]
+    fn fakehost_mit_und_ohne_port() {
+        assert_eq!(
+            options(&["x", "--fakehost", "play.example.net"]).fakehost,
+            Some(("play.example.net".to_string(), 0))
+        );
+        assert_eq!(
+            options(&["x", "--fakehost", "play.example.net:25566"]).fakehost,
+            Some(("play.example.net".to_string(), 25566))
+        );
+        assert!(parse_args(&["x", "--fakehost", "play.example.net:xx"]).is_err());
+    }
+
+    #[test]
+    fn regeln_werden_gelesen() {
+        let o = options(&[
+            "x",
+            "--on",
+            "join=/afk",
+            "--on",
+            "tod=/spawn",
+            "--on",
+            "chat:Du bist AFK=/lobby",
+        ]);
+        assert_eq!(o.rules.len(), 3);
+        assert!(matches!(o.rules[0].trigger, Trigger::Join));
+        assert_eq!(o.rules[0].action, "/afk");
+        assert!(matches!(o.rules[1].trigger, Trigger::Death));
+        // Chat-Auslöser werden kleingeschrieben verglichen.
+        match &o.rules[2].trigger {
+            Trigger::Chat(text) => assert_eq!(text, "du bist afk"),
+            _ => panic!("kein Chat-Auslöser"),
+        }
+    }
+
+    /// Ein '=' in der Aktion darf nicht stören – geteilt wird beim ersten.
+    #[test]
+    fn regel_aktion_darf_gleichheitszeichen_enthalten() {
+        let o = options(&["x", "--on", "join=/setwarp name=hier"]);
+        assert_eq!(o.rules[0].action, "/setwarp name=hier");
+    }
+
+    #[test]
+    fn unsinnige_regeln_werden_abgelehnt() {
+        assert!(parse_args(&["x", "--on", "join"]).is_err());
+        assert!(parse_args(&["x", "--on", "join="]).is_err());
+        assert!(parse_args(&["x", "--on", "chat:=/afk"]).is_err());
+        assert!(parse_args(&["x", "--on", "sonstwas=/afk"]).is_err());
+    }
+
+    /// 0 heißt aus, alles andere bekommt die Untergrenze.
+    #[test]
+    fn antiafk_hat_eine_untergrenze() {
+        assert_eq!(options(&["x"]).antiafk_seconds, 0);
+        assert_eq!(options(&["x", "--antiafk", "0"]).antiafk_seconds, 0);
+        assert_eq!(options(&["x", "--antiafk", "3"]).antiafk_seconds, 15);
+        assert_eq!(options(&["x", "--antiafk", "90"]).antiafk_seconds, 90);
+    }
+
+    #[test]
+    fn schalter_ohne_wert() {
+        let o = options(&["x", "--events", "--sneak"]);
+        assert!(o.events);
+        assert!(o.sneak);
     }
 }

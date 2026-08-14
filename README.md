@@ -4,12 +4,18 @@ Schlanker Minecraft-AFK-Client. Er meldet sich mit einem Microsoft-Konto an, tri
 bei, bleibt verbunden und zeigt den Chat. Kein Menü, keine Konfigurationsdatei: **alles steht im
 Startbefehl.**
 
-Es gibt ihn zweimal aus einem Repo:
+Es gibt ihn dreimal aus einem Repo:
 
 | | Datei | Minecraft-Versionen | Verbrauch |
 | --- | --- | --- | --- |
 | **Rust** (empfohlen) | `afk-windows.exe`, `afk-linux` | alle vier in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 2 Threads |
+| **Rust Premium** | `premium-afk-windows.exe`, `premium-afk-linux` | dieselbe eine Datei | ~1,1 MB Datei, ein paar MB mehr RAM |
 | **Java** | `afk-1.21.1.jar` … `afk-26.2.jar` | eine Jar je Version | ~10 MB Jar, 40–70 MB RAM |
+
+Der **Premium-Client** kann alles, was der schlanke kann, plus Bewegung, Anzeigetafel, Tab-Liste,
+Menü-Klicks und automatisches Anti-AFK. Wer nur AFK stehen will, nimmt den schlanken – er ist
+kleiner und hält im Leerlauf gar keinen Zustand. Die vollständige Gegenüberstellung steht in
+**[FEATURES.md](FEATURES.md)**, dort auch, was bewusst *nicht* umgesetzt ist und warum.
 
 Warum beim Java-Client eine Jar pro Version: MCProtocolLib spricht pro Build genau ein Protokoll.
 Alle vier in eine Jar zu packen hieße vierfache Größe und Classloader-Trickserei – der Rust-Client
@@ -41,24 +47,40 @@ java -jar afk-26.1.jar mc.example.net -c 300:/afk
 
 ## Optionen
 
-Beide Clients verstehen dieselben Argumente.
+Die Grundoptionen verstehen beide Clients gleich. Die mit **R** markierten gibt es nur im
+Rust-Client, die mit **P** nur im Premium-Build (der schlanke Rust-Client nimmt sie an und sagt,
+dass er sie ignoriert – so kann das Panel allen Bauformen dieselbe Befehlszeile schicken).
 
 | Option | Bedeutung |
 | --- | --- |
 | `-s`, `--server <host[:port]>` | Serveradresse. Geht auch ohne `-s` als erstes Argument. Ohne Port wird der SRV-Eintrag gefragt. |
 | `-a`, `--account <name>` | gespeichertes Konto (Standard: das erste) |
+| `--offline <name>` | **R** Offline-/Cracked-Konto statt Microsoft-Login. Nur auf Servern mit `online-mode=false`. |
 | `-m`, `--mc <version>` | `1.21.1` \| `1.21.11` \| `26.1` \| `26.2` (Standard `26.1`). Beim Java-Client muss die Angabe zur Jar passen. |
+| `--proxy <adresse>` | **R** Spielverbindung über `socks5://[nutzer:pass@]host:port` oder `http://...` |
+| `--fakehost <host[:port]>` | **R** diese Adresse im Handshake statt der echten (TCP geht weiter ans echte Ziel) |
 | `-c`, `--cmd [sek:]<befehl>` | Befehl nach dem Beitritt, mehrfach angebbar. Ohne `sek:` einmalig, sonst alle `sek` Sekunden. Beispiel: `-c 300:/afk` |
 | `--join-delay <sek>` | Wartezeit nach dem Beitritt vor dem ersten Befehl (Standard 4) |
+| `--on <auslöser>=<aktion>` | **R** Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
+| `--on-cooldown <sek>` | **R** Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
 | `--no-reconnect` | nach einem Abbruch nicht neu verbinden, sondern beenden |
 | `--reconnect-delay <sek>` | erste Wartezeit vor dem Reconnect (Standard 5, danach exponentiell) |
 | `--max-backoff <sek>` | Obergrenze der Reconnect-Wartezeit (Standard 60) |
 | `--chat-delay <ms>` | Mindestabstand ausgehender Nachrichten (Standard 1000, gegen Spam-Kick) |
 | `--no-color` | keine ANSI-Farben |
 | `-q`, `--quiet` | keine Statusmeldungen – wirklich nur Chat |
+| `--events` | **R** zusätzlich maschinenlesbare `@event …`-Zeilen (auch mit `-q`) |
+| `--antiafk <sek>` | **P** alle `sek` Sekunden eine kleine Bewegung (mindestens 15, `0` = aus) |
+| `--sneak` | **P** beim Beitritt geduckt bleiben |
 | `--login` | Microsoft-Konto anmelden und beenden |
 | `--accounts` | gespeicherte Konten auflisten und beenden |
 | `-h`, `--help` | Hilfe |
+
+Beispiel für Makros:
+
+```bash
+afk mc.example.net --on death=/spawn --on "chat:du bist afk=/lobby" --on join=/afk
+```
 
 ## Ein-/Ausgabe (für die Website)
 
@@ -76,6 +98,21 @@ Damit reicht ein Prozess-Start mit Pipes; ein eigenes Protokoll braucht es nicht
 afk mc.example.net -q -c 300:/afk > chat.log
 echo "/list" | afk mc.example.net -q
 ```
+
+Mit `--events` kommen auf der Fehlerausgabe zusätzlich Zeilen der Form `@event <name> <angaben>` –
+sie kommen **auch mit `-q`** durch, sind nie eingefärbt und lassen sich stumpf mit
+`startswith("@event ")` herausfiltern:
+
+| Zeile | wann |
+| --- | --- |
+| `@event connecting host=… port=… mc=…` | vor jedem Verbindungsversuch |
+| `@event join name=…` | echter Beitritt (erstes Login-Paket einer Verbindung) |
+| `@event world grund=unterserver` | Unterserver-Wechsel |
+| `@event world` | Weltwechsel (Respawn in einer anderen Welt) |
+| `@event death` | gestorben |
+| `@event disconnect <grund>` | Verbindung beendet (Grund kann leer sein) |
+| `@event reconnect versuch=N in=Ns` | vor dem nächsten Versuch |
+| `@event menu open id=N` / `@event menu close` | nur Premium: Menü auf/zu |
 
 ## Konten
 
@@ -108,13 +145,13 @@ Beim Java-Client steckt derselbe Unterschied in `Net` – einmal in `java/src/ap
 ## Selbst bauen
 
 ```powershell
-.\build-all.ps1              # alle vier Jars + afk-windows.exe nach dist\
-.\build-all.ps1 -Only rust
+.\build-all.ps1                          # alle vier Jars + afk-windows.exe nach dist\
+.\build-all.ps1 -Only rust -Move -Premium # dazu afk-windows-move.exe und premium-afk-windows.exe
 ```
 
 ```bash
-./build-all.sh               # alle vier Jars + afk-linux nach dist/
-./build-all.sh --only java
+./build-all.sh                           # alle vier Jars + afk-linux nach dist/
+./build-all.sh --only rust --move --premium
 ```
 
 Einzeln:
@@ -148,6 +185,31 @@ cd rust && cargo build --release --features movement --target-dir target/movemen
 Im schlanken Build ist davon keine einzige Klasse bzw. kein Byte enthalten. Die Bewegung merkt sich
 Heimatposition und Routen in `movement.json` neben den Konten.
 
+## Premium-Client (eigene Datei, nur Rust)
+
+`premium-afk-windows.exe` / `premium-afk-linux` enthält alles vom schlanken Client **und** von der
+Bewegungs-Bauform, dazu:
+
+| Befehl | Was |
+| --- | --- |
+| `:board` | Anzeigetafel / Seitenleiste so, wie sie im Spiel rechts stünde |
+| `:tab` | Spielerliste (Tab-Liste) |
+| `:menu`, `:click <feld> [rechts\|shift]`, `:close` | geöffnete Menüs/Kisten bedienen |
+| `:sneak [on\|off]`, `:sprint [on\|off]` | Schleichen / Sprinten |
+| `:swing`, `:use`, `:hand <1-9>` | Arm schwingen, Rechtsklick, Schnellleiste |
+| `:antiafk [on\|off\|<sek>]` | automatische kleine Bewegung gegen AFK-Plugins |
+
+`:help` listet im laufenden Client alle örtlichen Befehle auf. Warum das eine eigene Datei ist:
+Anzeigetafel, Tab-Liste und Menüs müssen Zustand mitführen und Anti-AFK braucht einen Zeitgeber –
+genau das, was der schlanke Client bewusst nicht tut. Ohne `--features premium` ist davon kein Byte
+einkompiliert.
+
+```bash
+cd rust && cargo build --release --features premium --target-dir target/premium
+```
+
+Der vollständige Funktionsvergleich steht in **[FEATURES.md](FEATURES.md)**.
+
 ## Wie der Kick-Schutz funktioniert
 
 Rein protokollbasiert – genau das, was ein wartender Vanilla-Client tut, und **kein** Gezappel:
@@ -167,6 +229,10 @@ Wechsel zwischen Unterservern bewusst nicht.
 
 ```
 rust/     Rust-Client (Cargo)      – proto.rs = Paket-IDs, client.rs = Ablauf, options.rs = Argumente
+          rules.rs/proxy.rs        – Makros und Proxy (auch im schlanken Build)
+          premium.rs board.rs      – nur mit --features premium: Anzeigetafel, Tab-Liste,
+          menu.rs antiafk.rs         Menüs, Anti-AFK
 java/     Java-Client (Gradle)     – src/main = Ablauf, src/api-* = Versionsunterschiede, src/move = Bewegung
+FEATURES.md   was welcher Client kann – und was bewusst fehlt
 .github/  Workflow: baut bei jedem Push auf main alles und ersetzt das Release "latest"
 ```

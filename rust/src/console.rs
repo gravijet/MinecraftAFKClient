@@ -30,6 +30,8 @@ struct Inner {
     color: AtomicBool,
     /// Nur Chat und echte Fehler ausgeben.
     quiet: AtomicBool,
+    /// Zusätzliche `@event`-Zeilen für ein Programm davor.
+    events: AtomicBool,
 }
 
 /// Beliebig oft klonbar (alle Klone teilen sich denselben Zustand).
@@ -39,13 +41,14 @@ pub struct Console {
 }
 
 impl Console {
-    pub fn new(color: bool, quiet: bool) -> Console {
+    pub fn new(color: bool, quiet: bool, events: bool) -> Console {
         #[cfg(windows)]
         enable_windows_utf8();
         Console {
             inner: Arc::new(Inner {
                 color: AtomicBool::new(color),
                 quiet: AtomicBool::new(quiet),
+                events: AtomicBool::new(events),
             }),
         }
     }
@@ -99,6 +102,24 @@ impl Console {
     pub fn error(&self, text: &str) {
         let mut err = std::io::stderr().lock();
         let _ = writeln!(err, "{}", self.paint(RED, text));
+    }
+
+    /// Maschinenlesbare Zustandszeile für ein Programm davor (`--events`):
+    /// `@event <name> <angaben>`, immer ohne Farbe und **auch mit `--quiet`**.
+    ///
+    /// Ohne `--events` kostet das genau einen atomaren Ladevorgang – der Aufrufer darf die
+    /// Zeile also bedenkenlos an jeder interessanten Stelle setzen.
+    pub fn event(&self, name: &str, detail: &str) {
+        if !self.inner.events.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let _ = if detail.is_empty() {
+            writeln!(err, "@event {}", name)
+        } else {
+            writeln!(err, "@event {} {}", name, detail)
+        };
+        let _ = err.flush();
     }
 
     /// Eingabezeilen, bis die Standardeingabe endet. `None` = Ende (z. B. Strg-D oder eine
