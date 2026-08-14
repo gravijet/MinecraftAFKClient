@@ -192,10 +192,6 @@ impl PacketWriter {
         }
         self.stream.write_all(&bytes)
     }
-
-    pub fn shutdown(&self) {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
-    }
 }
 
 // ===================== Aufbau =====================

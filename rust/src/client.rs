@@ -3,18 +3,24 @@
 //! Kick-Schutz ist rein protokollbasiert – genau das, was ein wartender Vanilla-Client tut:
 //! `KeepAlive` sofort beantworten, `Ping`→`Pong`, Teleports bestätigen, erzwungene Resource-Packs
 //! bestätigen (nicht laden), beim Beitritt `ClientInformation` senden, Cookies beantworten,
-//! den Verhaltenskodex (neu in 26.1) bestätigen. **Keine** Anti-AFK-Bewegung.
+//! den Verhaltenskodex (ab 1.21.11) bestätigen. **Keine** Anti-AFK-Bewegung.
 //!
 //! Threads: 1× Netz (liest und antwortet), 1× Sender (rate-limitiert), sonst nichts. Im Leerlauf
 //! blockieren beide – kein Timer, kein Polling, praktisch 0 % CPU.
+//!
+//! Die Protokollversion steckt in [`crate::proto::Protocol`] und kommt aus `--mc`; alle
+//! versionsabhängigen Stellen sind unten mit `proto.modern` bzw. über `proto.game` markiert.
+//!
+//! Nur im Build mit `--features movement` kommt [`crate::movement`] dazu: gesteuerte Bewegung auf
+//! Zuruf (`:go`, `:look`, `:home`). Ohne das Feature ist davon nichts einkompiliert.
 
 use crate::auth::{self, Account};
 use crate::buf::{Reader, Writer};
-use crate::config::Config;
 use crate::conn::{self, PacketReader, PacketWriter};
-use crate::console::{Console, Link};
-use crate::proto::{config as cfg, game, handshake, login, pack_status, State};
-use crate::proto::{MINECRAFT_VERSION, PROTOCOL_VERSION};
+use crate::console::Console;
+use crate::options::Options;
+use crate::proto::{config as cfg, handshake, login, pack_status, In, Protocol, State};
+use crate::proto::CLIENT_COMMAND_RESPAWN;
 use crate::{dns, nbt};
 
 use rand::RngCore;
@@ -43,9 +49,14 @@ struct Queue {
     signal: Condvar,
 }
 
+/// Spielerposition: x, y, z, Gierwinkel, Neigung.
+pub type Position = (f64, f64, f64, f32, f32);
+
 pub struct Shared {
-    console: Console,
-    config: Mutex<Config>,
+    pub(crate) console: Console,
+    /// Gewählte Protokollversion – fest für die ganze Laufzeit.
+    pub(crate) proto: &'static Protocol,
+    options: Options,
     account: Mutex<Account>,
     writer: Mutex<Option<PacketWriter>>,
     /// Ziel: (Host, Port, SRV-Auflösung erlaubt)
@@ -53,31 +64,30 @@ pub struct Shared {
     cookies: Mutex<HashMap<String, Vec<u8>>>,
     queue: Queue,
 
-    /// Weckt den Befehls-Planer, sobald die Verbindung endet oder die Liste sich ändert –
-    /// sonst schläft er blockierend bis zum nächsten Termin (0 % CPU im Leerlauf).
+    /// Weckt den Befehls-Planer, sobald die Verbindung endet – sonst schläft er blockierend bis
+    /// zum nächsten Termin (0 % CPU im Leerlauf).
     idle: (Mutex<()>, Condvar),
 
-    in_game: AtomicBool,
-    running: AtomicBool,
-    shutting_down: AtomicBool,
-    /// Trennung wurde von uns ausgelöst (:reconnect, :server, Kontowechsel) -> ohne Backoff neu verbinden.
+    /// Zuletzt bekannte eigene Position; `None`, solange der Server noch keine geschickt hat.
+    /// Der Netz-Thread schreibt sie bei jedem Teleport, der Bewegungs-Thread bei jedem Schritt.
+    position: Mutex<Option<Position>>,
+
+    /// Gesteuerte Bewegung (`:go`, `:look`, `:home`) – nur im Build mit `--features movement`.
+    #[cfg(feature = "movement")]
+    pub(crate) mover: crate::movement::Mover,
+
+    pub(crate) in_game: AtomicBool,
+    /// Solange `true`, arbeiten Netz-, Sende- und Bewegungs-Threads weiter.
+    pub(crate) running: AtomicBool,
+    /// Trennung wurde von uns ausgelöst (Server-Transfer) -> ohne Backoff neu verbinden.
     intentional: AtomicBool,
     /// Zählt Verbindungs-Generationen: ein wartender Befehl erkennt daran, dass „seine"
     /// Verbindung längst tot ist, und feuert dann nicht mehr.
-    generation: AtomicU32,
-    /// Zählt Änderungen an der Befehlsliste – ein laufender Planer beendet sich dadurch.
-    command_epoch: AtomicU32,
+    pub(crate) generation: AtomicU32,
     /// Empfangene signierte Nachrichten, die der Server noch quittiert haben will.
     unacked: AtomicU32,
     /// Zeitstempel der letzten gesendeten Nachricht; der Server verlangt monotone Zeit.
     last_chat_ms: AtomicI64,
-}
-
-/// Ausweis eines Befehls-Planers: gilt nur für „seine" Verbindung und „seine" Befehlsliste.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Ticket {
-    generation: u32,
-    epoch: u32,
 }
 
 pub struct Client {
@@ -85,10 +95,14 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(console: Console, config: Config, account: Account, host: String, port: u16, srv: bool) -> Client {
+    /// Startet Netz- und Sender-Thread. Verbunden wird sofort und danach bei jedem Abbruch neu.
+    pub fn new(console: Console, options: Options, account: Account) -> Client {
+        let (host, port, srv) = parse_host(&options.server);
+        let proto = options.protocol;
         let shared = Arc::new(Shared {
             console,
-            config: Mutex::new(config),
+            proto,
+            options,
             account: Mutex::new(account),
             writer: Mutex::new(None),
             target: Mutex::new((host, port, srv)),
@@ -98,28 +112,30 @@ impl Client {
                 signal: Condvar::new(),
             },
             idle: (Mutex::new(()), Condvar::new()),
+            position: Mutex::new(None),
+            #[cfg(feature = "movement")]
+            mover: crate::movement::Mover::new(),
             in_game: AtomicBool::new(false),
             running: AtomicBool::new(true),
-            shutting_down: AtomicBool::new(false),
             intentional: AtomicBool::new(false),
             generation: AtomicU32::new(0),
-            command_epoch: AtomicU32::new(0),
             unacked: AtomicU32::new(0),
             last_chat_ms: AtomicI64::new(0),
         });
-        shared.update_status(Link::Offline);
 
-        let net = Arc::clone(&shared);
-        thread::Builder::new()
-            .name("hugoafk-net".into())
-            .spawn(move || net_loop(net))
-            .expect("Netz-Thread");
-
-        let sender = Arc::clone(&shared);
-        thread::Builder::new()
-            .name("hugoafk-sender".into())
-            .spawn(move || sender_loop(sender))
-            .expect("Sender-Thread");
+        for (name, task) in [("afk-net", true), ("afk-sender", false)] {
+            let shared = Arc::clone(&shared);
+            thread::Builder::new()
+                .name(name.into())
+                .spawn(move || {
+                    if task {
+                        net_loop(shared)
+                    } else {
+                        sender_loop(shared)
+                    }
+                })
+                .expect("Thread");
+        }
 
         Client { shared }
     }
@@ -127,56 +143,18 @@ impl Client {
     /// Nachricht oder Befehl in die rate-limitierte Warteschlange stellen.
     pub fn send_chat(&self, input: &str) {
         if !self.shared.in_game.load(Ordering::Relaxed) {
-            self.shared.console.error("Nicht verbunden – Nachricht nicht gesendet.");
+            self.shared
+                .console
+                .error("Nicht verbunden – Nachricht nicht gesendet.");
             return;
         }
         self.shared.queue.push(input.to_string());
     }
 
-    pub fn reconnect_now(&self) {
-        self.shared.console.info("Verbinde neu ...");
-        self.shared.drop_connection(true);
-    }
-
-    pub fn account_name(&self) -> String {
-        self.shared.account.lock().unwrap().name.clone()
-    }
-
-    /// Konto wechseln und mit dem neuen Konto sofort neu verbinden.
-    pub fn set_account(&self, account: Account) {
-        *self.shared.account.lock().unwrap() = account;
-        self.shared.console.note("Konto gewechselt – verbinde neu ...");
-        self.shared.drop_connection(true);
-    }
-
-    pub fn switch_server(&self, host: String, port: u16, srv: bool) {
-        self.shared
-            .console
-            .note(&format!("Wechsle zu {}:{} ...", host, port));
-        *self.shared.target.lock().unwrap() = (host, port, srv);
-        self.shared.drop_connection(true);
-    }
-
-    /// Geänderte Konfiguration übernehmen. Läuft gerade ein Befehls-Planer, wird er beendet
-    /// und – wenn wir im Spiel sind – mit der neuen Liste neu gestartet.
-    pub fn update_config(&self, config: Config) {
-        *self.shared.config.lock().unwrap() = config;
-        self.shared.command_epoch.fetch_add(1, Ordering::SeqCst);
-        self.shared.wake();
-        if self.shared.in_game.load(Ordering::Relaxed) {
-            start_commands(&self.shared);
-        }
-    }
-
-    pub fn shutdown(&self) {
-        self.shared.shutting_down.store(true, Ordering::SeqCst);
-        self.shared.running.store(false, Ordering::SeqCst);
-        self.shared.intentional.store(true, Ordering::SeqCst);
-        self.shared.queue.signal.notify_all();
-        self.shared.wake();
-        if let Some(writer) = self.shared.writer.lock().unwrap().as_ref() {
-            writer.shutdown();
-        }
+    /// Bewegungsbefehl aus der Eingabeschleife (`:go`, `:look`, `:home`, `:stop`, `:pos`).
+    #[cfg(feature = "movement")]
+    pub fn movement_command(&self, verb: &str, arg: &str) {
+        crate::movement::command(&self.shared, verb, arg);
     }
 }
 
@@ -192,45 +170,23 @@ impl Queue {
 }
 
 impl Shared {
-    fn send(&self, packet: Writer) {
+    pub(crate) fn send(&self, packet: Writer) {
         if let Some(writer) = self.writer.lock().unwrap().as_mut() {
             let _ = writer.send(packet);
         }
     }
 
-    /// Verbindung hart schließen; der Netz-Thread merkt das am Lesefehler und verbindet neu.
-    fn drop_connection(&self, intentional: bool) {
-        self.intentional.store(intentional, Ordering::SeqCst);
-        if let Some(writer) = self.writer.lock().unwrap().as_ref() {
-            writer.shutdown();
-        }
+    pub(crate) fn position(&self) -> Option<Position> {
+        *self.position.lock().unwrap()
     }
 
-    /// Chat-/Serverzeile anzeigen (mit Uhrzeit davor).
+    pub(crate) fn set_position(&self, position: Position) {
+        *self.position.lock().unwrap() = Some(position);
+    }
+
+    /// Chat-/Serverzeile anzeigen.
     fn display(&self, text: &str) {
         self.console.chat(text);
-    }
-
-    /// Zustandszeile unter dem Eingabefeld nachziehen.
-    fn update_status(&self, link: Link) {
-        let account = self.account.lock().unwrap().name.clone();
-        let (host, port, _) = self.target.lock().unwrap().clone();
-        let server = if host.is_empty() {
-            "kein Server".to_string()
-        } else if port == DEFAULT_PORT {
-            host
-        } else {
-            format!("{}:{}", host, port)
-        };
-        let state = match link {
-            Link::Online => "verbunden",
-            Link::Connecting => "verbinde",
-            Link::Offline => "getrennt",
-        };
-        self.console.set_status(
-            link,
-            &format!("{}  ·  {}  ·  {}  ·  :help", state, server, account),
-        );
     }
 
     /// Zeitstempel für die nächste Nachricht – nie kleiner als der vorige, sonst trennt der
@@ -252,24 +208,13 @@ impl Shared {
         }
     }
 
-    fn ticket(&self) -> Ticket {
-        Ticket {
-            generation: self.generation.load(Ordering::SeqCst),
-            epoch: self.command_epoch.load(Ordering::SeqCst),
-        }
-    }
-
-    fn valid(&self, ticket: Ticket) -> bool {
-        self.running.load(Ordering::Relaxed) && self.ticket() == ticket
-    }
-
-    /// Höchstens `duration` warten, ohne zu pollen. `false` = Verbindung beendet, Programm
-    /// beendet oder Befehlsliste geändert: der Aufrufer soll aufhören.
-    fn wait(&self, duration: Duration, ticket: Ticket) -> bool {
+    /// Höchstens `duration` warten, ohne zu pollen. `false` = Verbindung beendet oder Programm
+    /// beendet: der Aufrufer soll aufhören.
+    fn wait(&self, duration: Duration, generation: u32) -> bool {
         let mut left = duration;
         let mut guard = self.idle.0.lock().unwrap();
         loop {
-            if !self.valid(ticket) {
+            if !self.valid(generation) {
                 return false;
             }
             if left.is_zero() {
@@ -279,13 +224,17 @@ impl Shared {
             let (next, result) = self.idle.1.wait_timeout(guard, left).unwrap();
             guard = next;
             if result.timed_out() {
-                return self.valid(ticket);
+                return self.valid(generation);
             }
             left = left.saturating_sub(started.elapsed());
         }
     }
 
-    /// Alle Wartenden wecken (Verbindung beendet, Liste geändert, Programmende).
+    fn valid(&self, generation: u32) -> bool {
+        self.running.load(Ordering::Relaxed) && self.generation.load(Ordering::SeqCst) == generation
+    }
+
+    /// Alle Wartenden wecken (Verbindung beendet, Programmende).
     fn wake(&self) {
         let _guard = self.idle.0.lock().unwrap();
         self.idle.1.notify_all();
@@ -323,7 +272,7 @@ fn sender_loop(shared: Arc<Shared>) {
             // Befehle tragen KEINE Quittung (das Paket hat kein lastSeenMessages-Feld),
             // der Offset darf hier also nicht verbraucht werden.
             Outgoing::Command(command) => {
-                let mut w = Writer::packet(game::SB_CHAT_COMMAND);
+                let mut w = Writer::packet(shared.proto.game.sb_chat_command);
                 w.string(&command);
                 shared.send(w);
             }
@@ -333,8 +282,7 @@ fn sender_loop(shared: Arc<Shared>) {
             }
         }
 
-        let delay = shared.config.lock().unwrap().chat_min_delay_ms.max(200);
-        thread::sleep(Duration::from_millis(delay));
+        thread::sleep(Duration::from_millis(shared.options.chat_min_delay_ms));
     }
 }
 
@@ -367,14 +315,16 @@ fn sanitize(input: &str, limit: usize) -> String {
 }
 
 fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
-    let mut w = Writer::packet(game::SB_CHAT);
+    let mut w = Writer::packet(shared.proto.game.sb_chat);
     w.string(message);
     w.i64(shared.next_chat_time());
     w.i64(0); // salt
     w.bool(false); // keine Signatur (unsignierter Chat)
     w.var_int(offset as i32);
     w.raw(&[0, 0, 0]); // Bitset der zuletzt gesehenen Nachrichten (20 Bit = 3 Byte)
-    w.u8(0); // Prüfsumme 0 = „bitte nicht prüfen"
+    if shared.proto.modern {
+        w.u8(0); // Prüfsumme 0 = „bitte nicht prüfen" (gibt es erst ab 1.21.11)
+    }
     w
 }
 
@@ -389,45 +339,38 @@ fn net_loop(shared: Arc<Shared>) {
         shared.in_game.store(false, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         *shared.writer.lock().unwrap() = None;
+        *shared.position.lock().unwrap() = None;
         // Wartende Befehls-Planer erkennen an der neuen Generation, dass sie fertig sind.
         shared.wake();
+        #[cfg(feature = "movement")]
+        crate::movement::on_disconnect(&shared);
 
-        if shared.shutting_down.load(Ordering::Relaxed) {
-            return;
-        }
-        shared.update_status(Link::Offline);
         if let Err(e) = result {
             shared.console.error(&format!("Getrennt: {}", e));
         }
 
         if shared.intentional.swap(false, Ordering::SeqCst) {
-            attempts = 0; // vom Nutzer ausgelöst: sofort neu verbinden
+            attempts = 0; // Server-Transfer: sofort weiter
             continue;
         }
-
-        let (auto, base, max) = {
-            let config = shared.config.lock().unwrap();
-            (
-                config.auto_reconnect,
-                config.reconnect_delay_seconds,
-                config.max_backoff_seconds,
-            )
-        };
-        if !auto {
-            shared
-                .console
-                .warn("Auto-Reconnect ist aus – mit :reconnect neu verbinden.");
-            return;
+        if !shared.options.auto_reconnect {
+            // Ohne Reconnect gibt es nichts mehr zu tun. Der Hauptthread wartet womöglich
+            // blockierend auf eine Eingabe, die nie kommt – also das Programm beenden, damit ein
+            // Dienst dahinter den Abbruch sieht.
+            shared.console.error("Auto-Reconnect ist aus – beende.");
+            shared.running.store(false, Ordering::SeqCst);
+            std::process::exit(1);
         }
 
         attempts += 1;
         let exponent = (attempts - 1).min(6);
-        let delay = (base.saturating_mul(1 << exponent)).clamp(1, max);
+        let delay = (shared.options.reconnect_delay_seconds.saturating_mul(1 << exponent))
+            .clamp(1, shared.options.max_backoff_seconds);
         shared
             .console
             .info(&format!("Reconnect-Versuch {} in {} s ...", attempts, delay));
 
-        // In Sekundenschritten schlafen, damit :quit nicht bis zu 60 s hängt.
+        // In Sekundenschritten schlafen, damit ein Abbruch nicht bis zu 60 s hängt.
         for _ in 0..delay {
             if !shared.running.load(Ordering::Relaxed) {
                 return;
@@ -440,18 +383,17 @@ fn net_loop(shared: Arc<Shared>) {
 fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     let (host, port, srv_allowed) = shared.target.lock().unwrap().clone();
 
-    // SRV nur beim Standardport – exakt wie MCProtocolLib im Java-Client. Manche Server (z. B.
-    // hugosmp.net) haben überhaupt keinen A-Record und sind nur über SRV erreichbar.
+    // SRV nur beim Standardport – exakt wie MCProtocolLib im Java-Client. Manche Server haben
+    // überhaupt keinen A-Record und sind nur über SRV erreichbar.
     let (real_host, real_port) = if srv_allowed && port == DEFAULT_PORT {
         dns::resolve_srv(&host).unwrap_or((host.clone(), port))
     } else {
         (host.clone(), port)
     };
 
-    shared.update_status(Link::Connecting);
     shared.console.note(&format!(
         "Verbinde zu {}:{} (MC {}) ...",
-        real_host, real_port, MINECRAFT_VERSION
+        real_host, real_port, shared.proto.name
     ));
 
     let (mut reader, writer) =
@@ -466,7 +408,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     };
 
     let mut intention = Writer::packet(handshake::SB_INTENTION);
-    intention.var_int(PROTOCOL_VERSION);
+    intention.var_int(shared.proto.version);
     intention.string(&real_host);
     intention.u16(real_port);
     intention.var_int(handshake::INTENT_LOGIN);
@@ -480,7 +422,6 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     let mut session = Session {
         state: State::Login,
         joined: false,
-        position: None,
         dead: false,
         last_signature: None,
     };
@@ -520,7 +461,6 @@ struct Session {
     /// Erstes Login-Paket dieser TCP-Verbindung = echter Beitritt zum Proxy. Jedes weitere ist
     /// nur ein Wechsel zwischen Unterservern und zählt bewusst NICHT als neuer Beitritt.
     joined: bool,
-    position: Option<(f64, f64, f64, f32, f32)>,
     dead: bool,
     /// Signatur der letzten gezählten Nachricht. Der Server zählt zwei gleiche Signaturen
     /// direkt hintereinander nur einmal – der Vanilla-Client macht es genauso.
@@ -582,7 +522,7 @@ fn handle_login(
         login::CB_FINISHED => {
             shared.send(Writer::packet(login::SB_ACKNOWLEDGED));
             session.state = State::Configuration;
-            shared.send(client_information(cfg::SB_CLIENT_INFORMATION));
+            shared.send(client_information(shared, cfg::SB_CLIENT_INFORMATION));
         }
         login::CB_DISCONNECT => {
             // In der Login-Phase kommt der Grund noch als JSON-Text, nicht als NBT.
@@ -606,6 +546,9 @@ fn handle_login(
 }
 
 // ===================== Konfigurations-Phase =====================
+//
+// Die IDs dieser Phase sind in allen unterstützten Versionen gleich; nur den Verhaltenskodex
+// gibt es erst ab 1.21.11 (in 1.21.1 hat die Phase so viele Pakete gar nicht).
 
 fn handle_config(
     shared: &Arc<Shared>,
@@ -637,8 +580,8 @@ fn handle_config(
             w.var_int(0);
             shared.send(w);
         }
-        cfg::CB_CODE_OF_CONDUCT => {
-            // Neu in 26.1: ohne Bestätigung lässt der Server niemanden ins Spiel.
+        cfg::CB_CODE_OF_CONDUCT if shared.proto.modern => {
+            // Ab 1.21.11: ohne Bestätigung lässt der Server niemanden ins Spiel.
             shared.send(Writer::packet(cfg::SB_ACCEPT_CODE_OF_CONDUCT));
         }
         cfg::CB_RESOURCE_PACK_PUSH => {
@@ -665,34 +608,35 @@ fn handle_game(
     id: i32,
     r: &mut Reader,
 ) -> Result<bool, String> {
-    match id {
+    let game = &shared.proto.game;
+    match game.incoming(id) {
         // KeepAlive zuerst und sofort beantworten – das ist der eigentliche Schutz gegen
         // disconnect.timeout. Alles andere (Anzeige o. Ä.) kommt danach.
-        game::CB_KEEP_ALIVE => {
+        In::KeepAlive => {
             let ping = r.i64().map_err(|e| e.to_string())?;
-            let mut w = Writer::packet(game::SB_KEEP_ALIVE);
+            let mut w = Writer::packet(game.sb_keep_alive);
             w.i64(ping);
             shared.send(w);
         }
-        game::CB_PING => {
+        In::Ping => {
             let ping = r.i32().map_err(|e| e.to_string())?;
-            let mut w = Writer::packet(game::SB_PONG);
+            let mut w = Writer::packet(game.sb_pong);
             w.i32(ping);
             shared.send(w);
         }
-        game::CB_LOGIN => {
+        In::Login => {
             let first_join = !session.joined;
             session.joined = true;
             on_join(shared, session, first_join);
         }
-        game::CB_SYSTEM_CHAT => {
+        In::SystemChat => {
             let component = nbt::read_network(r).map_err(|e| e.to_string())?;
             let line = nbt::render(&component, shared.console.is_color());
             if !line.trim().is_empty() {
                 shared.display(&line);
             }
         }
-        game::CB_PLAYER_CHAT => {
+        In::PlayerChat => {
             let chat = parse_player_chat(shared, r);
             // Nur SIGNIERTE Nachrichten führt der Server in seiner Quittungsliste. Zählte man
             // unsignierte mit (Plugin-/Proxy-Chat!), wäre unser Offset größer als das, was der
@@ -708,37 +652,37 @@ fn handle_game(
             }
             maybe_acknowledge(shared);
         }
-        game::CB_PLAYER_POSITION => handle_position(shared, session, r)?,
-        game::CB_SET_HEALTH => {
+        In::Position => handle_position(shared, r)?,
+        In::SetHealth => {
             let health = r.f32().map_err(|e| e.to_string())?;
             if health <= 0.0 && !session.dead {
                 session.dead = true;
                 shared.console.error("Gestorben – respawne automatisch.");
-                let mut w = Writer::packet(game::SB_CLIENT_COMMAND);
-                w.var_int(game::CLIENT_COMMAND_RESPAWN);
+                let mut w = Writer::packet(game.sb_client_command);
+                w.var_int(CLIENT_COMMAND_RESPAWN);
                 shared.send(w);
             } else if health > 0.0 {
                 session.dead = false;
             }
         }
-        game::CB_RESOURCE_PACK_PUSH => {
+        In::ResourcePackPush => {
             let pack = r.uuid().map_err(|e| e.to_string())?;
-            acknowledge_resource_pack(shared, game::SB_RESOURCE_PACK, &pack);
+            acknowledge_resource_pack(shared, game.sb_resource_pack, &pack);
         }
-        game::CB_START_CONFIGURATION => {
+        In::StartConfiguration => {
             // Der Server holt uns zurück in die Konfigurationsphase (z. B. Ressourcen-Neuladen).
             shared.in_game.store(false, Ordering::SeqCst);
-            shared.send(Writer::packet(game::SB_CONFIGURATION_ACKNOWLEDGED));
+            shared.send(Writer::packet(game.sb_configuration_acknowledged));
             session.state = State::Configuration;
         }
-        game::CB_STORE_COOKIE => store_cookie(shared, r)?,
-        game::CB_COOKIE_REQUEST => {
+        In::StoreCookie => store_cookie(shared, r)?,
+        In::CookieRequest => {
             let key = r.string().map_err(|e| e.to_string())?;
-            shared.send(cookie_response(shared, game::SB_COOKIE_RESPONSE, &key));
+            shared.send(cookie_response(shared, game.sb_cookie_response, &key));
         }
-        game::CB_TRANSFER => return transfer(shared, r),
-        game::CB_DISCONNECT => return Err(disconnect_reason(shared, r)),
-        _ => {}
+        In::Transfer => return transfer(shared, r),
+        In::Disconnect => return Err(disconnect_reason(shared, r)),
+        In::Ignored => {}
     }
     Ok(false)
 }
@@ -750,12 +694,13 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     // Der Server beginnt mit einer frischen Quittungsliste – unser Zähler muss mit.
     shared.unacked.store(0, Ordering::Relaxed);
     shared.queue.clear();
-    session.position = None;
+    // Die alte Position gilt nicht mehr: der Server setzt uns gleich neu ab (auch bei einem
+    // Unterserver-Wechsel, dort ist es sogar eine andere Welt).
+    *shared.position.lock().unwrap() = None;
     session.dead = false;
     session.last_signature = None;
 
-    shared.send(client_information(game::SB_CLIENT_INFORMATION));
-    shared.update_status(Link::Online);
+    shared.send(client_information(shared, shared.proto.game.sb_client_information));
 
     if first_join {
         let name = shared.account.lock().unwrap().name.clone();
@@ -768,23 +713,28 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
             .console
             .info("Unterserver gewechselt (zählt nicht als neuer Beitritt).");
     }
+
+    // Heimatposition nach JEDEM Beitritt – anders als bei den Befehlen zählt hier auch der
+    // Unterserver-Wechsel, denn dort landen wir in einer anderen Welt an einer anderen Stelle.
+    #[cfg(feature = "movement")]
+    crate::movement::on_join(shared);
 }
 
-/// Wiederkehrende Befehle nach dem echten Beitritt.
+/// Wiederkehrende Befehle (`--cmd`) nach dem echten Beitritt.
 ///
 /// **Ein** Thread für alle Einträge: er schläft blockierend bis zum nächsten Termin (kein
-/// Polling, 0 % CPU im Leerlauf) und beendet sich, sobald die Verbindung endet oder die Liste
-/// geändert wird. Ohne Befehle wird gar kein Thread gestartet.
+/// Polling, 0 % CPU im Leerlauf) und beendet sich, sobald die Verbindung endet. Ohne `--cmd`
+/// wird gar kein Thread gestartet.
 fn start_commands(shared: &Arc<Shared>) {
-    let list = shared.config.lock().unwrap().active_commands();
-    if list.is_empty() {
+    if shared.options.commands.is_empty() {
         return;
     }
-    let ticket = shared.ticket();
+    let generation = shared.generation.load(Ordering::SeqCst);
     let shared = Arc::clone(shared);
     thread::Builder::new()
-        .name("hugoafk-cmds".into())
+        .name("afk-cmds".into())
         .spawn(move || {
+            let list = &shared.options.commands;
             let start = Instant::now();
             // Nächster Termin je Eintrag, gemessen ab dem Beitritt. `None` = erledigt.
             let mut due: Vec<Option<Duration>> = list
@@ -803,19 +753,19 @@ fn start_commands(shared: &Arc<Shared>) {
                     return;
                 };
 
-                if !shared.wait(at.saturating_sub(start.elapsed()), ticket) {
+                if !shared.wait(at.saturating_sub(start.elapsed()), generation) {
                     return;
                 }
                 // Serverwechsel o. Ä.: kurz warten, statt ins Leere zu senden.
                 if !shared.in_game.load(Ordering::Relaxed) {
-                    if !shared.wait(Duration::from_secs(2), ticket) {
+                    if !shared.wait(Duration::from_secs(2), generation) {
                         return;
                     }
                     continue;
                 }
 
                 let command = &list[index];
-                shared.console.note(&format!("Befehl: {}", command.command));
+                shared.console.info(&format!("Befehl: {}", command.command));
                 shared.queue.push(command.command.clone());
 
                 due[index] = match command.repeat_seconds {
@@ -837,23 +787,33 @@ fn start_commands(shared: &Arc<Shared>) {
         .ok();
 }
 
-fn handle_position(shared: &Arc<Shared>, session: &mut Session, r: &mut Reader) -> Result<(), String> {
-    let id = r.var_int().map_err(|e| e.to_string())?;
-    let (x, y, z) = (
-        r.f64().map_err(|e| e.to_string())?,
-        r.f64().map_err(|e| e.to_string())?,
-        r.f64().map_err(|e| e.to_string())?,
-    );
-    // Delta-Bewegung interessiert uns nicht, muss aber übersprungen werden.
-    for _ in 0..3 {
-        r.f64().map_err(|e| e.to_string())?;
-    }
-    let yaw = r.f32().map_err(|e| e.to_string())?;
-    let pitch = r.f32().map_err(|e| e.to_string())?;
-    let flags = r.i32().map_err(|e| e.to_string())?;
+/// Teleport des Servers übernehmen und bestätigen.
+///
+/// Das Paketformat hat sich mit 1.21.2 geändert: vorher standen die Koordinaten vorn und die
+/// Teleport-Nummer hinten, heute umgekehrt und mit Bewegungsvektor dazwischen. Die Bedeutung der
+/// „relativ"-Bits ist in beiden gleich (0=x, 1=y, 2=z, 3=Gierwinkel, 4=Neigung).
+fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
+    let err = |e: io::Error| e.to_string();
 
-    // Bit je Element: X, Y, Z, Y_ROT, X_ROT (relativ = zum bisherigen Wert addieren).
-    let previous = session.position.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
+    let (id, x, y, z, yaw, pitch, flags) = if shared.proto.modern {
+        let id = r.var_int().map_err(err)?;
+        let (x, y, z) = (r.f64().map_err(err)?, r.f64().map_err(err)?, r.f64().map_err(err)?);
+        // Bewegungsvektor interessiert uns nicht, muss aber übersprungen werden.
+        for _ in 0..3 {
+            r.f64().map_err(err)?;
+        }
+        let yaw = r.f32().map_err(err)?;
+        let pitch = r.f32().map_err(err)?;
+        (id, x, y, z, yaw, pitch, r.i32().map_err(err)?)
+    } else {
+        let (x, y, z) = (r.f64().map_err(err)?, r.f64().map_err(err)?, r.f64().map_err(err)?);
+        let yaw = r.f32().map_err(err)?;
+        let pitch = r.f32().map_err(err)?;
+        let flags = r.u8().map_err(err)? as i32;
+        (r.var_int().map_err(err)?, x, y, z, yaw, pitch, flags)
+    };
+
+    let previous = shared.position().unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
     let relative = |bit: i32, old: f64, value: f64| -> f64 {
         if flags & (1 << bit) != 0 {
             old + value
@@ -868,21 +828,23 @@ fn handle_position(shared: &Arc<Shared>, session: &mut Session, r: &mut Reader) 
         relative(3, previous.3 as f64, yaw as f64) as f32,
         relative(4, previous.4 as f64, pitch as f64) as f32,
     );
-    session.position = Some(new);
+    shared.set_position(new);
 
     // Teleport bestätigen (Pflicht, sonst Rubberband/Kick) und die vorgegebene Position EINMAL
     // zurückspiegeln – das ist die Antwort auf den Teleport, keine Eigenbewegung.
-    let mut accept = Writer::packet(game::SB_ACCEPT_TELEPORTATION);
+    let mut accept = Writer::packet(shared.proto.game.sb_accept_teleportation);
     accept.var_int(id);
     shared.send(accept);
 
-    let mut move_packet = Writer::packet(game::SB_MOVE_PLAYER_POS_ROT);
+    // Das Bewegungspaket ist in allen unterstützten Versionen bytegleich: ab 1.21.4 steht dort
+    // ein Flag-Byte statt des alten `onGround`-Bool – 0x01 bedeutet in beiden „am Boden".
+    let mut move_packet = Writer::packet(shared.proto.game.sb_move_player_pos_rot);
     move_packet.f64(new.0);
     move_packet.f64(new.1);
     move_packet.f64(new.2);
     move_packet.f32(new.3);
     move_packet.f32(new.4);
-    move_packet.u8(0x01); // onGround
+    move_packet.u8(0x01);
     shared.send(move_packet);
     Ok(())
 }
@@ -905,8 +867,12 @@ fn parse_player_chat(shared: &Arc<Shared>, r: &mut Reader) -> PlayerChat {
         signature: None,
         line: None,
     };
-    if r.var_int().is_err() || r.uuid().is_err() || r.var_int().is_err() {
-        return chat; // globalIndex, Absender, index
+    // globalIndex gibt es erst ab 1.21.11; davor beginnt das Paket direkt mit dem Absender.
+    if shared.proto.modern && r.var_int().is_err() {
+        return chat;
+    }
+    if r.uuid().is_err() || r.var_int().is_err() {
+        return chat; // Absender, index
     }
     match r.bool() {
         Ok(true) => match r.bytes(256) {
@@ -970,7 +936,7 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
     if shared.unacked.load(Ordering::Relaxed) >= ACK_THRESHOLD {
         let offset = shared.unacked.swap(0, Ordering::Relaxed);
         if offset > 0 {
-            let mut w = Writer::packet(game::SB_CHAT_ACK);
+            let mut w = Writer::packet(shared.proto.game.sb_chat_ack);
             w.var_int(offset as i32);
             shared.send(w);
         }
@@ -980,7 +946,7 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
 // ===================== gemeinsame Bausteine =====================
 
 /// Spieleinstellungen wie ein echter Client (manche Server erwarten das vor dem Spielbeitritt).
-fn client_information(packet_id: i32) -> Writer {
+fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     let mut w = Writer::packet(packet_id);
     w.string("de_DE");
     w.u8(8); // Sichtweite (Chunks) – wir laden ohnehin nichts
@@ -990,7 +956,9 @@ fn client_information(packet_id: i32) -> Writer {
     w.var_int(1); // Haupthand: rechts
     w.bool(false); // Textfilterung
     w.bool(true); // in der Serverliste sichtbar
-    w.var_int(0); // Partikel: ALL
+    if shared.proto.modern {
+        w.var_int(0); // Partikel: ALL (gibt es erst ab 1.21.11)
+    }
     w
 }
 
@@ -1044,6 +1012,30 @@ fn disconnect_reason(shared: &Arc<Shared>, r: &mut Reader) -> String {
     }
 }
 
+/// `host`, `host:port` oder `[::1]:port` zerlegen. Der dritte Rückgabewert sagt, ob eine
+/// SRV-Auflösung versucht werden darf (nur wenn kein Port angegeben wurde).
+fn parse_host(input: &str) -> (String, u16, bool) {
+    let value = input.trim();
+
+    if let Some(end) = value.strip_prefix('[').and_then(|v| v.find(']')) {
+        let host = value[1..end + 1].to_string();
+        let rest = &value[end + 2..];
+        if let Some(port) = rest.strip_prefix(':') {
+            return (host, port.trim().parse().unwrap_or(DEFAULT_PORT), false);
+        }
+        return (host, DEFAULT_PORT, false);
+    }
+
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => (
+            host.to_string(),
+            port.trim().parse().unwrap_or(DEFAULT_PORT),
+            false,
+        ),
+        _ => (value.to_string(), DEFAULT_PORT, true),
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1081,5 +1073,46 @@ mod tests {
         // Nichts Sendbares übrig: darf keinen Quittungs-Offset verbrauchen.
         assert!(prepare("/").is_none());
         assert!(prepare("   ").is_none());
+    }
+
+    #[test]
+    fn host_und_port_werden_zerlegt() {
+        // Ohne Port darf (und muss) SRV gefragt werden, mit Port nicht.
+        assert_eq!(parse_host("mc.example.net"), ("mc.example.net".into(), 25565, true));
+        assert_eq!(
+            parse_host("mc.example.net:25566"),
+            ("mc.example.net".into(), 25566, false)
+        );
+        assert_eq!(parse_host("[::1]:25566"), ("::1".into(), 25566, false));
+    }
+
+    /// Die Paket-IDs jeder Version müssen sich eindeutig zuordnen lassen – ein Tippfehler in der
+    /// Tabelle (zwei gleiche IDs) würde sonst still das falsche Paket verarbeiten.
+    #[test]
+    fn paket_ids_sind_je_version_eindeutig() {
+        for p in crate::proto::PROTOCOLS {
+            let g = &p.game;
+            let ids = [
+                g.cb_cookie_request,
+                g.cb_disconnect,
+                g.cb_keep_alive,
+                g.cb_login,
+                g.cb_ping,
+                g.cb_player_chat,
+                g.cb_player_position,
+                g.cb_resource_pack_push,
+                g.cb_set_health,
+                g.cb_start_configuration,
+                g.cb_store_cookie,
+                g.cb_system_chat,
+                g.cb_transfer,
+            ];
+            for (i, a) in ids.iter().enumerate() {
+                for b in &ids[i + 1..] {
+                    assert_ne!(a, b, "doppelte Paket-ID in {}", p.name);
+                }
+                assert_ne!(g.incoming(*a), In::Ignored, "unbekannte ID in {}", p.name);
+            }
+        }
     }
 }

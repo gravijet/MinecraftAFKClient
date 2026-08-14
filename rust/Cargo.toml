@@ -1,12 +1,20 @@
 [package]
-name = "hugoafk"
-version = "1.0.0"
+name = "afk"
+version = "2.0.0"
 edition = "2021"
-description = "Schlanker Minecraft-AFK-Client (nur MC 26.1, Protokoll 775) – minimaler RAM-/CPU-Verbrauch"
+description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.21.11, 26.1 und 26.2"
 
 [[bin]]
-name = "hugoafk"
+name = "afk"
 path = "src/main.rs"
+
+# Zwei Bauformen aus derselben Quelle. Ohne Feature entsteht exakt der bisherige schlanke
+# AFK-Client (kein Byte Bewegungscode); mit `--features movement` kommen :go/:look/:home dazu.
+# Die Skripte bauen die Bewegungsvariante in ein eigenes Zielverzeichnis, damit die schlanke
+# afk.exe dabei nicht überschrieben wird (siehe build-all.ps1 / build-all.sh).
+[features]
+default = []
+movement = []
 
 [dependencies]
 # HTTPS nur für Login/Token-Refresh und den Sitzungs-Join (kurze Bursts, danach wieder frei).
@@ -27,26 +35,18 @@ rand = "0.8"
 base64 = "0.22"
 # Nur um beim Anlegen eines NEUEN Kontos ein deviceKeyPair zu erzeugen, das der Java-Client lesen kann.
 p256 = { version = "0.13", features = ["pkcs8"] }
-# Rohmodus-Terminal: Chat kann eintrudeln, während man tippt.
-crossterm = "0.28"
 
 [target.'cfg(windows)'.dependencies]
 # TLS über SChannel (im System vorhanden) – spart den Wurzelzertifikat-Speicher im Binary.
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
-# Für SetConsoleOutputCP(UTF-8) – ohne das zerlegt die Windows-Konsole jeden Umlaut –
-# und GetLocalTime für die Uhrzeit in der Konsole.
-windows-sys = { version = "0.59", features = [
-    "Win32_System_Console",
-    "Win32_System_SystemInformation",
-] }
+# Nur für SetConsoleOutputCP(UTF-8) – ohne das zerlegt die Windows-Konsole jeden Umlaut.
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux/macOS: rustls statt OpenSSL. Beim Bauen wird dadurch KEIN libssl-dev/pkg-config
 # gebraucht, und das Ergebnis ist gegen musl auch vollständig statisch linkbar.
 ureq = { version = "2", default-features = false, features = ["tls"] }
-# Nur für localtime_r (Zeitzone der Konsolen-Uhrzeit); libc steckt ohnehin im Abhängigkeitsbaum.
-libc = "0.2"
 
 # Auf minimalen Fußabdruck getrimmt: kleine Binary, ein Codegen-Unit, kein Unwind-Tabellen-Ballast.
 [profile.release]

@@ -1,141 +1,92 @@
 <#
-    Baut beide Module:
-      java\  – Per-Version-Jars nach java\build\libs\   (Gradle)
-      rust\  – hugoafk.exe nach rust\target\release\    (Cargo, nur MC 26.1)
+    Baut AFKSystems lokal und legt alles fertig benannt in dist\ ab:
 
-    Gradle 8.14.3 läuft NICHT unter Java 25 – dieses Skript sucht daher automatisch ein
-    JDK 21 (oder 17), um Gradle zu starten. Die fertigen Jars laufen davon unabhängig auf Java 25.
+      dist\afk-1.21.1.jar   dist\afk-1.21.11.jar   dist\afk-26.1.jar   dist\afk-26.2.jar
+      dist\afk-windows.exe                     (Rust, alle vier Versionen in einer Datei)
 
-    Aufruf:  .\build-all.ps1 [-JavaHome "C:\Pfad\zum\jdk"] [-Only java|rust|linux|both]
+    Mit -Move zusätzlich die Bewegungs-Bauform (afk-<ver>-move.jar bzw. afk-windows-move.exe).
 
-    -Only linux baut den Rust-Client für Linux. Da dafür ein Linux-Linker nötig ist, läuft der
-    Build in WSL (Cargo dort einmalig einrichten, siehe Hinweis im Fehlerfall).
+    Gradle läuft NICHT unter Java 25 – das Skript sucht daher automatisch ein JDK 21 (oder 17).
+    Die fertigen Jars laufen davon unabhängig auf jedem Java ab 21.
+
+    Aufruf:  .\build-all.ps1 [-Only java|rust|both] [-Move] [-JavaHome "C:\Pfad\zum\jdk"]
 #>
 [CmdletBinding()]
 param(
-    [string]$JavaHome,
-    [ValidateSet('java', 'rust', 'linux', 'both')]
+    [ValidateSet('java', 'rust', 'both')]
     [string]$Only = 'both',
-    # WSL-Distribution für -Only linux (Standard: die voreingestellte).
-    [string]$WslDistro
+    [switch]$Move,
+    [string]$JavaHome
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+# Windows PowerShell wertet JEDE Zeile auf der Fehlerausgabe eines externen Programms als Fehler –
+# cargo und gradle schreiben dort aber ihren normalen Fortschritt hin. Deshalb laufen externe
+# Aufrufe hier durch diesen Helfer, der allein den Rueckgabewert zaehlt.
+function Invoke-Native {
+    param([scriptblock]$Block, [string]$What)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Block } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) { throw "$What fehlgeschlagen." }
+}
+
+$versions = @('1.21.1', '1.21.11', '26.1', '26.2')
+$dist = Join-Path $root 'dist'
+New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
 # ===================== Java =====================
 
 function Get-GradleJdk {
     param([string]$explicit)
     if ($explicit -and (Test-Path $explicit)) { return $explicit }
-    # Kandidaten: bevorzugt 21, sonst 17.
-    $candidates = @()
-    foreach ($base in @("$env:ProgramFiles\Java", "$env:USERPROFILE\.jdks")) {
-        if (Test-Path $base) {
-            $candidates += Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '(^|[-_.])(21|17)([-_.]|$)' -or $_.Name -match 'jdk-?(21|17)' } |
-                Select-Object -ExpandProperty FullName
+    foreach ($wanted in @('21', '17')) {
+        foreach ($base in @("$env:ProgramFiles\Java", "$env:USERPROFILE\.jdks")) {
+            if (-not (Test-Path $base)) { continue }
+            $hit = Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match "-?$wanted(\.|$)" -and (Test-Path (Join-Path $_.FullName 'bin\javac.exe')) } |
+                Select-Object -First 1
+            if ($hit) { return $hit.FullName }
         }
     }
-    foreach ($c in $candidates) { if (Test-Path (Join-Path $c 'bin\java.exe')) { return $c } }
-    return $null
+    throw "Kein JDK 21 gefunden. Mit -JavaHome den Pfad angeben."
 }
 
-function Build-Java {
-    $jdk = Get-GradleJdk $JavaHome
-    if (-not $jdk) {
-        Write-Host "Kein JDK 21/17 für Gradle gefunden. Bitte -JavaHome angeben." -ForegroundColor Red
-        exit 1
+if ($Only -in @('java', 'both')) {
+    $env:JAVA_HOME = Get-GradleJdk $JavaHome
+    Write-Host "Java-Build mit $env:JAVA_HOME" -ForegroundColor Cyan
+    foreach ($v in $versions) {
+        Write-Host "  afk-$v.jar ..." -ForegroundColor Gray
+        Invoke-Native { & "$root\gradlew.bat" :java:shadowJar "-Pmc=$v" --console=plain -q } "Java-Build fuer $v"
+        if ($Move) {
+            Invoke-Native { & "$root\gradlew.bat" :java:shadowJar "-Pmc=$v" '-Pmove=true' --console=plain -q } "Bewegungs-Build fuer $v"
+        }
     }
-    $env:JAVA_HOME = $jdk
-    Write-Host "Gradle läuft mit JDK: $jdk" -ForegroundColor Cyan
-
-    # Zu bauende Varianten. 1.8.9 nur, wenn die Via-Bridge vorhanden ist.
-    $variants = @('26.1', '1.21.11')
-    if (Test-Path (Join-Path $root 'java\src\via\java\net\gravijet\afk\via\ViaProtocolBridge.java')) {
-        $variants += '1.8.9'
-    } else {
-        Write-Host "Hinweis: 1.8.9 wird übersprungen (Via-Bridge java\src\via\... fehlt noch)." -ForegroundColor Yellow
-    }
-
-    foreach ($v in $variants) {
-        Write-Host "`n=== Java-Modul: Variante $v ===" -ForegroundColor Green
-        & .\gradlew.bat :java:shadowJar "-Pvariant=$v"
-        if ($LASTEXITCODE -ne 0) { Write-Host "Build für $v fehlgeschlagen." -ForegroundColor Red; exit 1 }
-    }
+    Copy-Item "$root\java\build\libs\afk-*.jar" $dist -Force
 }
 
 # ===================== Rust =====================
 
-function Build-Rust {
-    Write-Host "`n=== Rust-Modul (MC 26.1) ===" -ForegroundColor Green
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        Write-Host "cargo nicht gefunden. Rust installieren:  winget install Rustlang.Rustup" -ForegroundColor Red
-        exit 1
-    }
-    # Die GNU-Toolchain braucht dlltool aus MinGW (WinLibs). Falls nicht im PATH: nachreichen.
-    if (-not (Get-Command dlltool.exe -ErrorAction SilentlyContinue)) {
-        $mingw = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Recurse -Filter dlltool.exe -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($mingw) { $env:Path = "$($mingw.DirectoryName);$env:Path" }
-    }
-    Push-Location (Join-Path $root 'rust')
+if ($Only -in @('rust', 'both')) {
+    Write-Host "Rust-Build ..." -ForegroundColor Cyan
+    Push-Location "$root\rust"
     try {
-        & cargo build --release
-        if ($LASTEXITCODE -ne 0) { Write-Host "Rust-Build fehlgeschlagen." -ForegroundColor Red; exit 1 }
+        Invoke-Native { & cargo build --release } "Rust-Build"
+        Copy-Item 'target\release\afk.exe' (Join-Path $dist 'afk-windows.exe') -Force
+
+        if ($Move) {
+            # Eigenes Zielverzeichnis, sonst ueberschreibt die Bewegungsvariante die schlanke Datei.
+            Invoke-Native { & cargo build --release --features movement --target-dir target\movement } "Rust-Bewegungs-Build"
+            Copy-Item 'target\movement\release\afk.exe' (Join-Path $dist 'afk-windows-move.exe') -Force
+        }
     } finally {
         Pop-Location
     }
 }
 
-# ===================== Rust für Linux (über WSL) =====================
-
-# Ein Linux-Binary braucht einen Linux-Linker. Statt eine Cross-Toolchain einzurichten, wird
-# derselbe Quellbaum in WSL gebaut – das Ergebnis liegt danach unter
-# rust\target\x86_64-unknown-linux-gnu\release\hugoafk (bzw. ...-musl\... beim statischen Build).
-function Build-Linux {
-    Write-Host "`n=== Rust-Modul für Linux (via WSL) ===" -ForegroundColor Green
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-        Write-Host "WSL nicht gefunden. Entweder WSL einrichten (wsl --install) oder den Build" -ForegroundColor Red
-        Write-Host "direkt auf einem Linux-Rechner mit  ./build-all.sh rust  ausfuehren." -ForegroundColor Red
-        exit 1
-    }
-    # In WSL liegt das Projekt unter /mnt/<laufwerk>/...
-    $drive = $root.Substring(0, 1).ToLower()
-    $wslPath = '/mnt/' + $drive + $root.Substring(2).Replace('\', '/')
-
-    # Einzeiler: mehrzeilige Argumente kommen bei wsl.exe nicht zuverlaessig an.
-    # Fehlt Cargo, meldet sich build-all.sh selbst mit der passenden Anleitung.
-    $script = ". `$HOME/.cargo/env 2>/dev/null; cd '$wslPath' && ./build-all.sh rust-linux"
-
-    # WSL schreibt Konfigurationswarnungen nach stderr; die duerfen den Build nicht abbrechen.
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        if ($WslDistro) { & wsl.exe -d $WslDistro -e bash -lc $script }
-        else { & wsl.exe -e bash -lc $script }
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Linux-Build fehlgeschlagen." -ForegroundColor Red
-        Write-Host "Andere Distribution nutzen:  .\build-all.ps1 -Only linux -WslDistro <Name>" -ForegroundColor Yellow
-        exit 1
-    }
-}
-
-if ($Only -in @('java', 'both')) { Build-Java }
-if ($Only -in @('rust', 'both')) { Build-Rust }
-if ($Only -eq 'linux') { Build-Linux }
-
-Write-Host "`n=== Ergebnisse ===" -ForegroundColor Cyan
-Get-ChildItem (Join-Path $root 'java\build\libs\hugoafk-*.jar') -ErrorAction SilentlyContinue |
-    ForEach-Object { "{0,7:N1} MB   java   {1}" -f ($_.Length / 1MB), $_.Name }
-foreach ($bin in @('rust\target\release\hugoafk.exe',
-                   'rust\target\release\hugoafk',
-                   'rust\target\x86_64-unknown-linux-gnu\release\hugoafk',
-                   'rust\target\x86_64-unknown-linux-musl\release\hugoafk')) {
-    Get-Item (Join-Path $root $bin) -ErrorAction SilentlyContinue |
-        ForEach-Object { "{0,7:N1} MB   rust   {1}" -f ($_.Length / 1MB), $bin }
-}
+Write-Host ""
+Write-Host "Fertig in $dist" -ForegroundColor Green
+Get-ChildItem $dist | Select-Object Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 2) } } | Format-Table
