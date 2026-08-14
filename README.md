@@ -17,8 +17,8 @@ löst das sauberer, weil er das Protokoll selbst spricht.
 
 ## Download
 
-Der Workflow baut bei jedem Push alles und ersetzt damit das Release **`latest`** – dort liegen
-immer alle aktuellen Dateien:
+Der Workflow baut bei jedem Push auf `main` alles und ersetzt damit das Release **`latest`** – dort
+liegen immer alle aktuellen Dateien:
 
 <https://github.com/gravijet/HugoAFKClient/releases/tag/latest>
 
@@ -168,5 +168,5 @@ Wechsel zwischen Unterservern bewusst nicht.
 ```
 rust/     Rust-Client (Cargo)      – proto.rs = Paket-IDs, client.rs = Ablauf, options.rs = Argumente
 java/     Java-Client (Gradle)     – src/main = Ablauf, src/api-* = Versionsunterschiede, src/move = Bewegung
-.github/  Workflow: baut bei jedem Push alles und ersetzt das Release "latest"
+.github/  Workflow: baut bei jedem Push auf main alles und ersetzt das Release "latest"
 ```
