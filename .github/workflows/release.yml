@@ -1,9 +1,11 @@
 name: Build und latest-Release
 
-# Bei JEDEM Push: alles bauen und das Release "latest" durch den frischen Stand ersetzen.
-# Soll nur der Hauptzweig veröffentlichen, hier   branches: [main]   eintragen.
+# Bei jedem Push auf main: alles bauen und das Release "latest" durch den frischen Stand ersetzen.
+# Bewusst nur main - sonst würde ein Push auf irgendeinen Nebenzweig "latest" überschreiben.
+# Für einen Testlauf aus einem Zweig heraus: Actions -> diesen Workflow -> "Run workflow".
 on:
   push:
+    branches: [main]
   workflow_dispatch:
 
 # Ein neuer Push macht einen noch laufenden Build überflüssig.
