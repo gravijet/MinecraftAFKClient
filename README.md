@@ -4,18 +4,20 @@ Schlanker Minecraft-AFK-Client. Er meldet sich mit einem Microsoft-Konto an, tri
 bei, bleibt verbunden und zeigt den Chat. Kein Menü, keine Konfigurationsdatei: **alles steht im
 Startbefehl.**
 
-Es gibt ihn dreimal aus einem Repo:
+Es gibt den Rust-Client in getrennten Bauformen und den bisherigen Java-Client:
 
 | | Datei | Minecraft-Versionen | Verbrauch |
 | --- | --- | --- | --- |
 | **Rust** (empfohlen) | `afk-windows.exe`, `afk-linux` | alle vier in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 2 Threads |
-| **Rust Premium** | `premium-afk-windows.exe`, `premium-afk-linux` | dieselbe eine Datei | ~1,1 MB Datei, ein paar MB mehr RAM |
+| **Rust mit Zusätzen** | `items-afk-*`, `premium-afk-*`, `premium-items-afk-*`, `pov-afk-*`, `ultra-afk-*` | dieselbe eine Datei je Bauform | nur die jeweils genannten Funktionen sind einkompiliert |
 | **Java** | `afk-1.21.1.jar` … `afk-26.2.jar` | eine Jar je Version | ~10 MB Jar, 40–70 MB RAM |
 
-Der **Premium-Client** kann alles, was der schlanke kann, plus Bewegung, Anzeigetafel, Tab-Liste,
-Menü-Klicks und automatisches Anti-AFK. Wer nur AFK stehen will, nimmt den schlanken – er ist
-kleiner und hält im Leerlauf gar keinen Zustand. Die vollständige Gegenüberstellung steht in
-**[FEATURES.md](FEATURES.md)**, dort auch, was bewusst *nicht* umgesetzt ist und warum.
+Der **Premium-Client** kann alles, was der schlanke kann, plus Bewegung, farbiges Scoreboard,
+Menü-Klicks und automatisches Anti-AFK. Eigene zusätzliche Dateien liefern sichtbare Gegenstände,
+eine echte paketbasierte Live-POV oder alles zusammen als Ultra. Wer nur AFK stehen will, nimmt den
+schlanken Client – er ist kleiner und hält im Leerlauf keinen Welt-/Menüzustand. Die exakte
+Dateiauswahl steht in **[RELEASE.md](RELEASE.md)**, der Funktionsvergleich in
+**[FEATURES.md](FEATURES.md)**.
 
 Warum beim Java-Client eine Jar pro Version: MCProtocolLib spricht pro Build genau ein Protokoll.
 Alle vier in eine Jar zu packen hieße vierfache Größe und Classloader-Trickserei – der Rust-Client
@@ -63,9 +65,6 @@ dass er sie ignoriert – so kann das Panel allen Bauformen dieselbe Befehlszeil
 | `--join-delay <sek>` | Wartezeit nach dem Beitritt vor dem ersten Befehl (Standard 4) |
 | `--on <auslöser>=<aktion>` | **R** Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
 | `--on-cooldown <sek>` | **R** Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
-| `--no-reconnect` | nach einem Abbruch nicht neu verbinden, sondern beenden |
-| `--reconnect-delay <sek>` | erste Wartezeit vor dem Reconnect (Standard 5, danach exponentiell) |
-| `--max-backoff <sek>` | Obergrenze der Reconnect-Wartezeit (Standard 60) |
 | `--chat-delay <ms>` | Mindestabstand ausgehender Nachrichten (Standard 1000, gegen Spam-Kick) |
 | `--no-color` | keine ANSI-Farben |
 | `-q`, `--quiet` | keine Statusmeldungen – wirklich nur Chat |
@@ -111,8 +110,13 @@ sie kommen **auch mit `-q`** durch, sind nie eingefärbt und lassen sich stumpf 
 | `@event world` | Weltwechsel (Respawn in einer anderen Welt) |
 | `@event death` | gestorben |
 | `@event disconnect <grund>` | Verbindung beendet (Grund kann leer sein) |
-| `@event reconnect versuch=N in=Ns` | vor dem nächsten Versuch |
-| `@event menu open id=N` / `@event menu close` | nur Premium: Menü auf/zu |
+| `@event menu open id=N` / `@event menu close` | Menü auf/zu (Items/Premium/Ultra) |
+| `@event board …` | Scoreboard-Titel/-Zeilen samt formatiertem Zahlenfeld und `§`-Farbcodes (Premium/Ultra) |
+| `@event slot …` / `@event lore …` | Gegenstände und Lore mit `§`-Farbcodes (Items-Bauformen) |
+
+Nach einem Kick oder Verbindungsabbruch beendet sich der Rust-Client mit Fehlerstatus und verbindet
+sich nicht automatisch neu. Nur einem ausdrücklichen Server-Transfer auf einen Unterserver folgt er
+weiterhin als Teil derselben Sitzung.
 
 ## Konten
 
@@ -136,8 +140,9 @@ immer nur das aktive Konto.
 Der Rust-Client spricht alle vier selbst. Seine Paket-IDs sind nicht geraten, sondern aus der
 Registrierungsreihenfolge im `MinecraftCodec` der jeweiligen MCProtocolLib-Fassung abgelesen
 (siehe Kopf von `rust/src/proto.rs`) – **bei einem Minecraft-Update dort neu ablesen, nicht raten.**
-Zwischen 1.21.1 und den neueren Versionen unterscheiden sich außerdem vier Paketformate; sie hängen
-im Code an einem einzigen Schalter (`Protocol::modern`).
+Zwischen 1.21.1 und den neueren Versionen unterscheiden sich außerdem mehrere Paketformate. Die
+gemeinsamen Unterschiede hängen an `Protocol::modern`; weitere klar getrennte Weichen beschreiben
+beispielsweise Team-Pakete, Chunk-Abschnitte und Gegenstandskomponenten.
 
 Beim Java-Client steckt derselbe Unterschied in `Net` – einmal in `java/src/api-legacy/java`
 (1.21.1) und einmal in `java/src/api-modern/java`. Der übrige Code kennt ihn nicht.
@@ -145,13 +150,13 @@ Beim Java-Client steckt derselbe Unterschied in `Net` – einmal in `java/src/ap
 ## Selbst bauen
 
 ```powershell
-.\build-all.ps1                          # alle vier Jars + afk-windows.exe nach dist\
-.\build-all.ps1 -Only rust -Move -Premium # dazu afk-windows-move.exe und premium-afk-windows.exe
+.\build-all.ps1                          # alle vier Jars + alle sieben Rust-Dateien nach dist\
+.\build-all.ps1 -Only rust               # nur alle sieben Rust-Dateien
 ```
 
 ```bash
-./build-all.sh                           # alle vier Jars + afk-linux nach dist/
-./build-all.sh --only rust --move --premium
+./build-all.sh                           # alle vier Jars + alle sieben Rust-Dateien nach dist/
+./build-all.sh --only rust               # nur alle sieben Rust-Dateien
 ```
 
 Einzeln:
@@ -193,19 +198,37 @@ Bewegungs-Bauform, dazu:
 | Befehl | Was |
 | --- | --- |
 | `:board` | Anzeigetafel / Seitenleiste so, wie sie im Spiel rechts stünde |
-| `:tab` | Spielerliste (Tab-Liste) |
 | `:menu`, `:click <feld> [rechts\|shift]`, `:close` | geöffnete Menüs/Kisten bedienen |
 | `:sneak [on\|off]`, `:sprint [on\|off]` | Schleichen / Sprinten |
 | `:swing`, `:use`, `:hand <1-9>` | Arm schwingen, Rechtsklick, Schnellleiste |
 | `:antiafk [on\|off\|<sek>]` | automatische kleine Bewegung gegen AFK-Plugins |
 
 `:help` listet im laufenden Client alle örtlichen Befehle auf. Warum das eine eigene Datei ist:
-Anzeigetafel, Tab-Liste und Menüs müssen Zustand mitführen und Anti-AFK braucht einen Zeitgeber –
-genau das, was der schlanke Client bewusst nicht tut. Ohne `--features premium` ist davon kein Byte
-einkompiliert.
+Anzeigetafel und Menüs müssen Zustand mitführen und Anti-AFK braucht einen Zeitgeber – genau das,
+was der schlanke Client bewusst nicht tut. Ohne `--features premium` ist davon kein Byte
+einkompiliert. Tablist und Playerlist gibt es in keiner Rust-Bauform.
 
 ```bash
 cd rust && cargo build --release --features premium --target-dir target/premium
+```
+
+Für sichtbare Namen/Farben/Lore im Menü und im eigenen Inventar gibt es zwei weitere Dateien:
+
+```bash
+cd rust && cargo build --release --features items --target-dir target/items
+cd rust && cargo build --release --features premium,items --target-dir target/premium-items
+```
+
+Standarditems erhalten dabei ihren versionsgenauen `minecraft:...`-Ressourcennamen aus den
+offiziellen Mojang-Registry-Reports; benutzerdefinierte Namen und Lore behalten ihre `§`-Farbcodes.
+
+Die eigene POV-Datei startet nach dem Beitritt automatisch eine Live-First-Person-Ansicht aus den
+empfangenen Chunk-, Block- und Entity-Paketen. Ultra enthält alle Rust-Funktionen; dort wird die
+Ansicht bewusst erst mit `:pov live` gestartet.
+
+```bash
+cd rust && cargo build --release --features pov-client --target-dir target/pov
+cd rust && cargo build --release --features ultra --target-dir target/ultra
 ```
 
 Der vollständige Funktionsvergleich steht in **[FEATURES.md](FEATURES.md)**.
@@ -230,9 +253,10 @@ Wechsel zwischen Unterservern bewusst nicht.
 ```
 rust/     Rust-Client (Cargo)      – proto.rs = Paket-IDs, client.rs = Ablauf, options.rs = Argumente
           rules.rs/proxy.rs        – Makros und Proxy (auch im schlanken Build)
-          premium.rs board.rs      – nur mit --features premium: Anzeigetafel, Tab-Liste,
-          menu.rs antiafk.rs         Menüs, Anti-AFK
+          extras.rs               – gemeinsame, feature-gesteuerte Zusatz-Verteilerstelle
+          board.rs/menu.rs/items.rs/antiafk.rs/pov.rs – getrennte Rust-Zusatzfunktionen
 java/     Java-Client (Gradle)     – src/main = Ablauf, src/api-* = Versionsunterschiede, src/move = Bewegung
+RELEASE.md    genaue Erklärung jeder Release-Datei
 FEATURES.md   was welcher Client kann – und was bewusst fehlt
 .github/  Workflow: baut bei jedem Push auf main alles und ersetzt das Release "latest"
 ```

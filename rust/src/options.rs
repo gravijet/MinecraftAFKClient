@@ -76,10 +76,6 @@ pub struct Options {
     /// Was im Handshake als Zieladresse steht, falls es nicht der echte Server sein soll.
     pub fakehost: Option<(String, u16)>,
 
-    pub auto_reconnect: bool,
-    pub reconnect_delay_seconds: u64,
-    pub max_backoff_seconds: u64,
-
     /// Makros: Auslöser -> Aktion.
     pub rules: Vec<Spec>,
     /// Sperrzeit je Regel, damit eine Regel sich nicht selbst nachtriggert.
@@ -108,9 +104,6 @@ impl Default for Options {
             commands: Vec::new(),
             proxy: None,
             fakehost: None,
-            auto_reconnect: true,
-            reconnect_delay_seconds: 5,
-            max_backoff_seconds: 60,
             rules: Vec::new(),
             rule_cooldown_seconds: 3,
             color: true,
@@ -176,23 +169,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
                 o.protocol = Protocol::find(&name).ok_or_else(|| {
-                    format!("Unbekannte Version '{}'. Möglich: {}", name, Protocol::names())
+                    format!(
+                        "Unbekannte Version '{}'. Möglich: {}",
+                        name,
+                        Protocol::names()
+                    )
                 })?;
             }
             "-c" | "--cmd" => o.commands.push(parse_command(&value("--cmd")?)?),
             "--join-delay" => join_delay = number(&value("--join-delay")?, "--join-delay")?,
-            "--reconnect-delay" => {
-                o.reconnect_delay_seconds =
-                    number(&value("--reconnect-delay")?, "--reconnect-delay")?.max(1)
-            }
-            "--max-backoff" => {
-                o.max_backoff_seconds = number(&value("--max-backoff")?, "--max-backoff")?.max(1)
-            }
             "--chat-delay" => {
                 o.chat_min_delay_ms =
                     number(&value("--chat-delay")?, "--chat-delay")?.max(MIN_CHAT_DELAY_MS)
             }
-            "--no-reconnect" => o.auto_reconnect = false,
             "--no-color" => o.color = false,
             "-q" | "--quiet" => o.quiet = true,
 
@@ -233,7 +222,9 @@ fn parse_fakehost(input: &str) -> Result<(String, u16), String> {
         None => (text, 0),
     };
     if host.trim().is_empty() {
-        return Err("--fakehost braucht einen Namen, z. B. --fakehost play.example.net".to_string());
+        return Err(
+            "--fakehost braucht einen Namen, z. B. --fakehost play.example.net".to_string(),
+        );
     }
     Ok((host.trim().to_string(), port))
 }
@@ -370,12 +361,18 @@ mod tests {
     /// Zu schnelle Wiederholung fängt nur den Spam-Schutz des Servers ein.
     #[test]
     fn wiederholung_hat_eine_untergrenze() {
-        assert_eq!(options(&["x", "-c", "1:/afk"]).commands[0].repeat_seconds, 5);
+        assert_eq!(
+            options(&["x", "-c", "1:/afk"]).commands[0].repeat_seconds,
+            5
+        );
     }
 
     #[test]
     fn offline_und_konto_zugleich_geht_nicht() {
-        assert_eq!(options(&["x", "--offline", "Hugo"]).offline.unwrap(), "Hugo");
+        assert_eq!(
+            options(&["x", "--offline", "Hugo"]).offline.unwrap(),
+            "Hugo"
+        );
         assert!(parse_args(&["x", "--offline", "Hugo", "-a", "user@example.invalid"]).is_err());
     }
 

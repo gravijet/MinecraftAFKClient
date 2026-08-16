@@ -19,8 +19,8 @@ use crate::buf::{Reader, Writer};
 use crate::conn::{self, PacketReader, PacketWriter};
 use crate::console::Console;
 use crate::options::Options;
-use crate::proto::{config as cfg, handshake, login, pack_status, In, Protocol, State};
 use crate::proto::CLIENT_COMMAND_RESPAWN;
+use crate::proto::{config as cfg, handshake, login, pack_status, In, Protocol, State};
 use crate::rules::{Event, Rules};
 use crate::{dns, nbt};
 
@@ -43,7 +43,7 @@ const MAX_MESSAGE_CHARS: usize = 256;
 const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
 
-/// Warteschlange ausgehender Nachrichten – mit `clear()`, damit nach einem Reconnect keine
+/// Warteschlange ausgehender Nachrichten – mit `clear()`, damit bei einem Server-Transfer keine
 /// veralteten Zeilen nachträglich im Chat landen.
 struct Queue {
     items: Mutex<VecDeque<String>>,
@@ -79,12 +79,12 @@ pub struct Shared {
     #[cfg(feature = "movement")]
     pub(crate) mover: crate::movement::Mover,
 
-    /// Anzeigetafel, Tab-Liste, Menüs, Anti-AFK – nur im Premium-Build.
-    #[cfg(feature = "premium")]
-    pub(crate) premium: crate::premium::Premium,
+    /// Optionale Zustände (Anzeigetafel, Menüs, Gegenstände, POV, Tastenzustand, Anti-AFK).
+    #[cfg(feature = "extras")]
+    pub(crate) extras: crate::extras::Extras,
 
     /// Eigene Entitäts-Nummer aus dem Login-Paket. Das Schleich-Paket von 1.21.1 braucht sie.
-    #[cfg(feature = "premium")]
+    #[cfg(feature = "state")]
     pub(crate) entity_id: std::sync::atomic::AtomicI32,
 
     pub(crate) in_game: AtomicBool,
@@ -106,7 +106,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// Startet Netz- und Sender-Thread. Verbunden wird sofort und danach bei jedem Abbruch neu.
+    /// Startet Netz- und Sender-Thread. Verbunden wird genau einmal; nur ein vom Server
+    /// angeordneter Transfer darf das Ziel wechseln und eine neue Verbindung öffnen.
     pub fn new(console: Console, options: Options, account: Account) -> Client {
         let (host, port, srv) = parse_host(&options.server);
         let proto = options.protocol;
@@ -127,9 +128,9 @@ impl Client {
             position: Mutex::new(None),
             #[cfg(feature = "movement")]
             mover: crate::movement::Mover::new(),
-            #[cfg(feature = "premium")]
-            premium: crate::premium::Premium::new(&options),
-            #[cfg(feature = "premium")]
+            #[cfg(feature = "extras")]
+            extras: crate::extras::Extras::new(&options),
+            #[cfg(feature = "state")]
             entity_id: std::sync::atomic::AtomicI32::new(0),
             options,
             in_game: AtomicBool::new(false),
@@ -168,15 +169,67 @@ impl Client {
         self.shared.queue.push(input.to_string());
     }
 
-    /// Örtlicher Befehl aus der Eingabeschleife (alles mit `:` vorn). Im Premium-Build bekommen
-    /// dessen Befehle zuerst die Gelegenheit; alles Übrige geht an die Bewegung.
-    #[cfg(feature = "movement")]
+    /// Örtlicher Befehl aus der Eingabeschleife (alles mit `:` vorn). Zusatzbefehle bekommen
+    /// zuerst die Gelegenheit; alles Übrige geht an die Bewegung.
+    #[cfg(feature = "local")]
     pub fn local_command(&self, verb: &str, arg: &str) {
-        #[cfg(feature = "premium")]
-        if crate::premium::command(&self.shared, verb, arg) {
+        if matches!(verb, "help" | "hilfe" | "?") {
+            return self.local_help();
+        }
+        if matches!(verb, "pos" | "position") {
+            return match self.shared.position() {
+                Some((x, y, z, yaw, pitch)) => self.shared.console.info(&format!(
+                    "x={:.2}  y={:.2}  z={:.2}  ·  Blick {:.1}° / {:.1}°",
+                    x, y, z, yaw, pitch
+                )),
+                None => self
+                    .shared
+                    .console
+                    .error("Position noch unbekannt (nicht im Spiel?)."),
+            };
+        }
+        #[cfg(feature = "extras")]
+        if crate::extras::command(&self.shared, verb, arg) {
             return;
         }
+        #[cfg(feature = "movement")]
         crate::movement::command(&self.shared, verb, arg);
+        #[cfg(not(feature = "movement"))]
+        self.shared
+            .console
+            .error("Unbekannter örtlicher Befehl. :help zeigt die verfügbaren Befehle.");
+    }
+
+    /// `:help` liegt absichtlich hier statt im Bewegungsmodul: auch Items- und POV-Dateien haben
+    /// örtliche Befehle, obwohl dort kein Byte Bewegungslogik einkompiliert ist.
+    #[cfg(feature = "local")]
+    fn local_help(&self) {
+        let console = &self.shared.console;
+        console.print("");
+        console.print(&console.paint(
+            crate::console::BOLD,
+            "  Befehle (alles mit ':' vorn, alles andere geht in den Chat)",
+        ));
+        #[cfg(feature = "movement")]
+        for line in [
+            ":go vor|zurück|links|rechts [blöcke]   laufen (Richtung relativ zum Blick)",
+            ":look <gier> [neigung] · nord|ost|…    Kopf drehen",
+            ":jump [richtung]  ·  :fall             springen · fallen lassen",
+            ":home set|on|off|go|delay|speed        Heimatposition",
+            ":route rec|stop|add|del|go|clear       Wegpunkte zur Heimatposition",
+            ":stop                                  Bewegung abbrechen",
+        ] {
+            console.print(&format!("    {}", line));
+        }
+        #[cfg(feature = "extras")]
+        for line in crate::extras::help_lines() {
+            console.print(&format!("    {}", line));
+        }
+        console.print("    :pos                                   Position anzeigen");
+        console.print(&console.paint(
+            crate::console::GRAY,
+            "    /befehl geht als Serverbefehl raus, alles andere als Chat.",
+        ));
     }
 }
 
@@ -224,7 +277,8 @@ impl Shared {
     /// für sie derselbe Mindestabstand und dieselben Längengrenzen wie für Eingaben.
     fn run_rules(&self, event: &Event) {
         for action in self.rules.fire(event) {
-            self.console.info(&format!("Regel ({}): {}", event.name(), action));
+            self.console
+                .info(&format!("Regel ({}): {}", event.name(), action));
             self.queue.push(action);
         }
     }
@@ -371,8 +425,6 @@ fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
 // ===================== Netz-Thread =====================
 
 fn net_loop(shared: Arc<Shared>) {
-    let mut attempts: u32 = 0;
-
     while shared.running.load(Ordering::Relaxed) {
         let result = run_connection(&shared);
 
@@ -385,8 +437,8 @@ fn net_loop(shared: Arc<Shared>) {
         shared.rules.reset();
         #[cfg(feature = "movement")]
         crate::movement::on_disconnect(&shared);
-        #[cfg(feature = "premium")]
-        crate::premium::on_disconnect(&shared);
+        #[cfg(feature = "extras")]
+        crate::extras::on_disconnect(&shared);
 
         match &result {
             Err(e) => {
@@ -397,36 +449,21 @@ fn net_loop(shared: Arc<Shared>) {
         }
 
         if shared.intentional.swap(false, Ordering::SeqCst) {
-            attempts = 0; // Server-Transfer: sofort weiter
+            // Server-Transfer ist ein ausdrücklicher Protokollwechsel, kein Reconnect nach
+            // einem Kick. Deshalb wird nur in diesem Fall sofort weiterverbunden.
             continue;
         }
-        if !shared.options.auto_reconnect {
-            // Ohne Reconnect gibt es nichts mehr zu tun. Der Hauptthread wartet womöglich
-            // blockierend auf eine Eingabe, die nie kommt – also das Programm beenden, damit ein
-            // Dienst dahinter den Abbruch sieht.
-            shared.console.error("Auto-Reconnect ist aus – beende.");
-            shared.running.store(false, Ordering::SeqCst);
-            std::process::exit(1);
-        }
-
-        attempts += 1;
-        let exponent = (attempts - 1).min(6);
-        let delay = (shared.options.reconnect_delay_seconds.saturating_mul(1 << exponent))
-            .clamp(1, shared.options.max_backoff_seconds);
         shared
             .console
-            .info(&format!("Reconnect-Versuch {} in {} s ...", attempts, delay));
-        shared
-            .console
-            .event("reconnect", &format!("versuch={} in={}s", attempts, delay));
-
-        // In Sekundenschritten schlafen, damit ein Abbruch nicht bis zu 60 s hängt.
-        for _ in 0..delay {
-            if !shared.running.load(Ordering::Relaxed) {
-                return;
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
+            .info("Verbindung beendet – kein automatischer Reconnect.");
+        shared.running.store(false, Ordering::SeqCst);
+        shared.queue.signal.notify_all();
+        shared.wake();
+        // `main` kann blockierend auf Terminal-/Pipe-Eingabe warten. Nur den Netz-Thread zu
+        // beenden ließe den Prozess deshalb nach einem Kick scheinbar weiterlaufen. Ein
+        // Verbindungsabbruch ist für einen einzelnen AFK-Prozess ein Fehlerstatus; ein
+        // Dienst/Panel kann ihn dadurch ebenfalls zuverlässig erkennen.
+        std::process::exit(1);
     }
 }
 
@@ -454,7 +491,10 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     ));
     shared.console.event(
         "connecting",
-        &format!("host={} port={} mc={}", real_host, real_port, shared.proto.name),
+        &format!(
+            "host={} port={} mc={}",
+            real_host, real_port, shared.proto.name
+        ),
     );
 
     let (mut reader, writer) =
@@ -520,7 +560,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         };
 
         match outcome {
-            Ok(true) => return Ok(()),   // sauber getrennt (Disconnect/Transfer)
+            Ok(true) => return Ok(()), // sauber getrennt (Disconnect/Transfer)
             Ok(false) => {}
             Err(e) => return Err(e),
         }
@@ -655,6 +695,8 @@ fn handle_config(
             // Ab 1.21.11: ohne Bestätigung lässt der Server niemanden ins Spiel.
             shared.send(Writer::packet(cfg::SB_ACCEPT_CODE_OF_CONDUCT));
         }
+        #[cfg(feature = "extras")]
+        cfg::CB_REGISTRY_DATA => crate::extras::registry(shared, r),
         cfg::CB_RESOURCE_PACK_PUSH => {
             let pack = r.uuid().map_err(|e| e.to_string())?;
             acknowledge_resource_pack(shared, cfg::SB_RESOURCE_PACK, &pack);
@@ -697,12 +739,18 @@ fn handle_game(
         }
         In::Login => {
             // Erstes Feld ist die eigene Entitäts-Nummer. Der schlanke Client braucht sie nicht,
-            // das Schleich-Paket von 1.21.1 dagegen schon.
-            #[cfg(feature = "premium")]
-            if let Ok(entity) = r.i32() {
+            // das Schleich-Paket von 1.21.1 und die POV-Ansicht dagegen schon.
+            #[cfg(any(feature = "state", feature = "pov"))]
+            let own_entity = r.i32().ok();
+            #[cfg(feature = "state")]
+            if let Some(entity) = own_entity {
                 shared
                     .entity_id
                     .store(entity, std::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "pov")]
+            if let Some(entity) = own_entity {
+                crate::pov::login(shared, entity, r);
             }
             let first_join = !session.joined;
             session.joined = true;
@@ -712,6 +760,8 @@ fn handle_game(
         // unterscheiden wir am eigenen Zustand statt am Paketinhalt: dessen Aufbau ist in jeder
         // Version ein anderer, `session.dead` dagegen ist eindeutig – und kostet nichts.
         In::Respawn => {
+            #[cfg(feature = "pov")]
+            crate::pov::respawn(shared, r);
             if !session.dead {
                 shared.console.info("Welt gewechselt.");
                 shared.trigger(Event::World, "");
@@ -719,7 +769,7 @@ fn handle_game(
         }
         In::SystemChat => {
             let component = nbt::read_network(r).map_err(|e| e.to_string())?;
-            let line = nbt::render(&component, shared.console.is_color());
+            let line = nbt::render(&component, shared.console.fmt());
             if !line.trim().is_empty() {
                 shared.display(&line);
             }
@@ -772,12 +822,12 @@ fn handle_game(
         In::Transfer => return transfer(shared, r),
         In::Disconnect => return Err(disconnect_reason(shared, r)),
 
-        // Alles Weitere gibt es nur im Premium-Build; dort landet es bei der Anzeigetafel bzw.
-        // beim Menü. Im schlanken Build existieren diese Zweige gar nicht.
-        #[cfg(feature = "premium")]
-        other => crate::premium::incoming(shared, other, r),
+        // Alles Weitere gibt es nur in einer Zusatz-Bauform. Im schlanken Build existieren
+        // diese Zweige gar nicht.
+        #[cfg(feature = "extras")]
+        other => crate::extras::incoming(shared, other, r),
 
-        #[cfg(not(feature = "premium"))]
+        #[cfg(not(feature = "extras"))]
         In::Ignored => {}
     }
     Ok(false)
@@ -796,7 +846,10 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     session.dead = false;
     session.last_signature = None;
 
-    shared.send(client_information(shared, shared.proto.game.sb_client_information));
+    shared.send(client_information(
+        shared,
+        shared.proto.game.sb_client_information,
+    ));
 
     if first_join {
         let name = shared.account.lock().unwrap().name.clone();
@@ -817,8 +870,8 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     // Unterserver-Wechsel, denn dort landen wir in einer anderen Welt an einer anderen Stelle.
     #[cfg(feature = "movement")]
     crate::movement::on_join(shared);
-    #[cfg(feature = "premium")]
-    crate::premium::on_join(shared);
+    #[cfg(feature = "extras")]
+    crate::extras::on_join(shared);
 }
 
 /// Wiederkehrende Befehle (`--cmd`) nach dem echten Beitritt.
@@ -898,7 +951,11 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
 
     let (id, x, y, z, yaw, pitch, flags) = if shared.proto.modern {
         let id = r.var_int().map_err(err)?;
-        let (x, y, z) = (r.f64().map_err(err)?, r.f64().map_err(err)?, r.f64().map_err(err)?);
+        let (x, y, z) = (
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+        );
         // Bewegungsvektor interessiert uns nicht, muss aber übersprungen werden.
         for _ in 0..3 {
             r.f64().map_err(err)?;
@@ -907,7 +964,11 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         let pitch = r.f32().map_err(err)?;
         (id, x, y, z, yaw, pitch, r.i32().map_err(err)?)
     } else {
-        let (x, y, z) = (r.f64().map_err(err)?, r.f64().map_err(err)?, r.f64().map_err(err)?);
+        let (x, y, z) = (
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+        );
         let yaw = r.f32().map_err(err)?;
         let pitch = r.f32().map_err(err)?;
         let flags = r.u8().map_err(err)? as i32;
@@ -1024,12 +1085,12 @@ fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
     }
 
     let name = nbt::read_network(r).ok()?;
-    let color = shared.console.is_color();
+    let format = shared.console.fmt();
     let body = match unsigned {
-        Some(component) => nbt::render(&component, color),
-        None => nbt::render(&nbt::Nbt::Str(content), color),
+        Some(component) => nbt::render(&component, format),
+        None => nbt::render(&nbt::Nbt::Str(content), format),
     };
-    Some(format!("<{}> {}", nbt::render(&name, color), body))
+    Some(format!("<{}> {}", nbt::render(&name, format), body))
 }
 
 /// Empfangene Chat-Nachrichten regelmäßig quittieren (sonst kickt der Server irgendwann).
@@ -1108,7 +1169,7 @@ fn transfer(shared: &Arc<Shared>, r: &mut Reader) -> Result<bool, String> {
 
 fn disconnect_reason(shared: &Arc<Shared>, r: &mut Reader) -> String {
     match nbt::read_network(r) {
-        Ok(component) => nbt::render(&component, shared.console.is_color()),
+        Ok(component) => nbt::render(&component, shared.console.fmt()),
         Err(_) => "unbekannt".to_string(),
     }
 }
@@ -1179,7 +1240,10 @@ mod tests {
     #[test]
     fn host_und_port_werden_zerlegt() {
         // Ohne Port darf (und muss) SRV gefragt werden, mit Port nicht.
-        assert_eq!(parse_host("mc.example.net"), ("mc.example.net".into(), 25565, true));
+        assert_eq!(
+            parse_host("mc.example.net"),
+            ("mc.example.net".into(), 25565, true)
+        );
         assert_eq!(
             parse_host("mc.example.net:25566"),
             ("mc.example.net".into(), 25566, false)
@@ -1210,23 +1274,38 @@ mod tests {
                 g.cb_system_chat,
                 g.cb_transfer,
             ];
-            // Die Premium-IDs müssen sich in dieselbe Menge einreihen: eine Überschneidung mit
-            // einem der obigen Pakete würde still das falsche Paket verarbeiten.
-            #[cfg(feature = "premium")]
+            // Zusatz-IDs müssen sich in dieselbe Menge einreihen: eine Überschneidung mit einem
+            // der obigen Pakete würde still das falsche Paket verarbeiten.
+            #[cfg(feature = "extras")]
             {
                 let e = &p.extra;
+                #[cfg(feature = "menu")]
                 ids.extend_from_slice(&[
                     e.cb_container_close,
                     e.cb_container_set_content,
                     e.cb_container_set_slot,
                     e.cb_open_screen,
-                    e.cb_player_info_remove,
-                    e.cb_player_info_update,
+                ]);
+                #[cfg(feature = "board")]
+                ids.extend_from_slice(&[
                     e.cb_reset_score,
                     e.cb_set_display_objective,
                     e.cb_set_objective,
                     e.cb_set_player_team,
                     e.cb_set_score,
+                ]);
+                #[cfg(feature = "pov")]
+                ids.extend_from_slice(&[
+                    e.cb_level_chunk,
+                    e.cb_forget_level_chunk,
+                    e.cb_block_update,
+                    e.cb_section_blocks_update,
+                    e.cb_chunk_batch_finished,
+                    e.cb_add_entity,
+                    e.cb_remove_entities,
+                    e.cb_move_entity_pos,
+                    e.cb_move_entity_pos_rot,
+                    e.cb_teleport_entity,
                 ]);
             }
             for (i, a) in ids.iter().enumerate() {

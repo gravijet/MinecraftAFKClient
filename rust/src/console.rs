@@ -9,8 +9,9 @@
 //! * **Standardeingabe**: jede Zeile geht als Chat-Nachricht bzw. – mit `/` vorn – als
 //!   Serverbefehl raus.
 //!
-//! Kein Rohmodus, keine Statuszeile, kein Neuzeichnen: das spart eine Abhängigkeit, einen Thread
-//! und macht den Client pipe-fähig.
+//! Kein Rohmodus und keine Eingabe-Manipulation: das spart eine Abhängigkeit und macht den Client
+//! pipe-fähig. Nur die ausdrücklich gestartete POV-Bauform zeichnet auf stderr ANSI-Frames neu;
+//! Chat auf stdout bleibt weiterhin streng zeilenweise.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +23,9 @@ pub const RED: &str = "\x1b[91m";
 pub const GREEN: &str = "\x1b[92m";
 pub const YELLOW: &str = "\x1b[93m";
 pub const CYAN: &str = "\x1b[96m";
-/// Nur die Bewegung setzt fett – im schlanken Build ist die Konstante ungenutzt.
-#[cfg_attr(not(feature = "movement"), allow(dead_code))]
+/// Fett setzen nur die Ausbaustufen (Überschriften in `:help`, `:board`, `:menu`, `:pov`) –
+/// im schlanken Build ist die Konstante ungenutzt.
+#[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub const BOLD: &str = "\x1b[1m";
 
 struct Inner {
@@ -55,6 +57,27 @@ impl Console {
 
     pub fn is_color(&self) -> bool {
         self.inner.color.load(Ordering::Relaxed)
+    }
+
+    /// Ausgabeformat für Text-Komponenten: eingefärbt oder roh.
+    pub fn fmt(&self) -> crate::nbt::Fmt {
+        if self.is_color() {
+            crate::nbt::Fmt::Ansi
+        } else {
+            crate::nbt::Fmt::Plain
+        }
+    }
+
+    /// Einen im Speicher liegenden `§`-Text anzeigefertig machen. Anzeigetafel und
+    /// Gegenstandsnamen werden als `§`-Text gehalten, damit sie unverändert an ein Programm
+    /// davor weitergereicht werden können – eingefärbt wird erst hier.
+    #[cfg(any(feature = "board", feature = "items"))]
+    pub fn text(&self, legacy: &str) -> String {
+        if self.is_color() {
+            crate::nbt::legacy_to_ansi(legacy)
+        } else {
+            crate::nbt::strip_legacy(legacy)
+        }
     }
 
     /// Text einfärben – ohne Farbe unverändert zurück.
@@ -93,7 +116,6 @@ impl Console {
         self.print(&self.paint(GREEN, text));
     }
 
-    #[cfg_attr(not(feature = "movement"), allow(dead_code))]
     pub fn warn(&self, text: &str) {
         self.print(&self.paint(YELLOW, text));
     }
@@ -119,6 +141,16 @@ impl Console {
         } else {
             writeln!(err, "@event {} {}", name, detail)
         };
+        let _ = err.flush();
+    }
+
+    /// Einen vollständigen POV-Frame direkt auf die Fehlerausgabe schreiben. Die normale
+    /// Ausgabe bleibt zeilenorientiert; nur die ausdrücklich gestartete Live-Ansicht setzt den
+    /// Cursor mit ANSI neu. Chat auf stdout bleibt davon vollständig getrennt.
+    #[cfg(feature = "pov")]
+    pub fn pov_frame(&self, frame: &str) {
+        let mut err = std::io::stderr().lock();
+        let _ = write!(err, "{}", frame);
         let _ = err.flush();
     }
 

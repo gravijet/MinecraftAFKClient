@@ -8,17 +8,46 @@ description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.2
 name = "afk"
 path = "src/main.rs"
 
-# Drei Bauformen aus derselben Quelle:
-#   (ohne)              schlanker AFK-Client – kein Byte Bewegungs- oder Premium-Code
-#   --features movement zusätzlich :go/:look/:home/:route
-#   --features premium  zusätzlich Anzeigetafel, Tab-Liste, Menüs, Anti-AFK, Schleichen
-# Die Skripte bauen jede Variante in ein eigenes Zielverzeichnis, damit die schlanke afk.exe
-# dabei nicht überschrieben wird (siehe build-all.ps1 / build-all.sh).
+# Bauformen aus derselben Quelle. Was eine Bauform nicht kann, ist in ihr auch nicht
+# einkompiliert – weder der Code noch die Zustandstabellen. Die Skripte bauen jede Variante in ein
+# eigenes Zielverzeichnis, damit sie sich nicht gegenseitig überschreiben
+# (siehe build-all.ps1 / build-all.sh, Dateinamen in RELEASE.md).
+#
+#   (ohne)              schlanker AFK-Client – kein Byte darüber hinaus
+#   --features movement   zusätzlich :go/:look/:home/:route
+#   --features items      zusätzlich Menüs samt Feldinhalten (Name, Farben, Lore)
+#   --features pov-client eigene Live-Ansicht, startet beim Beitritt automatisch
+#   --features premium    zusätzlich Anzeigetafel, Menüs, Anti-AFK, Schleichen
+#   --features premium,items   Premium plus Feldinhalte
+#   --features ultra      alles zusammen
 [features]
 default = []
-movement = []
-# Premium schließt die Bewegung mit ein: Anti-AFK und die Menü-Befehle bauen darauf auf.
-premium = ["movement"]
+
+# --- Einzelteile ---------------------------------------------------------------------------
+# Örtliche ':'-Befehle überhaupt (Eingabeschleife, :help, :pos).
+local = []
+movement = ["local"]
+# Gemeinsame Zusatz-Paket-IDs aller Ausbaustufen (proto::Extra).
+extras = ["local"]
+# Anzeigetafel (Seitenleiste).
+board = ["extras"]
+# Behälter/Menüs öffnen, anklicken, schließen.
+menu = ["extras"]
+# Feldinhalte lesen: Name, Farbformatierung, Lore.
+items = ["menu"]
+# Tastenzustand: Schleichen, Sprinten, Arm, Rechtsklick, Schnellleiste.
+state = ["extras"]
+# Automatische kleine Bewegung – braucht sb_swing (state) und das Bewegungspaket.
+antiafk = ["movement", "state"]
+# Live-Ansicht: Chunks lesen und als Bild zeichnen.
+pov = ["extras"]
+# Eigene POV-Datei: startet die Ansicht nach dem Beitritt automatisch. Ultra enthält zwar den
+# POV-Code, startet ihn aber nur auf Wunsch mit `:pov live`.
+pov-client = ["pov"]
+
+# --- Fertige Bauformen ---------------------------------------------------------------------
+premium = ["movement", "board", "menu", "state", "antiafk"]
+ultra = ["premium", "items", "pov"]
 
 [dependencies]
 # HTTPS nur für Login/Token-Refresh und den Sitzungs-Join (kurze Bursts, danach wieder frei).

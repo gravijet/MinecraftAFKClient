@@ -3,21 +3,25 @@
 
       dist\afk-1.21.1.jar   dist\afk-1.21.11.jar   dist\afk-26.1.jar   dist\afk-26.2.jar
       dist\afk-windows.exe                     (Rust, alle vier Versionen in einer Datei)
+      dist\afk-windows-move.exe                (Rust + Bewegung)
+      dist\items-afk-windows.exe               (Rust + Menüs mit Gegenständen)
+      dist\premium-afk-windows.exe             (Rust Premium)
+      dist\premium-items-afk-windows.exe       (Rust Premium + Gegenstände)
+      dist\pov-afk-windows.exe                 (Rust Live-POV)
+      dist\ultra-afk-windows.exe               (alle Rust-Funktionen)
 
-    Mit -Move zusätzlich die Bewegungs-Bauform (afk-<ver>-move.jar bzw. afk-windows-move.exe).
-    Mit -Premium zusätzlich den Premium-Client (dist\premium-afk-windows.exe) – nur Rust.
+    Die sieben Rust-Bauformen werden immer gebaut. -Move ergänzt nur die vier Java-Bewegungs-Jars.
 
     Gradle läuft NICHT unter Java 25 – das Skript sucht daher automatisch ein JDK 21 (oder 17).
     Die fertigen Jars laufen davon unabhängig auf jedem Java ab 21.
 
-    Aufruf:  .\build-all.ps1 [-Only java|rust|both] [-Move] [-Premium] [-JavaHome "C:\Pfad\zum\jdk"]
+    Aufruf:  .\build-all.ps1 [-Only java|rust|both] [-Move] [-JavaHome "C:\Pfad\zum\jdk"]
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('java', 'rust', 'both')]
     [string]$Only = 'both',
     [switch]$Move,
-    [switch]$Premium,
     [string]$JavaHome
 )
 
@@ -79,16 +83,20 @@ if ($Only -in @('rust', 'both')) {
         Invoke-Native { & cargo build --release } "Rust-Build"
         Copy-Item 'target\release\afk.exe' (Join-Path $dist 'afk-windows.exe') -Force
 
-        if ($Move) {
-            # Eigenes Zielverzeichnis, sonst ueberschreibt die Bewegungsvariante die schlanke Datei.
-            Invoke-Native { & cargo build --release --features movement --target-dir target\movement } "Rust-Bewegungs-Build"
-            Copy-Item 'target\movement\release\afk.exe' (Join-Path $dist 'afk-windows-move.exe') -Force
-        }
-
-        if ($Premium) {
-            # Ebenfalls eigenes Zielverzeichnis: premium enthaelt movement, ist aber eine dritte Datei.
-            Invoke-Native { & cargo build --release --features premium --target-dir target\premium } "Rust-Premium-Build"
-            Copy-Item 'target\premium\release\afk.exe' (Join-Path $dist 'premium-afk-windows.exe') -Force
+        $variants = @(
+            @{ Target = 'movement';     Features = 'movement';      File = 'afk-windows-move.exe';          Label = 'Bewegung' },
+            @{ Target = 'items';        Features = 'items';         File = 'items-afk-windows.exe';          Label = 'Items' },
+            @{ Target = 'premium';      Features = 'premium';       File = 'premium-afk-windows.exe';        Label = 'Premium' },
+            @{ Target = 'premium-items'; Features = 'premium,items'; File = 'premium-items-afk-windows.exe'; Label = 'Premium + Items' },
+            @{ Target = 'pov';          Features = 'pov-client';    File = 'pov-afk-windows.exe';            Label = 'POV' },
+            @{ Target = 'ultra';        Features = 'ultra';         File = 'ultra-afk-windows.exe';          Label = 'Ultra' }
+        )
+        foreach ($variant in $variants) {
+            # Eigene Zielverzeichnisse verhindern, dass eine Bauform eine andere ueberschreibt.
+            Invoke-Native {
+                & cargo build --release --features $variant.Features --target-dir "target\$($variant.Target)"
+            } "Rust-Build $($variant.Label)"
+            Copy-Item "target\$($variant.Target)\release\afk.exe" (Join-Path $dist $variant.File) -Force
         }
     } finally {
         Pop-Location

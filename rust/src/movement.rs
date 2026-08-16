@@ -21,8 +21,8 @@
 
 use crate::buf::Writer;
 use crate::client::{Position, Shared};
-use crate::options;
 use crate::console::{Console, BOLD, CYAN, GRAY};
+use crate::options;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -277,7 +277,11 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
     let settings = shared.mover.get();
     match task {
         Task::Turn { yaw, pitch } => {
-            report(shared, turn_to(shared, job, &settings, yaw, pitch), "Drehen");
+            report(
+                shared,
+                turn_to(shared, job, &settings, yaw, pitch),
+                "Drehen",
+            );
         }
         Task::Jump { dx, dz } => {
             report(shared, jump(shared, job, &settings, dx, dz), "Sprung");
@@ -287,11 +291,18 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
             let outcome = fall(shared, job, 0.0, 0.0, 0.0);
             if matches!(outcome, Outcome::Arrived) {
                 let after = shared.position().map(|p| p.1).unwrap_or(before);
-                return shared.console.ok(&format!("Gefallen: {:.1} Blöcke.", before - after));
+                return shared
+                    .console
+                    .ok(&format!("Gefallen: {:.1} Blöcke.", before - after));
             }
             report(shared, outcome, "Fallen");
         }
-        Task::WalkTo { x, z, record, label } => {
+        Task::WalkTo {
+            x,
+            z,
+            record,
+            label,
+        } => {
             let mut outcome = walk_to(shared, job, &settings, x, z, None);
             if record && matches!(outcome, Outcome::Arrived) {
                 record_point(shared);
@@ -351,11 +362,18 @@ fn record_point(shared: &Arc<Shared>) {
         return;
     };
     if points.len() >= MAX_ROUTE {
-        return shared
-            .console
-            .warn(&format!("Route: mehr als {} Wegpunkte gehen nicht.", MAX_ROUTE));
+        return shared.console.warn(&format!(
+            "Route: mehr als {} Wegpunkte gehen nicht.",
+            MAX_ROUTE
+        ));
     }
-    points.push(Spot { x, y, z, yaw, pitch });
+    points.push(Spot {
+        x,
+        y,
+        z,
+        yaw,
+        pitch,
+    });
     shared
         .console
         .info(&format!("Wegpunkt {} aufgezeichnet.", points.len()));
@@ -451,7 +469,13 @@ fn walk_to(
         };
         send_move(
             shared,
-            (x + dx / distance * travel, ny, z + dz / distance * travel, yaw, pitch),
+            (
+                x + dx / distance * travel,
+                ny,
+                z + dz / distance * travel,
+                yaw,
+                pitch,
+            ),
         );
         next = sleep_tick(next);
 
@@ -811,19 +835,6 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) {
             shared.mover.stop();
             shared.console.info("Bewegung gestoppt.");
         }
-        "help" | "hilfe" | "?" => help(shared),
-        "pos" | "position" => match shared.position() {
-            Some((x, y, z, yaw, pitch)) => shared.console.info(&format!(
-                "x={:.2}  y={:.2}  z={:.2}  ·  Blick {:.1}° ({}) / {:.1}°",
-                x,
-                y,
-                z,
-                yaw,
-                compass(yaw),
-                pitch
-            )),
-            None => shared.console.error("Position noch unbekannt (nicht im Spiel?)."),
-        },
         _ => shared
             .console
             .error(&format!("Unbekannter Befehl: :{} (siehe :help)", verb)),
@@ -848,16 +859,19 @@ fn go(shared: &Arc<Shared>, arg: &str) {
         Some(text) => match parse_number(text) {
             Some(value) if value > 0.0 && value <= MAX_BLOCKS => value,
             _ => {
-                return shared
-                    .console
-                    .error(&format!("Anzahl muss zwischen 0 und {} liegen.", MAX_BLOCKS))
+                return shared.console.error(&format!(
+                    "Anzahl muss zwischen 0 und {} liegen.",
+                    MAX_BLOCKS
+                ))
             }
         },
         None => 1.0,
     };
 
     let Some((x, _, z, yaw, _)) = shared.position() else {
-        return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+        return shared
+            .console
+            .error("Position noch unbekannt (nicht im Spiel?).");
     };
     let (fx, fz) = direction.vector(yaw);
     shared.console.note(&format!(
@@ -890,12 +904,16 @@ fn jump_command(shared: &Arc<Shared>, arg: &str) {
             return;
         };
         let Some((_, _, _, yaw, _)) = shared.position() else {
-            return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+            return shared
+                .console
+                .error("Position noch unbekannt (nicht im Spiel?).");
         };
         direction.vector(yaw)
     };
     if shared.position().is_none() {
-        return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+        return shared
+            .console
+            .error("Position noch unbekannt (nicht im Spiel?).");
     }
     shared.console.note("Springe ...");
     spawn(shared, Task::Jump { dx, dz });
@@ -919,7 +937,9 @@ fn fall_command(shared: &Arc<Shared>, arg: &str) {
         }
         "" => {
             if shared.position().is_none() {
-                return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+                return shared
+                    .console
+                    .error("Position noch unbekannt (nicht im Spiel?).");
             }
             spawn(shared, Task::Fall);
         }
@@ -940,7 +960,9 @@ fn fall_command(shared: &Arc<Shared>, arg: &str) {
 
 fn look(shared: &Arc<Shared>, arg: &str) {
     let Some((_, _, _, yaw, pitch)) = shared.position() else {
-        return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+        return shared
+            .console
+            .error("Position noch unbekannt (nicht im Spiel?).");
     };
     let mut parts = arg.split_whitespace();
     let Some(first) = parts.next() else {
@@ -1021,9 +1043,10 @@ fn home(shared: &Arc<Shared>, arg: &str) {
         "delay" => match parse_number(&rest) {
             Some(seconds) if (0.0..=3600.0).contains(&seconds) => {
                 shared.mover.edit(|s| s.home_delay_seconds = seconds as u64);
-                shared
-                    .console
-                    .info(&format!("Startverzögerung: {} s nach dem Beitritt.", seconds as u64));
+                shared.console.info(&format!(
+                    "Startverzögerung: {} s nach dem Beitritt.",
+                    seconds as u64
+                ));
             }
             _ => shared.console.error("Nutzung: :home delay <sekunden>"),
         },
@@ -1035,7 +1058,9 @@ fn home(shared: &Arc<Shared>, arg: &str) {
                     shared.mover.get().walk_speed
                 ));
             }
-            None => shared.console.error("Nutzung: :home speed <blöcke pro sekunde>"),
+            None => shared
+                .console
+                .error("Nutzung: :home speed <blöcke pro sekunde>"),
         },
         other => shared
             .console
@@ -1047,7 +1072,9 @@ fn home(shared: &Arc<Shared>, arg: &str) {
 fn go_home(shared: &Arc<Shared>) {
     let settings = shared.mover.get();
     let Some(target) = settings.home else {
-        return shared.console.error("Keine Heimatposition gesetzt (:home set).");
+        return shared
+            .console
+            .error("Keine Heimatposition gesetzt (:home set).");
     };
     spawn(
         shared,
@@ -1064,9 +1091,17 @@ fn set_home(shared: &Arc<Shared>, rest: &str) {
     let numbers: Vec<f64> = rest.split_whitespace().filter_map(parse_number).collect();
     let spot = if numbers.is_empty() {
         let Some((x, y, z, yaw, pitch)) = shared.position() else {
-            return shared.console.error("Position noch unbekannt (nicht im Spiel?).");
+            return shared
+                .console
+                .error("Position noch unbekannt (nicht im Spiel?).");
         };
-        Spot { x, y, z, yaw, pitch }
+        Spot {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+        }
     } else if numbers.len() >= 3 {
         Spot {
             x: numbers[0],
@@ -1111,11 +1146,18 @@ fn print_home(shared: &Arc<Shared>) {
                     "    Start {} s nach dem Beitritt  ·  {:.3} Blöcke/s  ·  Fallen {}",
                     settings.home_delay_seconds,
                     settings.walk_speed,
-                    if settings.auto_fall { "automatisch" } else { "aus" }
+                    if settings.auto_fall {
+                        "automatisch"
+                    } else {
+                        "aus"
+                    }
                 ),
             ));
         }
-        None => console.print(&console.paint(GRAY, "    (keine – mit  :home set  die aktuelle Position übernehmen)")),
+        None => console.print(&console.paint(
+            GRAY,
+            "    (keine – mit  :home set  die aktuelle Position übernehmen)",
+        )),
     }
     console.print(&console.paint(
         GRAY,
@@ -1174,7 +1216,13 @@ fn route(shared: &Arc<Shared>, arg: &str) {
                 // Ohne Heimatposition wird der Endpunkt der Aufzeichnung zum Ziel.
                 if s.home.is_none() {
                     if let Some((x, y, z, yaw, pitch)) = here {
-                        s.home = Some(Spot { x, y, z, yaw, pitch });
+                        s.home = Some(Spot {
+                            x,
+                            y,
+                            z,
+                            yaw,
+                            pitch,
+                        });
                     }
                 }
                 s.route = points;
@@ -1199,18 +1247,26 @@ fn route(shared: &Arc<Shared>, arg: &str) {
             let Some((x, y, z, yaw, pitch)) = shared.position() else {
                 return console.error("Position noch unbekannt (nicht im Spiel?).");
             };
-            let spot = Spot { x, y, z, yaw, pitch };
+            let spot = Spot {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            };
             let mut guard = shared.mover.recording.lock().unwrap();
             if let Some(points) = guard.as_mut() {
                 if points.len() >= MAX_ROUTE {
-                    return console.error(&format!("Mehr als {} Wegpunkte gehen nicht.", MAX_ROUTE));
+                    return console
+                        .error(&format!("Mehr als {} Wegpunkte gehen nicht.", MAX_ROUTE));
                 }
                 points.push(spot);
                 console.ok(&format!("Wegpunkt {} aufgezeichnet.", points.len()));
             } else {
                 drop(guard);
                 if shared.mover.get().route.len() >= MAX_ROUTE {
-                    return console.error(&format!("Mehr als {} Wegpunkte gehen nicht.", MAX_ROUTE));
+                    return console
+                        .error(&format!("Mehr als {} Wegpunkte gehen nicht.", MAX_ROUTE));
                 }
                 shared.mover.edit(|s| s.route.push(spot));
                 console.ok(&format!(
@@ -1301,39 +1357,11 @@ fn print_route(shared: &Arc<Shared>) {
     ));
 }
 
-// ===================== Hilfen =====================
-
-/// `:help` – alle örtlichen Befehle. Was der Build nicht kann, steht auch nicht dabei.
-fn help(shared: &Arc<Shared>) {
-    let console = &shared.console;
-    console.print("");
-    console.print(&console.paint(BOLD, "  Befehle (alles mit ':' vorn, alles andere geht in den Chat)"));
-    for line in [
-        ":go vor|zurück|links|rechts [blöcke]   laufen (Richtung relativ zum Blick)",
-        ":look <gier> [neigung] · nord|ost|…    Kopf drehen",
-        ":jump [richtung]  ·  :fall             springen · fallen lassen",
-        ":home set|on|off|go|delay|speed        Heimatposition",
-        ":route rec|stop|add|del|go|clear       Wegpunkte zur Heimatposition",
-        ":pos  ·  :stop                         Position anzeigen · Bewegung abbrechen",
-    ] {
-        console.print(&format!("    {}", line));
-    }
-    #[cfg(feature = "premium")]
-    for line in [
-        ":board  ·  :tab                        Seitenleiste · Spielerliste",
-        ":menu  ·  :click <feld> [rechts|shift] ·  :close",
-        ":sneak [on|off]  ·  :sprint [on|off]   Schleichen · Sprinten",
-        ":swing  ·  :use  ·  :hand <1-9>        Arm · Rechtsklick · Schnellleiste",
-        ":antiafk [on|off|<sek>]                automatische kleine Bewegung",
-    ] {
-        console.print(&format!("    {}", line));
-    }
-    console.print(&console.paint(GRAY, "    /befehl geht als Serverbefehl raus, alles andere als Chat."));
-}
-
 fn usage_go(console: &Console) {
     console.error("Nutzung: :go vor|zurück|links|rechts [blöcke]     z. B.  :go vor 5");
-    console.info("Richtung ist relativ zum Blick (wie W/A/S/D). Ohne Zahl = 1 Block. :stop bricht ab.");
+    console.info(
+        "Richtung ist relativ zum Blick (wie W/A/S/D). Ohne Zahl = 1 Block. :stop bricht ab.",
+    );
 }
 
 fn usage_look(console: &Console) {
@@ -1480,7 +1508,8 @@ mod tests {
     /// Servers wird einfach übernommen, statt gegen sie anzurechnen.
     #[test]
     fn hoehe_folgt_der_strecke() {
-        let interpolate = |y: f64, ty: f64, travel: f64, distance: f64| y + (ty - y) * (travel / distance);
+        let interpolate =
+            |y: f64, ty: f64, travel: f64, distance: f64| y + (ty - y) * (travel / distance);
         // 8 Blöcke Strecke, 4 Blöcke tiefer: nach der halben Strecke die halbe Höhe.
         let mut y = 68.0;
         let mut left = 8.0;

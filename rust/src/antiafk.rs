@@ -30,7 +30,7 @@ const MIN_SECONDS: u64 = 15;
 
 /// Nach dem Beitritt: Thread starten, falls Anti-AFK an ist.
 pub fn on_join(shared: &Arc<Shared>) {
-    if shared.premium.antiafk.load(Ordering::Relaxed) > 0 {
+    if shared.extras.antiafk.load(Ordering::Relaxed) > 0 {
         start(shared);
     }
 }
@@ -38,7 +38,7 @@ pub fn on_join(shared: &Arc<Shared>) {
 /// `:antiafk` · `:antiafk on|off` · `:antiafk <sekunden>`
 pub fn command(shared: &Arc<Shared>, arg: &str) {
     let console = &shared.console;
-    let current = shared.premium.antiafk.load(Ordering::Relaxed);
+    let current = shared.extras.antiafk.load(Ordering::Relaxed);
 
     let seconds = match arg.trim().to_lowercase().as_str() {
         "" | "status" => {
@@ -58,17 +58,21 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         text => match text.parse::<u64>() {
             Ok(value) => value.max(MIN_SECONDS),
             Err(_) => {
-                return console.error("Nutzung: :antiafk   ·   :antiafk on|off   ·   :antiafk <sekunden>")
+                return console
+                    .error("Nutzung: :antiafk   ·   :antiafk on|off   ·   :antiafk <sekunden>")
             }
         },
     };
 
-    shared.premium.antiafk.store(seconds, Ordering::Relaxed);
+    shared.extras.antiafk.store(seconds, Ordering::Relaxed);
     if seconds == 0 {
         // Der laufende Thread sieht die 0 beim nächsten Aufwachen und beendet sich selbst.
         return console.info("Anti-AFK aus.");
     }
-    console.ok(&format!("Anti-AFK: alle {} s eine kleine Bewegung.", seconds));
+    console.ok(&format!(
+        "Anti-AFK: alle {} s eine kleine Bewegung.",
+        seconds
+    ));
     start(shared);
 }
 
@@ -79,7 +83,7 @@ fn start(shared: &Arc<Shared>) {
     }
     // Wer den Schalter von false auf true dreht, ist der eine Thread.
     if shared
-        .premium
+        .extras
         .antiafk_running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -94,16 +98,16 @@ fn start(shared: &Arc<Shared>) {
         .spawn(move || {
             run(&owned, generation);
             // Erst hier wieder freigeben – sonst könnten zwei Threads nebeneinander laufen.
-            owned.premium.antiafk_running.store(false, Ordering::SeqCst);
+            owned.extras.antiafk_running.store(false, Ordering::SeqCst);
         });
     if started.is_err() {
-        shared.premium.antiafk_running.store(false, Ordering::SeqCst);
+        shared.extras.antiafk_running.store(false, Ordering::SeqCst);
     }
 }
 
 fn run(shared: &Arc<Shared>, generation: u32) {
     loop {
-        let seconds = shared.premium.antiafk.load(Ordering::Relaxed);
+        let seconds = shared.extras.antiafk.load(Ordering::Relaxed);
         if seconds == 0 {
             return;
         }

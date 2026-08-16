@@ -76,6 +76,24 @@ impl<'a> Reader<'a> {
         Ok(f64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
+    /// VarLong – nur die Live-Ansicht braucht ihn (Sammel-Blockänderungen).
+    #[cfg(feature = "pov")]
+    pub fn var_long(&mut self) -> io::Result<i64> {
+        let mut value: i64 = 0;
+        let mut shift = 0;
+        loop {
+            if shift >= 70 {
+                return Err(err("VarLong laenger als 10 Bytes"));
+            }
+            let b = self.u8()?;
+            value |= ((b & 0x7F) as i64) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+    }
+
     pub fn var_int(&mut self) -> io::Result<i32> {
         let mut value: i32 = 0;
         let mut shift = 0;
@@ -113,14 +131,14 @@ impl<'a> Reader<'a> {
         Ok(self.bytes(16)?.try_into().unwrap())
     }
 
-    /// Feld überspringen, ohne es zu kopieren. Der Premium-Client läuft damit durch Felder,
-    /// die er nicht braucht (Skin-Texturen sind je Spieler ein paar Kilobyte).
-    #[cfg(feature = "premium")]
+    /// Feld überspringen, ohne es zu kopieren. Die Ausbaustufen laufen damit durch Felder, die
+    /// sie nicht brauchen (etwa die Höhenkarten eines Chunks).
+    #[cfg(feature = "extras")]
     pub fn skip(&mut self, n: usize) -> io::Result<()> {
         self.bytes(n).map(|_| ())
     }
 
-    #[cfg(feature = "premium")]
+    #[cfg(feature = "extras")]
     pub fn skip_string(&mut self) -> io::Result<()> {
         let len = self.var_int()?;
         if len < 0 || len > 1024 * 1024 {

@@ -6,32 +6,39 @@
 //! gehen auf die Standardfehlerausgabe, Eingabezeilen gehen als Chat raus. Damit lässt er sich
 //! ohne Terminal betreiben und von einem anderen Programm (z. B. einer Website) fernsteuern.
 //!
-//! Drei Bauformen aus derselben Quelle:
+//! Mehrere Bauformen aus derselben Quelle:
 //! * `cargo build --release` – der schlanke AFK-Client, ohne jede Bewegung.
 //! * `cargo build --release --features movement` – zusätzlich gesteuerte Bewegung
 //!   (`:go`, `:look`, `:home`, `:route`, `:stop`, `:pos`), siehe [`movement`].
-//! * `cargo build --release --features premium` – zusätzlich Anzeigetafel, Tab-Liste, Menüs,
-//!   Anti-AFK und Schleichen, siehe [`premium`]. Das ist der „Premium-AFK-Client"; alles darin
-//!   hält Zustand oder braucht einen Zeitgeber und gehört deshalb nicht in den schlanken Build.
+//! * `cargo build --release --features items` – Menüs und deren Gegenstände samt Lore.
+//! * `cargo build --release --features pov-client` – automatisch gestartete Live-Ansicht.
+//! * `cargo build --release --features premium` – Anzeigetafel, Menüs, Anti-AFK und Schleichen.
+//! * `cargo build --release --features ultra` – alle Rust-Zusatzfunktionen.
 
-#[cfg(feature = "premium")]
+#[cfg(feature = "antiafk")]
 mod antiafk;
 mod auth;
-#[cfg(feature = "premium")]
+#[cfg(feature = "board")]
 mod board;
 mod buf;
 mod client;
 mod conn;
 mod console;
 mod dns;
-#[cfg(feature = "premium")]
+#[cfg(feature = "extras")]
+mod extras;
+#[cfg(feature = "items")]
+mod item_names;
+#[cfg(feature = "items")]
+mod items;
+#[cfg(feature = "menu")]
 mod menu;
 #[cfg(feature = "movement")]
 mod movement;
 mod nbt;
 mod options;
-#[cfg(feature = "premium")]
-mod premium;
+#[cfg(feature = "pov")]
+mod pov;
 mod proto;
 mod proxy;
 mod rules;
@@ -100,7 +107,7 @@ fn run(options: Options) {
         if line.is_empty() {
             continue;
         }
-        #[cfg(feature = "movement")]
+        #[cfg(feature = "local")]
         if let Some(rest) = line.strip_prefix(':') {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let verb = parts.next().unwrap_or("").to_lowercase();
@@ -119,18 +126,21 @@ fn run(options: Options) {
 /// Das Panel schickt allen Bauformen dieselben Argumente. Damit `--antiafk` im schlanken Build
 /// nicht still verpufft, wird hier einmal gesagt, was dieser Build nicht kann.
 fn warn_about_unused_options(console: &Console, options: &Options) {
-    #[cfg(feature = "premium")]
+    #[cfg(feature = "antiafk")]
     let _ = options;
-    #[cfg(not(feature = "premium"))]
+    #[cfg(not(feature = "antiafk"))]
     {
         if options.antiafk_seconds > 0 {
-            console.warn("--antiafk kann nur der Premium-Client (premium-afk); wird ignoriert.");
-        }
-        if options.sneak {
-            console.warn("--sneak kann nur der Premium-Client (premium-afk); wird ignoriert.");
+            console.warn("--antiafk braucht den Premium- oder Ultra-Client; wird ignoriert.");
         }
     }
-    #[cfg(feature = "premium")]
+    #[cfg(not(feature = "state"))]
+    {
+        if options.sneak {
+            console.warn("--sneak braucht den Premium- oder Ultra-Client; wird ignoriert.");
+        }
+    }
+    #[cfg(feature = "state")]
     let _ = console;
 }
 
@@ -140,7 +150,10 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
 /// neues über den Microsoft-Gerätecode.
 fn sign_in(console: &Console, base: &Path, preferred: Option<&str>) -> auth::Res<auth::Account> {
     if let Some(name) = auth::migrate_legacy(base) {
-        console.info(&format!("Bestehende Anmeldung als Konto '{}' übernommen.", name));
+        console.info(&format!(
+            "Bestehende Anmeldung als Konto '{}' übernommen.",
+            name
+        ));
     }
 
     let accounts = auth::list(base);
@@ -169,7 +182,10 @@ fn sign_in(console: &Console, base: &Path, preferred: Option<&str>) -> auth::Res
     match auth::load(base, &target) {
         Ok(account) => Ok(account),
         Err(e) => {
-            console.error(&format!("Konto '{}' ließ sich nicht anmelden: {}", target, e));
+            console.error(&format!(
+                "Konto '{}' ließ sich nicht anmelden: {}",
+                target, e
+            ));
             device_code_login(console, base)
         }
     }
@@ -181,7 +197,10 @@ fn device_code_login(console: &Console, base: &Path) -> auth::Res<auth::Account>
     let account = auth::add(base, |code| {
         console.print("");
         console.print("==================  Microsoft-Login  ==================");
-        console.print(&format!("  1. Öffne im Browser:  {}", code.verification_uri));
+        console.print(&format!(
+            "  1. Öffne im Browser:  {}",
+            code.verification_uri
+        ));
         console.print(&format!("  2. Gib diesen Code ein: {}", code.user_code));
         console.print("=======================================================");
         console.info("Warte auf Anmeldung ...");
@@ -230,9 +249,6 @@ fn print_usage() {
          \x20 -m, --mc <version>          Protokoll: {}  (Standard: {})\n\
          \x20     --proxy <adresse>       socks5://[nutzer:pass@]host:port oder http://...\n\
          \x20     --fakehost <host[:port]> diese Adresse im Handshake statt der echten\n\
-         \x20     --no-reconnect          nach einem Abbruch nicht neu verbinden\n\
-         \x20     --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)\n\
-         \x20     --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)\n\
          \n\
          Befehle und Makros:\n\
          \x20 -c, --cmd [sek:]<befehl>    Befehl nach dem Beitritt, mehrfach angebbar.\n\
@@ -257,8 +273,16 @@ fn print_usage() {
          Eingabe: jede Zeile geht als Chat raus, mit '/' vorn als Serverbefehl.\n\
          Konten:  {}{}",
         env!("CARGO_PKG_VERSION"),
-        if cfg!(feature = "premium") {
+        if cfg!(feature = "ultra") {
+            "Ultra-AFK-Client fuer Minecraft"
+        } else if cfg!(feature = "pov-client") {
+            "POV-AFK-Client fuer Minecraft"
+        } else if cfg!(feature = "items") && cfg!(feature = "premium") {
+            "Premium-AFK-Client mit Gegenstaenden"
+        } else if cfg!(feature = "premium") {
             "Premium-AFK-Client fuer Minecraft"
+        } else if cfg!(feature = "items") {
+            "AFK-Client mit Gegenstaenden"
         } else if cfg!(feature = "movement") {
             "Minecraft-AFK-Client mit Bewegung"
         } else {
@@ -266,7 +290,7 @@ fn print_usage() {
         },
         Protocol::names(),
         proto::DEFAULT.name,
-        if cfg!(feature = "premium") {
+        if cfg!(feature = "antiafk") {
             "\nPremium:\n\
              \x20     --antiafk <sek>         alle <sek> eine kleine Bewegung (min. 15, 0 = aus)\n\
              \x20     --sneak                 beim Beitritt geduckt bleiben\n"
@@ -274,9 +298,13 @@ fn print_usage() {
             ""
         },
         options::dir().display(),
-        if cfg!(feature = "movement") {
-            "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf.\n\
-             Bewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis."
+        if cfg!(feature = "local") {
+            if cfg!(feature = "movement") {
+                "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf.\n\
+                 Bewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis."
+            } else {
+                "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf."
+            }
         } else {
             ""
         }

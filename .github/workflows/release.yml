@@ -42,15 +42,43 @@ jobs:
           cat > notes.md <<EOF
           Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7}).
 
-          | Datei | Was |
-          | --- | --- |
-          | \`afk-1.21.1.jar\` … \`afk-26.2.jar\` | Java-Client, je ein Jar pro Minecraft-Version: \`java -jar afk-26.1.jar <server>\` |
-          | \`afk-windows.exe\` | Rust-Client für Windows – spricht alle vier Versionen, Auswahl über \`--mc\` |
-          | \`afk-linux\` | dasselbe für Linux |
-          | \`premium-afk-windows.exe\` / \`premium-afk-linux\` | Premium-Client: alles vom schlanken plus Bewegung, Anzeigetafel, Tab-Liste, Menüs, Anti-AFK |
+          ## Welche Datei ist welche?
 
-          Wer nur AFK stehen will, nimmt \`afk-…\` – der ist kleiner und braucht weniger Speicher.
-          Was welcher Client kann, steht in [FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md).
+          Die neuen Varianten sind ausschließlich Rust-Clients. Jede Rust-Datei unterstützt
+          Minecraft \`1.21.1\`, \`1.21.11\`, \`26.1\` und \`26.2\`; ausgewählt wird mit
+          \`--mc <version>\`.
+
+          | Windows | Linux | Enthaltene Funktionen |
+          | --- | --- | --- |
+          | \`afk-windows.exe\` | \`afk-linux\` | kleiner Basisclient: Verbindung, Chat, Befehle und Makros |
+          | \`afk-windows-move.exe\` | \`afk-linux-move\` | Basisclient plus manuelle Bewegung, Blickrichtung, Routen und Sprung/Fall |
+          | \`items-afk-windows.exe\` | \`items-afk-linux\` | Basisclient plus Menü-Klicks und sichtbare Menü-/Inventargegenstände mit Anzahl, Name, Farbcodes und Lore |
+          | \`premium-afk-windows.exe\` | \`premium-afk-linux\` | Bewegung, formatiertes Scoreboard, Menü-Klicks, Tastenzustand und Anti-AFK; ohne Gegenstandsdaten und POV-Weltspeicher |
+          | \`premium-items-afk-windows.exe\` | \`premium-items-afk-linux\` | Premium plus sichtbare Menü- und Inventargegenstände mit Namen, Farben und Lore |
+          | \`pov-afk-windows.exe\` | \`pov-afk-linux\` | eigener POV-Client; startet automatisch eine Live-First-Person-Ansicht der geladenen Welt im Terminal |
+          | \`ultra-afk-windows.exe\` | \`ultra-afk-linux\` | alle Rust-Funktionen in einer Datei: Premium, Items und mit \`:pov live\` zuschaltbare POV |
+
+          Die vier Java-Dateien bleiben unverändert getrennt nach Protokollversion:
+          \`afk-1.21.1.jar\`, \`afk-1.21.11.jar\`, \`afk-26.1.jar\` und \`afk-26.2.jar\`.
+          Items-, POV-, Premium-Items- und Ultra-Varianten gibt es bewusst nur für Rust.
+
+          ## Wichtige Änderungen
+
+          - Tablist und Playerlist wurden vollständig aus allen Rust-Varianten entfernt.
+          - Nach einem Kick oder Verbindungsabbruch verbindet sich der Client nicht automatisch neu,
+            sondern beendet sich mit Fehlerstatus. Nur ein ausdrücklich vom Server angeordneter
+            Transfer auf einen Unterserver wird als Teil derselben Sitzung weiter befolgt.
+          - Items-Varianten zeigen \`:menu\`, \`:slot <nummer>\` und \`:inv\` mit echten
+            versionsabhängigen Vanilla-Namen sowie benutzerdefinierten Namen, \`§\`-Farbcodes und Lore.
+          - Premium und Ultra übertragen beim Scoreboard Titel, Anzeigenamen, Teamformatierung und
+            Zahlenformate einschließlich farbigem/festem Text oder ausgeblendeten Zahlen.
+          - Die POV decodiert live Chunks, Blockänderungen und Entities und raycastet aus der aktuellen
+            Kameraposition. Das Minecraft-Protokoll liefert keine fertigen Bildschirmbilder oder
+            Texturen; die headless POV ist deshalb eine farbige Voxelansicht im Terminal.
+
+          Die beigefügte [RELEASE.md](https://github.com/${{ github.repository }}/releases/download/latest/RELEASE.md)
+          enthält die ausführliche Auswahlhilfe, Bedienbefehle und Startbeispiele. Die vollständige
+          Funktionsmatrix steht in [FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md).
 
           Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
           EOF
@@ -60,6 +88,7 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "AFKSystems – latest" \
             --notes-file notes.md
+          gh release upload "$ENTWURF" RELEASE.md --clobber
 
   java:
     name: Jars (alle vier Minecraft-Versionen)
@@ -99,16 +128,12 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux
-            built: rust/target/release/afk
-            artifact: afk-linux
-            premium_built: rust/target/premium/release/afk
-            premium_artifact: premium-afk-linux
+            ext: ''
+            platform: linux
           - os: windows-latest
             name: windows
-            built: rust/target/release/afk.exe
-            artifact: afk-windows.exe
-            premium_built: rust/target/premium/release/afk.exe
-            premium_artifact: premium-afk-windows.exe
+            ext: .exe
+            platform: windows
     steps:
       - uses: actions/checkout@v5
 
@@ -120,18 +145,21 @@ jobs:
 
       - name: Bauen
         working-directory: rust
-        run: cargo build --release
-
-      # Eigenes Zielverzeichnis: sonst überschriebe der Premium-Build die schlanke Datei.
-      - name: Premium bauen
-        working-directory: rust
-        run: cargo build --release --features premium --target-dir target/premium
+        shell: bash
+        run: |
+          cargo build --release
+          cargo build --release --features movement --target-dir target/movement
+          cargo build --release --features items --target-dir target/items
+          cargo build --release --features premium --target-dir target/premium
+          cargo build --release --features premium,items --target-dir target/premium-items
+          cargo build --release --features pov-client --target-dir target/pov
+          cargo build --release --features ultra --target-dir target/ultra
 
       - name: Tests
         working-directory: rust
         run: |
           cargo test --release
-          cargo test --release --features premium --target-dir target/premium
+          cargo test --release --all-features --target-dir target/tests
 
       - name: Hochladen
         shell: bash
@@ -140,11 +168,16 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p out
-          cp "${{ matrix.built }}" "out/${{ matrix.artifact }}"
-          cp "${{ matrix.premium_built }}" "out/${{ matrix.premium_artifact }}"
-          gh release upload "$ENTWURF" \
-            "out/${{ matrix.artifact }}" \
-            "out/${{ matrix.premium_artifact }}" --clobber
+          ext='${{ matrix.ext }}'
+          platform='${{ matrix.platform }}'
+          cp "rust/target/release/afk$ext" "out/afk-$platform$ext"
+          cp "rust/target/movement/release/afk$ext" "out/afk-$platform-move$ext"
+          cp "rust/target/items/release/afk$ext" "out/items-afk-$platform$ext"
+          cp "rust/target/premium/release/afk$ext" "out/premium-afk-$platform$ext"
+          cp "rust/target/premium-items/release/afk$ext" "out/premium-items-afk-$platform$ext"
+          cp "rust/target/pov/release/afk$ext" "out/pov-afk-$platform$ext"
+          cp "rust/target/ultra/release/afk$ext" "out/ultra-afk-$platform$ext"
+          gh release upload "$ENTWURF" out/* --clobber
 
   veroeffentlichen:
     name: latest-Release ersetzen

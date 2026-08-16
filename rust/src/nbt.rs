@@ -1,8 +1,11 @@
-//! Netzwerk-NBT lesen und Text-Komponenten als ANSI rendern.
+//! Netzwerk-NBT lesen und Text-Komponenten ausgeben.
 //!
 //! Seit 1.20.3 verschickt Minecraft Chat-Komponenten nicht mehr als JSON, sondern als NBT
 //! ohne Wurzelnamen (Typ-Byte, dann direkt die Nutzdaten). Wir lesen genau so viel, wie zum
-//! Anzeigen nötig ist, und geben eine fertig eingefärbte Zeile zurück.
+//! Anzeigen nötig ist, und geben eine fertige Zeile zurück – in einem von drei Formaten
+//! ([`Fmt`]): ANSI fürs Terminal, roher Text ohne Farben, oder die alten `§`-Codes für ein
+//! Programm davor (Panel/Webseite). Letzteres ist der Weg, auf dem Anzeigetafel und
+//! Gegenstandsnamen ihre Farben behalten.
 
 use crate::buf::Reader;
 use std::io;
@@ -27,9 +30,22 @@ pub enum Nbt {
 }
 
 impl Nbt {
-    fn get<'a>(&'a self, key: &str) -> Option<&'a Nbt> {
+    pub(crate) fn get<'a>(&'a self, key: &str) -> Option<&'a Nbt> {
         match self {
             Nbt::Compound(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// Ganzzahliges Feld eines Compounds. Registry-Daten verwenden je nach Bereich Byte,
+    /// Short, Int oder Long; für Welthöhen sind alle vier verlustfrei als `i32` darstellbar.
+    #[cfg(feature = "pov")]
+    pub(crate) fn get_i32(&self, key: &str) -> Option<i32> {
+        match self.get(key)? {
+            Nbt::Byte(value) => Some(*value as i32),
+            Nbt::Short(value) => Some(*value as i32),
+            Nbt::Int(value) => Some(*value),
+            Nbt::Long(value) => i32::try_from(*value).ok(),
             _ => None,
         }
     }
@@ -142,6 +158,20 @@ fn read_nbt_string(r: &mut Reader) -> io::Result<String> {
 
 // ===================== Rendern =====================
 
+/// Wohin die Zeile geht.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Legacy` wird nur von Scoreboard-/Items-Bauformen konstruiert.
+pub enum Fmt {
+    /// Reiner Text ohne jede Formatierung.
+    Plain,
+    /// Für das Terminal: ANSI-Folgen.
+    Ansi,
+    /// Für ein Programm davor: die alten `§`-Codes von Minecraft. Echte Farben (`#rrggbb`)
+    /// werden als `§x§r§r§g§g§b§b` geschrieben – so macht es auch BungeeCord, und genau das
+    /// erwarten Panels und Weboberflächen.
+    Legacy,
+}
+
 #[derive(Clone, Default, PartialEq)]
 struct Style {
     color: Option<String>,
@@ -151,51 +181,51 @@ struct Style {
     strikethrough: bool,
 }
 
-/// Komponente in eine Terminalzeile umwandeln. `color=false` liefert reinen Text.
-pub fn render(tag: &Nbt, color: bool) -> String {
+/// Komponente in eine Zeile umwandeln.
+pub fn render(tag: &Nbt, fmt: Fmt) -> String {
     let mut out = String::new();
-    walk(tag, &Style::default(), color, &mut out);
-    if color && !out.is_empty() {
+    walk(tag, &Style::default(), fmt, &mut out);
+    if fmt == Fmt::Ansi && !out.is_empty() {
         out.push_str("\x1b[0m");
     }
     out
 }
 
-fn walk(tag: &Nbt, inherited: &Style, color: bool, out: &mut String) {
+fn walk(tag: &Nbt, inherited: &Style, fmt: Fmt, out: &mut String) {
     match tag {
         // Ein reiner String ist eine gültige Komponente ("Hallo").
-        Nbt::Str(s) => emit(s, inherited, color, out),
+        Nbt::Str(s) => emit(s, inherited, fmt, out),
         Nbt::List(items) => {
             for item in items {
-                walk(item, inherited, color, out);
+                walk(item, inherited, fmt, out);
             }
         }
         Nbt::Compound(_) => {
             let style = merge(inherited, tag);
 
             if let Some(text) = tag.get("text").and_then(|t| t.scalar_text()) {
-                emit(&text, &style, color, out);
+                emit(&text, &style, fmt, out);
             } else if let Some(key) = tag.get("translate").and_then(|t| t.as_str()) {
                 // Ohne Sprachdatei können wir nicht übersetzen: Schlüssel zeigen, Argumente anhängen
                 // (so macht es auch der Java-Client mit Adventure ohne Translator).
-                emit(key, &style, color, out);
+                emit(key, &style, fmt, out);
                 if let Some(Nbt::List(args)) = tag.get("with") {
                     for arg in args {
-                        emit(" ", &style, color, out);
-                        walk(arg, &style, color, out);
+                        emit(" ", &style, fmt, out);
+                        walk(arg, &style, fmt, out);
                     }
                 }
             }
 
             if let Some(Nbt::List(extra)) = tag.get("extra") {
                 for child in extra {
-                    walk(child, &style, color, out);
+                    walk(child, &style, fmt, out);
                 }
             }
         }
         other => {
             if let Some(text) = other.scalar_text() {
-                emit(&text, inherited, color, out);
+                emit(&text, inherited, fmt, out);
             }
         }
     }
@@ -222,19 +252,34 @@ fn merge(inherited: &Style, tag: &Nbt) -> Style {
 }
 
 /// Text ausgeben – inklusive Übersetzung alter §-Farbcodes, die viele Server noch senden.
-fn emit(text: &str, style: &Style, color: bool, out: &mut String) {
+fn emit(text: &str, style: &Style, fmt: Fmt, out: &mut String) {
     if text.is_empty() {
         return;
     }
-    if !color {
-        out.push_str(&strip_legacy(text));
-        return;
-    }
-    out.push_str(&ansi_of(style));
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{00a7}' {
-            if let Some(code) = chars.next() {
+    match fmt {
+        Fmt::Plain => out.push_str(&strip_legacy(text)),
+        // Der Text bringt seine eigenen §-Codes schon mit; davor kommt nur der geerbte Stil.
+        Fmt::Legacy => {
+            out.push_str(&legacy_of(style));
+            out.push_str(text);
+        }
+        Fmt::Ansi => {
+            out.push_str(&ansi_of(style));
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c != '\u{00a7}' {
+                    out.push(c);
+                    continue;
+                }
+                let Some(code) = chars.next() else { break };
+                // §x leitet eine echte Farbe ein: §x§r§r§g§g§b§b.
+                if code.eq_ignore_ascii_case(&'x') {
+                    match read_legacy_hex(&mut chars) {
+                        Some(rgb) => out.push_str(&rgb),
+                        None => break,
+                    }
+                    continue;
+                }
                 match legacy_ansi(code) {
                     Some(seq) => out.push_str(seq),
                     // Unbekannter Code: Grundstil wiederherstellen, damit nichts „ausblutet".
@@ -244,20 +289,56 @@ fn emit(text: &str, style: &Style, color: bool, out: &mut String) {
                     }
                 }
             }
-        } else {
-            out.push(c);
         }
     }
 }
 
-fn strip_legacy(text: &str) -> String {
+/// `§`-Text in ANSI übersetzen. Genutzt für alles, was im Speicher als §-Text liegt
+/// (Anzeigetafel, Gegenstandsnamen) und erst beim Anzeigen eingefärbt wird.
+#[allow(dead_code)] // nur Bauformen, die §-Text im Zustand halten
+pub fn legacy_to_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    emit(text, &Style::default(), Fmt::Ansi, &mut out);
+    if !out.is_empty() {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// Sechs `§`-Ziffern nach `§x` einlesen und als ANSI-Echtfarbe zurückgeben.
+fn read_legacy_hex(chars: &mut std::str::Chars) -> Option<String> {
+    let mut hex = String::with_capacity(6);
+    for _ in 0..6 {
+        if chars.next()? != '\u{00a7}' {
+            return None;
+        }
+        hex.push(chars.next()?);
+    }
+    let value = u32::from_str_radix(&hex, 16).ok()?;
+    Some(format!(
+        "\x1b[38;2;{};{};{}m",
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF
+    ))
+}
+
+pub fn strip_legacy(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
-        if c == '\u{00a7}' {
-            chars.next();
-        } else {
+        if c != '\u{00a7}' {
             out.push(c);
+            continue;
+        }
+        // §x frisst die sechs folgenden §-Paare gleich mit.
+        if chars
+            .next()
+            .is_some_and(|code| code.eq_ignore_ascii_case(&'x'))
+        {
+            for _ in 0..12 {
+                chars.next();
+            }
         }
     }
     out
@@ -293,6 +374,71 @@ fn ansi_of(style: &Style) -> String {
         s.push_str("\x1b[9m");
     }
     s
+}
+
+/// Stil als `§`-Codes – das Gegenstück zu [`ansi_of`] für die Weitergabe an ein Programm davor.
+fn legacy_of(style: &Style) -> String {
+    let mut s = String::from("\u{00a7}r");
+    if let Some(c) = &style.color {
+        match c.strip_prefix('#') {
+            // Echte Farbe: §x§r§r§g§g§b§b (Schreibweise von BungeeCord).
+            Some(hex) if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+                s.push_str("\u{00a7}x");
+                for digit in hex.chars() {
+                    s.push('\u{00a7}');
+                    s.push(digit.to_ascii_lowercase());
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(code) = named_legacy(c) {
+                    s.push('\u{00a7}');
+                    s.push(code);
+                }
+            }
+        }
+    }
+    for (on, code) in [
+        (style.bold, 'l'),
+        (style.italic, 'o'),
+        (style.underlined, 'n'),
+        (style.strikethrough, 'm'),
+    ] {
+        if on {
+            s.push('\u{00a7}');
+            s.push(code);
+        }
+    }
+    s
+}
+
+/// Den NBT-Stil eines Minecraft-`StyledFormat` als `§`-Präfix ausgeben. Scoreboards verwenden
+/// dafür ein reines Style-Compound statt einer Text-Komponente.
+#[cfg(feature = "board")]
+pub(crate) fn style_legacy(tag: &Nbt) -> String {
+    legacy_of(&merge(&Style::default(), tag))
+}
+
+fn named_legacy(name: &str) -> Option<char> {
+    Some(match name {
+        "black" => '0',
+        "dark_blue" => '1',
+        "dark_green" => '2',
+        "dark_aqua" => '3',
+        "dark_red" => '4',
+        "dark_purple" => '5',
+        "gold" => '6',
+        "gray" => '7',
+        "dark_gray" => '8',
+        "blue" => '9',
+        "green" => 'a',
+        "aqua" => 'b',
+        "red" => 'c',
+        "light_purple" => 'd',
+        "yellow" => 'e',
+        "white" => 'f',
+        _ => return None,
+    })
 }
 
 fn named_ansi(name: &str) -> Option<&'static str> {
@@ -343,4 +489,67 @@ fn legacy_ansi(code: char) -> Option<&'static str> {
         'k' => "", // obfuscated: im Terminal einfach ignorieren
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(value: &str) -> Nbt {
+        Nbt::Str(value.to_string())
+    }
+
+    fn compound(fields: Vec<(&str, Nbt)>) -> Nbt {
+        Nbt::Compound(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    }
+
+    /// Farben und Fettschrift müssen als §-Codes herauskommen – nur so kann ein Programm davor
+    /// (Panel, Webseite) sie weiterverwenden.
+    #[test]
+    fn stil_wird_zu_farbcodes() {
+        let tag = compound(vec![
+            ("text", text("Punkte")),
+            ("color", text("gold")),
+            ("bold", Nbt::Byte(1)),
+        ]);
+        assert_eq!(render(&tag, Fmt::Legacy), "§r§6§lPunkte");
+        assert_eq!(render(&tag, Fmt::Plain), "Punkte");
+    }
+
+    /// Echte Farben überstehen den Weg als §x-Folge und kommen als ANSI-Echtfarbe zurück.
+    #[test]
+    fn echte_farben_ueberleben_beide_richtungen() {
+        let tag = compound(vec![("text", text("Hi")), ("color", text("#ff8800"))]);
+        let legacy = render(&tag, Fmt::Legacy);
+        assert_eq!(legacy, "§r§x§f§f§8§8§0§0Hi");
+        assert!(legacy_to_ansi(&legacy).contains("\x1b[38;2;255;136;0m"));
+        assert_eq!(strip_legacy(&legacy), "Hi");
+    }
+
+    /// §-Codes, die schon im Text stehen, dürfen nicht verloren gehen.
+    #[test]
+    fn vorhandene_farbcodes_bleiben_stehen() {
+        let tag = text("§aGrün §cRot");
+        assert_eq!(render(&tag, Fmt::Legacy), "§r§aGrün §cRot");
+        assert_eq!(render(&tag, Fmt::Plain), "Grün Rot");
+        let ansi = render(&tag, Fmt::Ansi);
+        assert!(ansi.contains("\x1b[92m") && ansi.contains("\x1b[91m"));
+    }
+
+    /// Verschachtelte Komponenten erben den Stil des Elternteils.
+    #[test]
+    fn extra_erbt_den_stil() {
+        let tag = compound(vec![
+            ("text", text("a")),
+            ("color", text("red")),
+            ("extra", Nbt::List(vec![text("b")])),
+        ]);
+        assert_eq!(render(&tag, Fmt::Legacy), "§r§ca§r§cb");
+        assert_eq!(render(&tag, Fmt::Plain), "ab");
+    }
 }

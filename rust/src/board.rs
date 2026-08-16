@@ -1,12 +1,17 @@
-//! Anzeigetafel (Seitenleiste) und Tab-Liste – **nur im Premium-Build**.
+//! Anzeigetafel (Seitenleiste) – **nur mit `--features board`** (also im Premium- und im
+//! Ultra-Client).
 //!
-//! Beides ist reiner Zustand: der Server schickt Ziele, Punkte, Teams und Spieler einzeln, und
-//! wer sie anzeigen will, muss sie mitführen. Genau das ist der Grund, warum es das im schlanken
-//! Client nicht gibt – der wirft jedes Paket weg, das er nicht sofort beantworten muss.
+//! Das ist reiner Zustand: der Server schickt Ziele, Punkte und Teams einzeln, und wer sie
+//! anzeigen will, muss sie mitführen. Genau das ist der Grund, warum es das im schlanken Client
+//! nicht gibt – der wirft jedes Paket weg, das er nicht sofort beantworten muss.
 //!
-//! Der Speicherbedarf ist trotzdem gedeckelt (siehe [`MAX_ENTRIES`]): ein Server, der Tausende
-//! Einträge schickt, soll den Client nicht wachsen lassen. Skin-Texturen in der Tab-Liste werden
-//! übersprungen statt gelesen – sie sind je Spieler ein paar Kilobyte und für uns wertlos.
+//! **Farben bleiben erhalten.** Alles, was hier landet, wird als `§`-Text gespeichert (siehe
+//! [`crate::nbt::Fmt::Legacy`]) statt als fertige ANSI-Zeile. Damit lässt sich dieselbe Zeile
+//! sowohl eingefärbt im Terminal anzeigen als auch über `--events` unverändert an ein Programm
+//! davor weiterreichen – mit Farbcodes, Fettschrift und allem, was der Server geschickt hat.
+//!
+//! Der Speicherbedarf ist gedeckelt (siehe [`MAX_ENTRIES`]): ein Server, der Tausende Einträge
+//! schickt, soll den Client nicht wachsen lassen.
 //!
 //! Alle Feldreihenfolgen sind aus den Codec-Jars von MCProtocolLib abgelesen (siehe
 //! [`crate::proto`]); die einzige Stelle, die sich zwischen den Versionen unterscheidet, ist das
@@ -15,7 +20,7 @@
 use crate::buf::Reader;
 use crate::client::Shared;
 use crate::console::{BOLD, GRAY};
-use crate::nbt;
+use crate::nbt::{self, Fmt};
 use crate::proto::{values, In, TeamLayout};
 
 use std::collections::HashMap;
@@ -29,8 +34,25 @@ const MAX_LINES: usize = 15;
 
 #[derive(Default)]
 struct Team {
+    /// `§`-Text, kein ANSI – siehe Modulkopf.
     prefix: String,
     suffix: String,
+    /// Stil des eigentlichen Eintrags. Vanilla setzt ihn zwischen Präfix und Suffix separat.
+    color: Option<char>,
+}
+
+struct Objective {
+    title: String,
+    number: Option<NumberFormat>,
+}
+
+#[derive(Clone)]
+enum NumberFormat {
+    Blank,
+    /// Bereits fertiges `§`-Präfix; dahinter kommt der tatsächliche Punktwert.
+    Styled(String),
+    /// Vollständig vom Server vorgegebener Text, unabhängig vom Punktwert.
+    Fixed(String),
 }
 
 /// Ein Eintrag der Seitenleiste.
@@ -39,12 +61,14 @@ struct Score {
     /// Ab 1.20.3 darf der Server je Zeile einen fertigen Anzeigetext mitschicken. Ist er da,
     /// gilt er – sonst wird die Zeile aus Team-Präfix + Name + Suffix zusammengesetzt.
     display: Option<String>,
+    /// `None` übernimmt das Zahlenformat des Objectives bzw. Vanilla-Rot.
+    number: Option<NumberFormat>,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// Zielname -> Überschrift.
-    objectives: HashMap<String, String>,
+    /// Zielname -> Überschrift und Standard-Zahlenformat.
+    objectives: HashMap<String, Objective>,
     /// Welches Ziel steht gerade in der Seitenleiste?
     sidebar: Option<String>,
     /// Zielname -> (Eintrag -> Punktzahl).
@@ -52,8 +76,6 @@ struct Inner {
     teams: HashMap<String, Team>,
     /// Eintrag/Spielername -> Teamname.
     membership: HashMap<String, String>,
-    /// Tab-Liste: UUID -> (Name, Anzeigename).
-    players: HashMap<[u8; 16], (String, Option<String>)>,
 }
 
 pub struct Board {
@@ -82,8 +104,7 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 }
 
 fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
-    let color = shared.console.is_color();
-    let mut inner = shared.premium.board.inner.lock().unwrap();
+    let mut inner = shared.extras.board.inner.lock().unwrap();
 
     match kind {
         // name, action, [Anzeigename, Punktart, optionales Zahlenformat]
@@ -98,28 +119,39 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                     }
                 }
                 values::objective::ADD | values::objective::UPDATE => {
-                    let title = nbt::render(&nbt::read_network(r)?, color);
-                    if inner.objectives.len() < MAX_ENTRIES || inner.objectives.contains_key(&name) {
-                        inner.objectives.insert(name, title);
+                    let title = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                    r.var_int()?; // ScoreType (Integer/Hearts)
+                    let number = read_optional_number_format(r)?;
+                    if inner.objectives.len() < MAX_ENTRIES || inner.objectives.contains_key(&name)
+                    {
+                        inner.objectives.insert(name, Objective { title, number });
                     }
                 }
                 _ => {}
             }
         }
 
-        // Eintrag, Ziel, Punktzahl, optionaler Anzeigename (danach kommt nur noch das
-        // Zahlenformat, das uns nicht interessiert – wir hören einfach auf zu lesen).
+        // Eintrag, Ziel, Punktzahl, optionaler Anzeigename und optionales Zahlenformat.
         In::Score => {
             let owner = r.string()?;
             let objective = r.string()?;
             let value = r.var_int()?;
-            let display = match r.bool() {
-                Ok(true) => Some(nbt::render(&nbt::read_network(r)?, color)),
-                _ => None,
+            let display = if r.bool()? {
+                Some(nbt::render(&nbt::read_network(r)?, Fmt::Legacy))
+            } else {
+                None
             };
+            let number = read_optional_number_format(r)?;
             let entries = inner.scores.entry(objective).or_default();
             if entries.len() < MAX_ENTRIES || entries.contains_key(&owner) {
-                entries.insert(owner, Score { value, display });
+                entries.insert(
+                    owner,
+                    Score {
+                        value,
+                        display,
+                        number,
+                    },
+                );
             }
         }
 
@@ -149,31 +181,30 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             }
         }
 
-        In::Team => read_team(shared, &mut inner, r, color)?,
-
-        In::PlayerInfoUpdate => read_player_info(shared, &mut inner, r, color)?,
-
-        In::PlayerInfoRemove => {
-            let count = r.var_int()?.clamp(0, MAX_ENTRIES as i32);
-            for _ in 0..count {
-                inner.players.remove(&r.uuid()?);
-            }
-        }
+        In::Team => read_team(shared, &mut inner, r)?,
 
         _ => {}
     }
     Ok(())
 }
 
+/// Nullable `NumberFormat`: 0 = keine Zahl, 1 = Stil für den echten Wert, 2 = fester Text.
+fn read_optional_number_format(r: &mut Reader) -> std::io::Result<Option<NumberFormat>> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    Ok(Some(match r.var_int()? {
+        0 => NumberFormat::Blank,
+        1 => NumberFormat::Styled(nbt::style_legacy(&nbt::read_network(r)?)),
+        2 => NumberFormat::Fixed(nbt::render(&nbt::read_network(r)?, Fmt::Legacy)),
+        _ => return Err(crate::buf::err("Unbekanntes Scoreboard-Zahlenformat")),
+    }))
+}
+
 /// Team-Paket. Aufbau nach `name` und `action` je nach Version verschieden – siehe
 /// [`TeamLayout`]. Uns interessieren nur Präfix und Suffix (daraus bestehen auf fast jedem
 /// Server die Zeilen der Seitenleiste) und die Mitgliederliste.
-fn read_team(
-    shared: &Arc<Shared>,
-    inner: &mut Inner,
-    r: &mut Reader,
-    color: bool,
-) -> std::io::Result<()> {
+fn read_team(shared: &Arc<Shared>, inner: &mut Inner, r: &mut Reader) -> std::io::Result<()> {
     let name = r.string()?;
     let action = r.u8()?;
 
@@ -190,34 +221,48 @@ fn read_team(
                 r.u8()?; // Flags
                 r.skip_string()?; // Sichtbarkeit der Namensschilder
                 r.skip_string()?; // Kollisionsregel
-                r.var_int()?; // Farbe
-                let prefix = nbt::render(&nbt::read_network(r)?, color);
-                let suffix = nbt::render(&nbt::read_network(r)?, color);
-                Team { prefix, suffix }
+                let color = team_color(r.var_int()?);
+                let prefix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                let suffix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                Team {
+                    prefix,
+                    suffix,
+                    color,
+                }
             }
             TeamLayout::VarIntRules => {
                 nbt::read_network(r)?; // Anzeigename
                 r.u8()?; // Flags
                 r.var_int()?; // Sichtbarkeit
                 r.var_int()?; // Kollisionsregel
-                r.var_int()?; // Farbe
-                let prefix = nbt::render(&nbt::read_network(r)?, color);
-                let suffix = nbt::render(&nbt::read_network(r)?, color);
-                Team { prefix, suffix }
+                let color = team_color(r.var_int()?);
+                let prefix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                let suffix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                Team {
+                    prefix,
+                    suffix,
+                    color,
+                }
             }
             TeamLayout::Reordered => {
                 nbt::read_network(r)?; // Anzeigename
-                let prefix = nbt::render(&nbt::read_network(r)?, color);
-                let suffix = nbt::render(&nbt::read_network(r)?, color);
+                let prefix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                let suffix = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
                 // Sichtbarkeit, Kollision, optionale Farbe, Flags – alles nach Präfix/Suffix,
                 // also für uns nur noch Überspringen.
                 r.var_int()?;
                 r.var_int()?;
-                if r.bool()? {
-                    r.var_int()?;
-                }
+                let color = r
+                    .bool()?
+                    .then(|| r.var_int())
+                    .transpose()?
+                    .and_then(team_color);
                 r.u8()?;
-                Team { prefix, suffix }
+                Team {
+                    prefix,
+                    suffix,
+                    color,
+                }
             }
         };
         if inner.teams.len() < MAX_ENTRIES || inner.teams.contains_key(&name) {
@@ -243,160 +288,101 @@ fn read_team(
     Ok(())
 }
 
-/// Tab-Listen-Paket. Vorn steht ein Bitfeld, welche Angaben je Spieler folgen; danach die
-/// Spieler. Alles, was uns nicht interessiert, wird übersprungen statt kopiert – vor allem die
-/// Skin-Textur, die je Spieler mehrere Kilobyte groß ist.
-fn read_player_info(
-    shared: &Arc<Shared>,
-    inner: &mut Inner,
-    r: &mut Reader,
-    color: bool,
-) -> std::io::Result<()> {
-    let actions = shared.proto.extra.player_info_actions;
-    let mut mask: u32 = 0;
-    for byte in 0..actions.div_ceil(8) {
-        mask |= (r.u8()? as u32) << (8 * byte);
-    }
-    let has = |bit: u32| mask & bit != 0;
-
-    let count = r.var_int()?.clamp(0, MAX_ENTRIES as i32);
-    for _ in 0..count {
-        let id = r.uuid()?;
-        let mut name = None;
-        let mut display = None;
-
-        if has(values::info::ADD_PLAYER) {
-            name = Some(r.string()?);
-            // Eigenschaften (Skin): je Eintrag Name, Wert und optionale Signatur.
-            let properties = r.var_int()?.clamp(0, 32);
-            for _ in 0..properties {
-                r.skip_string()?;
-                r.skip_string()?;
-                if r.bool()? {
-                    r.skip_string()?;
-                }
-            }
-        }
-        if has(values::info::INITIALIZE_CHAT) && r.bool()? {
-            r.skip(16)?; // Sitzungs-ID
-            r.skip(8)?; // Gültig bis
-            let key = r.var_int()?.max(0) as usize;
-            r.skip(key)?;
-            let signature = r.var_int()?.max(0) as usize;
-            r.skip(signature)?;
-        }
-        if has(values::info::UPDATE_GAME_MODE) {
-            r.var_int()?;
-        }
-        if has(values::info::UPDATE_LISTED) {
-            r.bool()?;
-        }
-        if has(values::info::UPDATE_LATENCY) {
-            r.var_int()?;
-        }
-        if has(values::info::UPDATE_DISPLAY_NAME) && r.bool()? {
-            display = Some(nbt::render(&nbt::read_network(r)?, color));
-        }
-        if has(values::info::UPDATE_LIST_ORDER) {
-            r.var_int()?;
-        }
-        if has(values::info::UPDATE_HAT) {
-            r.bool()?;
-        }
-
-        let room = inner.players.len() < MAX_ENTRIES;
-        match inner.players.get_mut(&id) {
-            Some(entry) => {
-                if let Some(name) = name {
-                    entry.0 = name;
-                }
-                if display.is_some() {
-                    entry.1 = display;
-                }
-            }
-            None if room => {
-                inner.players.insert(id, (name.unwrap_or_default(), display));
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-
 // ===================== Anzeige =====================
 
 /// `:board` – die Seitenleiste so, wie sie im Spiel rechts stünde.
+///
+/// Zusätzlich geht mit `--events` dieselbe Tafel als `@event board`-Zeilen raus, dort aber mit
+/// `§`-Farbcodes statt ANSI: ein Panel kann sie damit genauso einfärben wie im Spiel.
 pub fn print_sidebar(shared: &Arc<Shared>) {
-    let inner = shared.premium.board.inner.lock().unwrap();
+    let inner = shared.extras.board.inner.lock().unwrap();
     let console = &shared.console;
 
     let Some(objective) = inner.sidebar.as_ref() else {
         return console.error("Der Server zeigt gerade keine Seitenleiste an.");
     };
-    let title = inner
-        .objectives
-        .get(objective)
-        .cloned()
-        .unwrap_or_else(|| objective.clone());
+    let objective_data = inner.objectives.get(objective);
+    let title = objective_data
+        .map(|data| data.title.as_str())
+        .unwrap_or(objective);
 
     // Die Seitenleiste ist nach Punktzahl absteigend sortiert – genau wie im Spiel.
-    let mut lines: Vec<(i32, String)> = match inner.scores.get(objective) {
+    let mut lines: Vec<(i32, String, Option<String>)> = match inner.scores.get(objective) {
         Some(entries) => entries
             .iter()
-            .map(|(entry, score)| (score.value, line_for(&inner, entry, score)))
+            .map(|(entry, score)| {
+                (
+                    score.value,
+                    line_for(&inner, entry, score),
+                    number_for(score, objective_data.and_then(|data| data.number.as_ref())),
+                )
+            })
             .collect(),
         None => Vec::new(),
     };
     lines.sort_by(|a, b| b.0.cmp(&a.0));
+    lines.truncate(MAX_LINES);
 
     console.print("");
-    console.print(&format!("  {}", console.paint(BOLD, &title)));
+    console.print(&format!("  {}", console.paint(BOLD, &console.text(&title))));
     if lines.is_empty() {
         console.print(&console.paint(GRAY, "    (keine Zeilen)"));
     }
-    for (value, text) in lines.iter().take(MAX_LINES) {
-        console.print(&format!("    {}  {}", text, console.paint(GRAY, &value.to_string())));
+    for (_, text, number) in &lines {
+        let number = number.as_deref().map(|text| console.text(text));
+        console.print(&match number {
+            Some(number) => format!("    {}  {}", console.text(text), number),
+            None => format!("    {}", console.text(text)),
+        });
+    }
+
+    console.event("board", &format!("titel {}", title));
+    for (value, text, number) in &lines {
+        console.event(
+            "board",
+            &format!(
+                "zeile wert={} zahl={} text={}",
+                value,
+                number.as_deref().unwrap_or(""),
+                text
+            ),
+        );
     }
 }
 
-/// Eine Zeile der Seitenleiste. Vorrang hat der fertige Anzeigetext des Servers; sonst wird sie
-/// aus Team-Präfix + Eintrag + Suffix gebaut – so machen es fast alle Server, weil der Eintrag
-/// selbst nur ein unsichtbarer Platzhalter ist.
+fn number_for(score: &Score, objective: Option<&NumberFormat>) -> Option<String> {
+    match score.number.as_ref().or(objective) {
+        Some(NumberFormat::Blank) => None,
+        Some(NumberFormat::Styled(style)) => Some(format!("{}{}", style, score.value)),
+        Some(NumberFormat::Fixed(text)) => Some(text.clone()),
+        None => Some(format!("§c{}", score.value)),
+    }
+}
+
+/// Eine Zeile der Seitenleiste als `§`-Text. Vorrang hat der fertige Anzeigetext des Servers;
+/// sonst wird sie aus Team-Präfix + Eintrag + Suffix gebaut – so machen es fast alle Server,
+/// weil der Eintrag selbst nur ein unsichtbarer Platzhalter ist.
 fn line_for(inner: &Inner, entry: &str, score: &Score) -> String {
     if let Some(display) = &score.display {
         return display.clone();
     }
     match inner.membership.get(entry).and_then(|t| inner.teams.get(t)) {
-        Some(team) => format!("{}{}{}", team.prefix, entry, team.suffix),
+        Some(team) => match team.color {
+            Some(color) => format!("{}§{}{}{}", team.prefix, color, entry, team.suffix),
+            None => format!("{}{}{}", team.prefix, entry, team.suffix),
+        },
         None => entry.to_string(),
     }
 }
 
-/// `:tab` – die Spielerliste.
-pub fn print_tab(shared: &Arc<Shared>) {
-    let inner = shared.premium.board.inner.lock().unwrap();
-    let console = &shared.console;
-
-    let mut names: Vec<String> = inner
-        .players
-        .values()
-        .map(|(name, display)| display.clone().unwrap_or_else(|| name.clone()))
-        .filter(|name| !name.trim().is_empty())
-        .collect();
-    names.sort_by_key(|name| name.to_lowercase());
-
-    console.print("");
-    console.print(&format!(
-        "  {}",
-        console.paint(BOLD, &format!("Spieler ({})", names.len()))
-    ));
-    if names.is_empty() {
-        return console.print(&console.paint(GRAY, "    (noch keine – kurz nach dem Beitritt)"));
-    }
-    // Drei je Zeile: eine Liste mit 200 Namen soll das Terminal nicht fluten.
-    for chunk in names.chunks(3) {
-        console.print(&format!("    {}", chunk.join("   ")));
-    }
+/// `TeamColor` ist in den Codec-Jars genau in dieser Reihenfolge registriert. Neben den 16
+/// Farben sind die sechs alten Formatierungen zulässig; unbekannte Werte werden nicht erfunden.
+fn team_color(id: i32) -> Option<char> {
+    const LEGACY: &[u8; 22] = b"0123456789abcdefklmnor";
+    usize::try_from(id)
+        .ok()
+        .and_then(|index| LEGACY.get(index).copied())
+        .map(char::from)
 }
 
 #[cfg(test)]
@@ -408,26 +394,47 @@ mod tests {
         inner.teams.insert(
             "t1".to_string(),
             Team {
-                prefix: "Rang: ".to_string(),
-                suffix: " ★".to_string(),
+                prefix: "\u{a7}aRang: ".to_string(),
+                suffix: " \u{a7}6*".to_string(),
+                color: None,
             },
         );
-        inner.membership.insert("§a".to_string(), "t1".to_string());
+        inner
+            .membership
+            .insert("hugo".to_string(), "t1".to_string());
         inner
     }
 
     /// Auf den meisten Servern ist der Eintrag selbst ein unsichtbarer Platzhalter; der Text
-    /// steckt in Präfix und Suffix des Teams.
+    /// steckt in Präfix und Suffix des Teams – **mit** den Farbcodes des Servers.
     #[test]
     fn zeile_kommt_aus_praefix_und_suffix() {
         let inner = inner_with_team();
         let score = Score {
             value: 3,
             display: None,
+            number: None,
         };
-        assert_eq!(line_for(&inner, "§a", &score), "Rang: §a ★");
+        assert_eq!(line_for(&inner, "hugo", &score), "§aRang: hugo §6*");
         // Ohne Team bleibt der Eintrag stehen.
         assert_eq!(line_for(&inner, "ohne", &score), "ohne");
+    }
+
+    /// Die gespeicherte Zeile muss sich sowohl einfärben als auch entfärben lassen.
+    #[test]
+    fn zeile_laesst_sich_einfaerben_und_entfaerben() {
+        let inner = inner_with_team();
+        let line = line_for(
+            &inner,
+            "hugo",
+            &Score {
+                value: 1,
+                display: None,
+                number: None,
+            },
+        );
+        assert_eq!(nbt::strip_legacy(&line), "Rang: hugo *");
+        assert!(nbt::legacy_to_ansi(&line).contains("\x1b[92m"));
     }
 
     /// Schickt der Server einen fertigen Anzeigetext, gilt der – Team hin oder her.
@@ -437,20 +444,27 @@ mod tests {
         let score = Score {
             value: 3,
             display: Some("fertige Zeile".to_string()),
+            number: None,
         };
-        assert_eq!(line_for(&inner, "§a", &score), "fertige Zeile");
+        assert_eq!(line_for(&inner, "hugo", &score), "fertige Zeile");
     }
 
-    /// Das Bitfeld der Tab-Liste ist in allen unterstützten Versionen genau ein Byte breit.
     #[test]
-    fn bitfeld_der_tabliste_ist_ein_byte() {
-        for p in crate::proto::PROTOCOLS {
-            assert_eq!(
-                p.extra.player_info_actions.div_ceil(8),
-                1,
-                "unerwartete Bitfeldbreite in {}",
-                p.name
-            );
-        }
+    fn zahlenformat_kann_faerben_ersetzen_oder_ausblenden() {
+        let score = Score {
+            value: 12,
+            display: None,
+            number: None,
+        };
+        assert_eq!(number_for(&score, None).as_deref(), Some("§c12"));
+        assert_eq!(
+            number_for(&score, Some(&NumberFormat::Styled("§6§l".into()))).as_deref(),
+            Some("§6§l12")
+        );
+        assert_eq!(
+            number_for(&score, Some(&NumberFormat::Fixed("§bX".into()))).as_deref(),
+            Some("§bX")
+        );
+        assert!(number_for(&score, Some(&NumberFormat::Blank)).is_none());
     }
 }
