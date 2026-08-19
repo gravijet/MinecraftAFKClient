@@ -121,7 +121,7 @@ fn pov_bild_hat_das_vereinbarte_format() {
 
     // 20 Bildzeilen ergeben 10 Zeichenzeilen à 40 Zellen. Auf alle zehn **vollständig gelesenen**
     // warten: sonst prüft der Test eine Zeile, von der erst ein Teil aus der Pipe da ist.
-    let (rows, log) = common::wait_for_rows(&err, TIMEOUT, 10, |line| {
+    let (rows, log) = common::wait_for_frame(&err, TIMEOUT, 10, "POV  x=", |line| {
         line.matches('\u{2580}').count() > 1
     });
     assert!(
@@ -164,7 +164,7 @@ fn pov_zeigt_den_boden() {
 
     // Ohne Farbe ist jede Bildzeile eine Zeichenzeile: 20 Stück. Auf alle **vollständig
     // gelesenen** warten – sonst wäre die „unterste" Zeile in Wahrheit die Bildmitte.
-    let (rows, log) = common::wait_for_rows(&err, TIMEOUT, 20, |line| {
+    let (rows, log) = common::wait_for_frame(&err, TIMEOUT, 20, "POV  x=", |line| {
         line.len() == 40 && line.chars().all(|c| " .:-=+*#%@".contains(c))
     });
     assert!(
@@ -211,10 +211,10 @@ fn pov_liest_alle_chunks() {
 
         let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
         assert!(joined, "{}: kein Beitritt. Ausgabe:\n{}", ids.name, log);
-        std::thread::sleep(Duration::from_millis(600));
-        let _ = writeln!(stdin, ":pov info");
 
-        let (found, log) = common::wait_for(&err, TIMEOUT, "25 Chunks");
+        // Nachfragen statt einmal raten: `:pov info` beantwortet den Stand von jetzt, und der
+        // Client kann die Chunks noch einlesen.
+        let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 Chunks");
         assert!(
             found,
             "{}: die 25 Chunks wurden nicht gelesen. Ausgabe:\n{}",
@@ -260,8 +260,7 @@ fn gemischte_palette_stuerzt_nicht_ab() {
         child.try_wait().expect("Status").is_none(),
         "der Client ist abgestürzt"
     );
-    let _ = writeln!(stdin, ":pov info");
-    let (found, log) = common::wait_for(&err, TIMEOUT, "25 Chunks");
+    let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 Chunks");
     assert!(found, "die Chunks fehlen. Ausgabe:\n{}", log);
     let _ = child.kill();
 }
@@ -286,14 +285,16 @@ fn weit_entfernte_chunks_fallen_weg() {
 
     let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
     assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
-    std::thread::sleep(Duration::from_secs(1));
-    let _ = writeln!(stdin, ":pov info");
 
-    let (found, log) = common::wait_for(&err, TIMEOUT, "Chunks ·");
-    assert!(found, "keine Auskunft. Ausgabe:\n{}", log);
+    // Erst fragen, wenn alle 441 Chunks durch sind – sonst zählt die Auskunft einen Zwischenstand.
+    // Nach dem Aufräumen bleiben genau 169 übrig, also darauf warten.
+    let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "169 Chunks");
+    assert!(found, "keine Auskunft über 169 Chunks. Ausgabe:\n{}", log);
+    // Die *letzte* Auskunft zählt: durch das Nachfragen stehen frühere Zwischenstände mit im Log.
     let line = log
         .lines()
-        .find(|line| line.contains("Chunks ·"))
+        .filter(|line| line.contains("Chunks ·"))
+        .next_back()
         .expect("Auskunftszeile");
     let chunks: usize = line
         .split_whitespace()

@@ -585,18 +585,40 @@ pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
 }
 
 /// Liest einen Ausgabestrom stückweise in einen Kanal – in einem eigenen Thread.
+///
+/// Ein angebrochenes Zeichen wird dabei aufgehoben und vorn an den nächsten Block gehängt.
+/// Ohne das war der Leser selbst die Fehlerquelle: das Halbblockzeichen `▀` der Live-Ansicht ist
+/// **drei Bytes** lang, und ein Lesevorgang liefert nur, was gerade in der Pipe steht. Endete er
+/// mitten im Zeichen, machte `from_utf8_lossy` daraus Ersatzzeichen – im Bildformat-Test fehlten
+/// dann Zellen (`left: 34, right: 40`), obwohl der Client ein völlig korrektes Bild geschickt
+/// hatte. Genau daran ist der Build auf `main` gescheitert.
 pub fn collect<R: Read + Send + 'static>(mut reader: R) -> Receiver<String> {
     let (tx, rx) = channel();
     thread::spawn(move || {
         let mut buffer = [0u8; 8192];
+        let mut rest: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => {
+                    if !rest.is_empty() {
+                        let _ = tx.send(String::from_utf8_lossy(&rest).into_owned());
+                    }
+                    break;
+                }
                 Ok(n) => {
-                    if tx
-                        .send(String::from_utf8_lossy(&buffer[..n]).into_owned())
-                        .is_err()
-                    {
+                    rest.extend_from_slice(&buffer[..n]);
+                    let good = match std::str::from_utf8(&rest) {
+                        Ok(_) => rest.len(),
+                        Err(e) => match e.error_len() {
+                            // Wirklich ungültige Bytes: mitnehmen, sonst käme der Puffer nie leer.
+                            Some(bad) => e.valid_up_to() + bad,
+                            // Nur abgeschnitten: den Anfang fürs nächste Mal aufheben.
+                            None => e.valid_up_to(),
+                        },
+                    };
+                    let text = String::from_utf8_lossy(&rest[..good]).into_owned();
+                    rest.drain(..good);
+                    if tx.send(text).is_err() {
                         break;
                     }
                 }
@@ -625,27 +647,32 @@ pub fn wait_for(rx: &Receiver<String>, timeout: Duration, needle: &str) -> (bool
     }
 }
 
-/// Wartet, bis `count` **vollständig gelesene** Zeilen `check` erfüllen, und gibt sie zurück.
+/// Wartet auf ein **vollständiges** Bild: eine Kopfzeile mit `header` und dahinter mindestens
+/// `count` lückenlos folgende Zeilen, die `check` erfüllen.
 ///
-/// Warum nicht einfach [`wait_for`]: das kehrt zurück, sobald sein Suchtext auftaucht. Bei einem
-/// POV-Bild ist das die Kopfzeile – der Rest des Bildes steckt dann womöglich noch in der Pipe,
-/// denn ein Lesevorgang liefert nur, was gerade da ist. Eine halb gelesene Bildzeile hat zu
-/// wenige Zellen, und genau daran ist der Bildformat-Test in der CI zufällig gescheitert
-/// (`left: 34, right: 40`). Hier zählen deshalb nur Zeilen, hinter denen bereits ein
-/// Zeilenumbruch gelesen wurde.
-pub fn wait_for_rows(
+/// Warum so umständlich und nicht einfach [`wait_for`]:
+///
+/// * `wait_for` kehrt zurück, sobald sein Suchtext auftaucht, und **verwirft dabei alles, was im
+///   selben Block noch dahinter stand**. Die POV-Bauformen starten die Ansicht schon beim
+///   Beitritt – wartet ein Test also erst auf „im Spiel", ist der Anfang des ersten Bildes
+///   bereits weg, und die erste sichtbare Zeile ist in Wahrheit das *Ende* einer Bildzeile.
+/// * Ein Lesevorgang liefert nur, was gerade in der Pipe steht. Die letzte Zeile im Puffer ist
+///   deshalb oft erst halb da.
+///
+/// Beides ergab zu wenige Zellen (`left: 34, right: 40`) und hat den Build auf `main` zum
+/// Scheitern gebracht – am Test, nicht am Client. Deshalb wird hier an der Kopfzeile verankert
+/// und es zählen nur Zeilen, hinter denen bereits ein Zeilenumbruch gelesen wurde.
+pub fn wait_for_frame(
     rx: &Receiver<String>,
     timeout: Duration,
     count: usize,
+    header: &str,
     check: impl Fn(&str) -> bool,
 ) -> (Vec<String>, String) {
     let deadline = Instant::now() + timeout;
     let mut out = String::new();
     loop {
-        let rows: Vec<String> = complete_lines(&out)
-            .filter(|line| check(line))
-            .map(str::to_string)
-            .collect();
+        let rows = frame_rows(&out, count, header, &check);
         if rows.len() >= count {
             return (rows, out);
         }
@@ -660,10 +687,79 @@ pub fn wait_for_rows(
     }
 }
 
+/// Die Zeilen des ersten Bildes, das hinter einer Kopfzeile vollständig vorliegt.
+fn frame_rows(
+    text: &str,
+    count: usize,
+    header: &str,
+    check: &impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let lines: Vec<&str> = complete_lines(text).collect();
+    for (at, line) in lines.iter().enumerate() {
+        if !line.contains(header) {
+            continue;
+        }
+        let rows: Vec<String> = lines[at + 1..]
+            .iter()
+            .take_while(|line| check(line))
+            .map(|line| line.to_string())
+            .collect();
+        if rows.len() >= count {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
 /// Nur die Zeilen, hinter denen schon ein Zeilenumbruch steht – der Rest ist noch unterwegs.
 fn complete_lines(text: &str) -> std::str::Lines<'_> {
     let end = text.rfind('\n').map_or(0, |at| at + 1);
     text[..end].lines()
+}
+
+/// Einen örtlichen Befehl so lange wiederholen, bis `needle` in der Ausgabe auftaucht.
+///
+/// `:pov info` beantwortet den **Stand von jetzt**. Wird der Befehl nur einmal geschickt und ist
+/// der Client gerade noch beim Einlesen der Chunks, steht in der einen Antwort eine kleinere Zahl
+/// – und der Test wartet danach vergeblich auf eine Zahl, die nie wieder kommt. Die Auskunft ist
+/// billig und ohne Nebenwirkung, deshalb wird hier einfach nachgefragt, bis der Stand da ist.
+pub fn poll_command(
+    stdin: &mut impl Write,
+    rx: &Receiver<String>,
+    timeout: Duration,
+    command: &str,
+    needle: &str,
+) -> (bool, String) {
+    let deadline = Instant::now() + timeout;
+    let mut out = String::new();
+    loop {
+        if out.contains(needle) {
+            return (true, out);
+        }
+        if writeln!(stdin, "{}", command).is_err() || stdin.flush().is_err() {
+            return (out.contains(needle), out);
+        }
+        // Eine Runde lang mitlesen, dann noch einmal fragen.
+        let until = Instant::now() + Duration::from_millis(500);
+        while let Some(left) = until.checked_duration_since(Instant::now()) {
+            if deadline < Instant::now() {
+                return (out.contains(needle), out);
+            }
+            match rx.recv_timeout(left) {
+                Ok(chunk) => {
+                    out.push_str(&chunk);
+                    if out.contains(needle) {
+                        return (true, out);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(_) => return (out.contains(needle), out),
+            }
+        }
+        if deadline < Instant::now() {
+            return (out.contains(needle), out);
+        }
+    }
 }
 
 /// Wartet auf eine Rückmeldung des Testservers, die `check` erfüllt.
