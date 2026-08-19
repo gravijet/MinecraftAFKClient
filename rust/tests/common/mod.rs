@@ -625,6 +625,47 @@ pub fn wait_for(rx: &Receiver<String>, timeout: Duration, needle: &str) -> (bool
     }
 }
 
+/// Wartet, bis `count` **vollständig gelesene** Zeilen `check` erfüllen, und gibt sie zurück.
+///
+/// Warum nicht einfach [`wait_for`]: das kehrt zurück, sobald sein Suchtext auftaucht. Bei einem
+/// POV-Bild ist das die Kopfzeile – der Rest des Bildes steckt dann womöglich noch in der Pipe,
+/// denn ein Lesevorgang liefert nur, was gerade da ist. Eine halb gelesene Bildzeile hat zu
+/// wenige Zellen, und genau daran ist der Bildformat-Test in der CI zufällig gescheitert
+/// (`left: 34, right: 40`). Hier zählen deshalb nur Zeilen, hinter denen bereits ein
+/// Zeilenumbruch gelesen wurde.
+pub fn wait_for_rows(
+    rx: &Receiver<String>,
+    timeout: Duration,
+    count: usize,
+    check: impl Fn(&str) -> bool,
+) -> (Vec<String>, String) {
+    let deadline = Instant::now() + timeout;
+    let mut out = String::new();
+    loop {
+        let rows: Vec<String> = complete_lines(&out)
+            .filter(|line| check(line))
+            .map(str::to_string)
+            .collect();
+        if rows.len() >= count {
+            return (rows, out);
+        }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return (rows, out);
+        };
+        match rx.recv_timeout(left.min(Duration::from_millis(200))) {
+            Ok(chunk) => out.push_str(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return (rows, out),
+        }
+    }
+}
+
+/// Nur die Zeilen, hinter denen schon ein Zeilenumbruch steht – der Rest ist noch unterwegs.
+fn complete_lines(text: &str) -> std::str::Lines<'_> {
+    let end = text.rfind('\n').map_or(0, |at| at + 1);
+    text[..end].lines()
+}
+
 /// Wartet auf eine Rückmeldung des Testservers, die `check` erfüllt.
 pub fn wait_note(notes: &Receiver<Note>, timeout: Duration, check: impl Fn(&Note) -> bool) -> bool {
     let deadline = Instant::now() + timeout;

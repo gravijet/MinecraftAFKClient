@@ -119,25 +119,31 @@ fn pov_bild_hat_das_vereinbarte_format() {
     assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
     let _ = writeln!(stdin, ":pov live");
 
-    let (found, log) = common::wait_for(&err, TIMEOUT, "(:pov stop)");
-    assert!(found, "kein POV-Bild. Ausgabe:\n{}", log.escape_debug());
+    // 20 Bildzeilen ergeben 10 Zeichenzeilen à 40 Zellen. Auf alle zehn **vollständig gelesenen**
+    // warten: sonst prüft der Test eine Zeile, von der erst ein Teil aus der Pipe da ist.
+    let (rows, log) = common::wait_for_rows(&err, TIMEOUT, 10, |line| {
+        line.matches('\u{2580}').count() > 1
+    });
+    assert!(
+        rows.len() >= 10,
+        "kein vollständiges POV-Bild ({} von 10 Zeilen). Ausgabe:\n{}",
+        rows.len(),
+        log.escape_debug()
+    );
 
     assert!(log.contains("POV  x="), "Kopfzeile fehlt");
     assert!(
         log.contains("\u{1b}[38;2;") && log.contains("\u{1b}[48;2;"),
         "Vorder-/Hintergrundfarbe fehlen"
     );
-    assert!(log.contains('\u{2580}'), "Halbblock ▀ fehlt");
-    // 20 Bildzeilen ergeben 10 Zeichenzeilen à 40 Zellen.
-    let row = log
-        .lines()
-        .find(|line| line.matches('\u{2580}').count() > 1)
-        .unwrap_or("");
-    assert_eq!(
-        row.matches('\u{2580}').count(),
-        40,
-        "Zeilenbreite passt nicht zu --pov-size 40x20"
-    );
+    for (index, row) in rows.iter().take(10).enumerate() {
+        assert_eq!(
+            row.matches('\u{2580}').count(),
+            40,
+            "Zeile {} passt nicht zu --pov-size 40x20",
+            index
+        );
+    }
 
     let _ = child.kill();
 }
@@ -156,21 +162,25 @@ fn pov_zeigt_den_boden() {
     assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
     let _ = writeln!(stdin, ":pov live");
 
-    let (found, log) = common::wait_for(&err, TIMEOUT, "(:pov stop)");
-    assert!(found, "kein POV-Bild. Ausgabe:\n{}", log);
+    // Ohne Farbe ist jede Bildzeile eine Zeichenzeile: 20 Stück. Auf alle **vollständig
+    // gelesenen** warten – sonst wäre die „unterste" Zeile in Wahrheit die Bildmitte.
+    let (rows, log) = common::wait_for_rows(&err, TIMEOUT, 20, |line| {
+        line.len() == 40 && line.chars().all(|c| " .:-=+*#%@".contains(c))
+    });
+    assert!(
+        rows.len() >= 20,
+        "kein vollständiges POV-Bild ({} von 20 Zeilen). Ausgabe:\n{}",
+        rows.len(),
+        log
+    );
     assert!(!log.contains('\u{1b}'), "ohne Farbe darf kein ANSI kommen");
 
-    let rows: Vec<&str> = log
-        .lines()
-        .filter(|line| line.len() == 40 && line.chars().all(|c| " .:-=+*#%@".contains(c)))
-        .collect();
-    assert!(rows.len() >= 10, "zu wenige Bildzeilen: {}", rows.len());
-    // Die untere Bildhälfte zeigt den Boden – dort darf nicht nur Himmel stehen.
-    let ground = rows[rows.len() - 1];
+    // Die unterste Zeile zeigt den Boden – dort darf nicht nur Himmel stehen.
+    let ground = &rows[19];
     assert!(
         ground.chars().any(|c| c != ' ' && c != '.'),
         "der Boden fehlt im Bild:\n{}",
-        rows.join("\n")
+        rows[..20].join("\n")
     );
 
     let _ = child.kill();
