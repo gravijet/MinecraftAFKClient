@@ -38,6 +38,40 @@ pub fn migrate() {
     }
 }
 
+/// Datei ersetzen, ohne sie je halb zu hinterlassen: erst vollständig daneben schreiben, dann
+/// an ihren Platz umbenennen.
+///
+/// `fs::write` kürzt die Zieldatei sofort und füllt sie erst danach. Wird der Client genau
+/// dazwischen beendet (Kill, Stromausfall, volle Platte), bleibt eine halbe Datei zurück – bei
+/// einem Konto heißt das: nur noch mit `--login` zu retten. Ein Umbenennen im selben Verzeichnis
+/// ist dagegen unteilbar; es liegt immer entweder der alte oder der neue Stand da.
+pub fn write_atomic(path: &std::path::Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut temporary = path.to_path_buf();
+    // Nicht `with_extension`: die Endung muss erhalten bleiben, damit ein liegengebliebener
+    // Rest niemals als Konto durchgeht (dort zählt genau die Endung `.json`).
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".neu");
+    temporary.set_file_name(name);
+
+    if std::fs::write(&temporary, text).is_err() {
+        return;
+    }
+    // Unter Windows scheitert `rename` auf eine vorhandene Datei – dort muss die alte zuerst weg.
+    // Das ist genau das Fenster, das es sonst gar nicht gäbe; es bleibt aber ungleich kleiner als
+    // ein vollständiger Schreibvorgang.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(path);
+    if std::fs::rename(&temporary, path).is_err() {
+        // Ließ sich nicht umbenennen (etwa über Dateisystemgrenzen hinweg): lieber direkt
+        // schreiben als gar nicht zu speichern.
+        let _ = std::fs::write(path, text);
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
 fn config_base() -> PathBuf {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(xdg) if !xdg.trim().is_empty() => PathBuf::from(xdg),
@@ -254,11 +288,45 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
         );
     }
     o.server = o.server.trim().to_string();
+    check_server(&o.server)?;
     for command in &mut o.commands {
         command.delay_seconds = join_delay;
     }
     Ok(Command::Run(Box::new(o)))
 }
+
+/// Serveradresse auf einen brauchbaren Port prüfen.
+///
+/// Zerlegt wird sie später in [`crate::client`]; dort ist ein unlesbarer Port stillschweigend
+/// zu 25565 geworden. Ein Tippfehler wie `mc.example.net:2556x` führte damit zu einer
+/// Verbindung auf einen ganz anderen Port – und zu einer Fehlersuche am falschen Ende.
+fn check_server(server: &str) -> Result<(), String> {
+    let port = if let Some(rest) = server.strip_prefix('[') {
+        // `[::1]:25565`: nur was hinter der schließenden Klammer steht, kann ein Port sein.
+        match rest.split_once(']') {
+            Some((_, rest)) => rest.strip_prefix(':'),
+            None => return Err(format!("Serveradresse ohne schließende Klammer: '{}'", server)),
+        }
+    } else if server.matches(':').count() > 1 {
+        None // nackte IPv6-Adresse – da ist kein Port dabei
+    } else {
+        server.rsplit_once(':').map(|(_, port)| port)
+    };
+
+    match port {
+        Some(port) if port.trim().parse::<u16>().is_err() => Err(format!(
+            "Server-Port ist keine Zahl zwischen 0 und 65535: '{}'. Beispiel: mc.example.net:25565",
+            port
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Grenzen der Live-Ansicht. Dieselben Werte prüft [`crate::pov`] noch einmal; hier stehen sie,
+/// damit ein unmöglicher Wunsch sofort eine klare Meldung bekommt statt still zurechtgebogen zu
+/// werden.
+const POV_WIDTH: std::ops::RangeInclusive<usize> = 24..=160;
+const POV_HEIGHT: std::ops::RangeInclusive<usize> = 12..=80;
 
 /// `--pov-size 160x80` (auch `160*80` oder `160 80`).
 fn parse_size(input: &str) -> Result<(usize, usize), String> {
@@ -267,12 +335,28 @@ fn parse_size(input: &str) -> Result<(usize, usize), String> {
         .split_once(['x', '*', ':'])
         .or_else(|| text.split_once(char::is_whitespace))
         .ok_or_else(|| format!("--pov-size braucht <breite>x<hoehe>, z. B. 160x80. Bekommen: '{}'", input))?;
-    let parse = |part: &str, what: &str| {
-        part.trim()
+    let parse = |part: &str, what: &str, range: std::ops::RangeInclusive<usize>| {
+        let value = part
+            .trim()
             .parse::<usize>()
-            .map_err(|_| format!("--pov-size: {} ist keine Zahl: '{}'", what, part))
+            .map_err(|_| format!("--pov-size: {} ist keine Zahl: '{}'", what, part))?;
+        // Nicht stillschweigend zurechtbiegen: wer 4000x3000 tippt, meint etwas anderes als
+        // 160x80 und soll das erfahren.
+        if !range.contains(&value) {
+            return Err(format!(
+                "--pov-size: {} muss zwischen {} und {} liegen, nicht {}.",
+                what,
+                range.start(),
+                range.end(),
+                value
+            ));
+        }
+        Ok(value)
     };
-    Ok((parse(width, "Breite")?, parse(height, "Hoehe")?))
+    Ok((
+        parse(width, "Breite", POV_WIDTH)?,
+        parse(height, "Hoehe", POV_HEIGHT)?,
+    ))
 }
 
 /// `--fakehost lobby.example.net` oder `--fakehost lobby.example.net:25565`.
@@ -292,6 +376,12 @@ fn parse_fakehost(input: &str) -> Result<(String, u16), String> {
                 .map_err(|_| format!("--fakehost: Port ist keine Zahl: '{}'", port))?,
             None => 0,
         };
+        // Dieselbe Prüfung wie unten: `[]` ist genauso wenig ein Name wie eine leere Angabe.
+        if host.trim().is_empty() {
+            return Err(
+                "--fakehost braucht einen Namen, z. B. --fakehost play.example.net".to_string(),
+            );
+        }
         return Ok((host, port));
     }
     if text.matches(':').count() > 1 {
@@ -413,6 +503,22 @@ mod tests {
     #[test]
     fn ohne_server_gibt_es_eine_fehlermeldung() {
         assert!(parse_args(&["--quiet"]).is_err());
+    }
+
+    /// Ein vertippter Port ist stillschweigend zu 25565 geworden – der Client verband sich dann
+    /// auf einen ganz anderen Port, und die Fehlersuche begann am falschen Ende.
+    #[test]
+    fn vertippter_port_wird_gemeldet() {
+        assert!(parse_args(&["mc.example.net:2556x"]).is_err());
+        assert!(parse_args(&["mc.example.net:"]).is_err());
+        assert!(parse_args(&["mc.example.net:99999"]).is_err());
+        assert!(parse_args(&["[::1"]).is_err());
+        // Gültige Schreibweisen bleiben gültig.
+        assert!(parse_args(&["mc.example.net"]).is_ok());
+        assert!(parse_args(&["mc.example.net:25566"]).is_ok());
+        assert!(parse_args(&["[::1]:25566"]).is_ok());
+        assert!(parse_args(&["[::1]"]).is_ok());
+        assert!(parse_args(&["::1"]).is_ok());
     }
 
     #[test]
@@ -566,6 +672,48 @@ mod tests {
         assert_eq!(options(&["x", "--pov", "aus"]).pov_autostart, Some(false));
         assert!(parse_args(&["x", "--pov-size", "gross"]).is_err());
         assert!(parse_args(&["x", "--pov", "vielleicht"]).is_err());
+    }
+
+    /// Eine unmögliche Bildgröße wurde bisher stillschweigend auf das Erlaubte gestaucht – wer
+    /// `4000x3000` tippt, meinte aber nicht `160x80` und soll das erfahren.
+    #[test]
+    fn pov_groesse_wird_gegen_die_grenzen_geprueft() {
+        assert!(parse_args(&["x", "--pov-size", "4000x3000"]).is_err());
+        assert!(parse_args(&["x", "--pov-size", "0x0"]).is_err());
+        assert!(parse_args(&["x", "--pov-size", "23x40"]).is_err());
+        assert!(parse_args(&["x", "--pov-size", "64x81"]).is_err());
+        // Genau auf den Grenzen bleibt es gültig.
+        assert_eq!(options(&["x", "--pov-size", "24x12"]).pov_size, Some((24, 12)));
+        assert_eq!(options(&["x", "--pov-size", "160x80"]).pov_size, Some((160, 80)));
+    }
+
+    /// Der Klammer-Zweig hat einen leeren Namen bisher durchgelassen.
+    #[test]
+    fn fakehost_ohne_namen_wird_abgelehnt() {
+        assert!(parse_args(&["x", "--fakehost", "[]"]).is_err());
+        assert!(parse_args(&["x", "--fakehost", "[]:25565"]).is_err());
+        assert!(parse_args(&["x", "--fakehost", "  "]).is_err());
+        // Eine echte IPv6-Adresse bleibt erlaubt.
+        assert_eq!(
+            options(&["x", "--fakehost", "[::1]:25566"]).fakehost,
+            Some(("::1".to_string(), 25566))
+        );
+    }
+
+    /// Ein Abbruch mitten im Schreiben darf keine halbe Datei hinterlassen: entweder steht der
+    /// alte Stand da oder der neue.
+    #[test]
+    fn atomares_schreiben_ersetzt_vollstaendig() {
+        let dir = std::env::temp_dir().join(format!("afk-test-{}", std::process::id()));
+        let file = dir.join("konto.json");
+        write_atomic(&file, "{\"a\":1}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"a\":1}");
+        // Ersetzen lässt eine vorhandene Datei nicht halb zurück.
+        write_atomic(&file, "{\"b\":2}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"b\":2}");
+        // Und die Zwischendatei ist wieder weg.
+        assert!(!dir.join("konto.json.neu").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

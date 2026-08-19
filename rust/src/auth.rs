@@ -384,15 +384,14 @@ impl Account {
         Ok(())
     }
 
+    /// Konto speichern. Unteilbar, damit ein Abbruch mitten im Schreiben keine halbe Kontodatei
+    /// hinterlässt – die ließe sich nur noch mit `--login` retten (siehe [`crate::options::write_atomic`]).
     fn save(&self) {
         if self.file.as_os_str().is_empty() {
             return;
         }
-        if let Some(parent) = self.file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(text) = serde_json::to_string_pretty(&self.json) {
-            let _ = std::fs::write(&self.file, text);
+            crate::options::write_atomic(&self.file, &text);
         }
     }
 }

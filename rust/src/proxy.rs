@@ -9,7 +9,16 @@
 
 use base64::Engine;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
+
+/// So lange darf der Proxy für den TCP-Aufbau und für jede Antwort im Handshake brauchen.
+///
+/// Ohne diese Grenzen hängt ein Proxy, der die Verbindung annimmt und dann schweigt, den
+/// Netz-Thread **unbegrenzt** auf: `TcpStream::connect` kennt von sich aus kein Zeitlimit, und
+/// ein frischer Socket hat weder Lese- noch Schreib-Zeitablauf. Der Client käme dann weder ins
+/// Spiel noch je zu einer Fehlermeldung.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Ein Proxy aus `--proxy`.
 #[derive(Clone)]
@@ -60,17 +69,31 @@ impl Proxy {
             None => (None, rest),
         };
 
-        let (host, port) = match address.rsplit_once(':') {
-            Some((host, port)) => (
-                host,
-                port.trim()
-                    .parse::<u16>()
-                    .map_err(|_| format!("Proxy-Port ist keine Zahl: '{}'", port))?,
-            ),
-            None => (
-                address,
-                if kind == Kind::Socks5 { 1080 } else { 8080 },
-            ),
+        let default_port = if kind == Kind::Socks5 { 1080 } else { 8080 };
+        let address = address.trim();
+        let number = |port: &str| {
+            port.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("Proxy-Port ist keine Zahl: '{}'", port))
+        };
+
+        // `[::1]:1080` und eine nackte IPv6-Adresse dürfen nicht am Doppelpunkt zerfallen – und
+        // die Klammern müssen weg, sonst findet die Namensauflösung die Adresse nicht.
+        let (host, port) = if let Some(rest) = address.strip_prefix('[') {
+            let (host, rest) = rest
+                .split_once(']')
+                .ok_or_else(|| format!("Proxy-Adresse ohne schließende Klammer: '{}'", address))?;
+            match rest.strip_prefix(':') {
+                Some(port) => (host, number(port)?),
+                None => (host, default_port),
+            }
+        } else if address.matches(':').count() > 1 {
+            (address, default_port) // nackte IPv6-Adresse
+        } else {
+            match address.rsplit_once(':') {
+                Some((host, port)) => (host, number(port)?),
+                None => (address, default_port),
+            }
         };
         if host.trim().is_empty() {
             return Err("Proxy ohne Adresse. Beispiel: --proxy socks5://192.0.2.1:1080".to_string());
@@ -97,14 +120,33 @@ impl Proxy {
     }
 
     /// Verbindet zum Proxy und lässt ihn zu `host:port` durchstellen.
+    ///
+    /// Aufbau und Handshake laufen unter [`HANDSHAKE_TIMEOUT`]; die endgültigen Zeitlimits der
+    /// Spielverbindung setzt danach [`crate::conn::connect`] auf demselben Socket.
     pub fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
-        let stream = TcpStream::connect((self.host.as_str(), self.port))?;
+        let stream = self.dial()?;
         stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
         match self.kind {
             Kind::Socks5 => self.socks5(&stream, host, port)?,
             Kind::Http => self.http_connect(&stream, host, port)?,
         }
         Ok(stream)
+    }
+
+    /// TCP-Verbindung zum Proxy mit Zeitlimit. `connect_timeout` braucht eine aufgelöste Adresse,
+    /// deshalb wird der Name hier selbst aufgelöst; scheitert jeder Kandidat, kommt der letzte
+    /// Fehler heraus.
+    fn dial(&self) -> io::Result<TcpStream> {
+        let mut last = None;
+        for address in (self.host.as_str(), self.port).to_socket_addrs()? {
+            match TcpStream::connect_timeout(&address, HANDSHAKE_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| fail("Proxy-Adresse ließ sich nicht auflösen")))
     }
 
     // ===================== SOCKS5 (RFC 1928) =====================
@@ -207,7 +249,9 @@ impl Proxy {
         let mut reader = BufReader::new(stream);
         let mut status = String::new();
         reader.read_line(&mut status)?;
-        if !status.contains(" 200") {
+        // Genau das zweite Feld der Statuszeile ist der Code. `contains(" 200")` ließe sich von
+        // einem Ablehnungsgrund täuschen, in dem zufällig „200" steht.
+        if status_code(&status) != Some(200) {
             return Err(fail(&format!(
                 "Proxy lehnt ab: {}",
                 status.trim_end().trim()
@@ -223,6 +267,11 @@ impl Proxy {
             }
         }
     }
+}
+
+/// Statuscode aus einer HTTP-Statuszeile (`HTTP/1.1 200 Connection established`).
+fn status_code(line: &str) -> Option<u16> {
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 fn socks5_error(code: u8) -> &'static str {
@@ -284,5 +333,36 @@ mod tests {
     fn unsinn_wird_abgelehnt() {
         assert!(Proxy::parse("ftp://192.0.2.1:21").is_err());
         assert!(Proxy::parse("socks5://192.0.2.1:abc").is_err());
+        assert!(Proxy::parse("socks5://").is_err());
+        assert!(Proxy::parse("socks5://[::1").is_err());
+    }
+
+    /// Eine IPv6-Adresse darf weder am Doppelpunkt zerfallen noch ihre Klammern behalten –
+    /// mit Klammern findet die Namensauflösung sie nicht.
+    #[test]
+    fn ipv6_adressen_bleiben_heil() {
+        let p = Proxy::parse("socks5://[::1]:1080").unwrap();
+        assert_eq!(p.host, "::1");
+        assert_eq!(p.port, 1080);
+
+        // Ohne Port gilt der Standardport der jeweiligen Art.
+        let p = Proxy::parse("socks5://[fe80::1]").unwrap();
+        assert_eq!(p.host, "fe80::1");
+        assert_eq!(p.port, 1080);
+        assert_eq!(Proxy::parse("http://[::1]").unwrap().port, 8080);
+
+        // Auch ohne Klammern darf eine nackte IPv6-Adresse nicht zerschnitten werden.
+        let p = Proxy::parse("socks5://fe80::1").unwrap();
+        assert_eq!(p.host, "fe80::1");
+        assert_eq!(p.port, 1080);
+    }
+
+    /// „200" irgendwo im Ablehnungsgrund darf nicht als Erfolg durchgehen.
+    #[test]
+    fn nur_der_echte_statuscode_zaehlt() {
+        assert_eq!(status_code("HTTP/1.1 200 Connection established\r\n"), Some(200));
+        assert_eq!(status_code("HTTP/1.1 403 Forbidden (rule 200)\r\n"), Some(403));
+        assert_eq!(status_code("HTTP/1.1 407 Proxy Authentication Required"), Some(407));
+        assert_eq!(status_code(""), None);
     }
 }

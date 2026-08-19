@@ -420,17 +420,45 @@ struct Scene {
     entities: Vec<Entity>,
 }
 
-impl Scene {
-    fn solid(&self, x: i32, y: i32, z: i32) -> Option<bool> {
-        self.chunks
-            .get(&(x.div_euclid(16), z.div_euclid(16)))
-            .map(|chunk| chunk.solid(x, y, z))
+/// Zugriff auf die Szene, der sich den zuletzt benutzten Chunk merkt.
+///
+/// Ein Strahl läuft fast immer etliche Blöcke am Stück durch denselben Chunk (der ist 16 Blöcke
+/// breit), und der nächste Bildpunkt beginnt ohnehin im selben. Ohne dieses Merken kostet **jeder
+/// durchquerte Block** einen Hashtabellen-Zugriff samt SipHash – bei 64x32 Bildpunkten, gut
+/// hundert Schritten je Strahl und acht Bildern je Sekunde sind das rund zwei Millionen
+/// Nachschlagevorgänge in der Sekunde, und damit der mit Abstand größte Einzelposten der
+/// Live-Ansicht. Mit dem Merker bleibt davon der Bruchteil an echten Chunk-Wechseln übrig.
+struct Cursor<'a> {
+    scene: &'a Scene,
+    at: Option<(i32, i32)>,
+    chunk: Option<&'a Chunk>,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(scene: &'a Scene) -> Cursor<'a> {
+        Cursor {
+            scene,
+            at: None,
+            chunk: None,
+        }
     }
 
-    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
-        self.chunks
-            .get(&(x.div_euclid(16), z.div_euclid(16)))
-            .map_or(0, |chunk| chunk.block(x, y, z))
+    fn chunk(&mut self, x: i32, z: i32) -> Option<&'a Chunk> {
+        let key = (x.div_euclid(16), z.div_euclid(16));
+        if self.at != Some(key) {
+            self.at = Some(key);
+            self.chunk = self.scene.chunks.get(&key).map(|chunk| chunk.as_ref());
+        }
+        self.chunk
+    }
+
+    /// `false` heißt „Luft **oder** Chunk nicht geladen" – durch beides läuft der Strahl weiter.
+    fn solid(&mut self, x: i32, y: i32, z: i32) -> bool {
+        self.chunk(x, z).is_some_and(|chunk| chunk.solid(x, y, z))
+    }
+
+    fn block(&mut self, x: i32, y: i32, z: i32) -> u32 {
+        self.chunk(x, z).map_or(0, |chunk| chunk.block(x, y, z))
     }
 }
 
@@ -1272,8 +1300,9 @@ fn render(
     // Horizont bei 90° Blickfeld sichtbar nach außen.
     let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
     let half_height = half_width * height as f64 / width as f64;
-    let vertical_fov = 2.0 * half_height.atan().to_degrees();
     let basis = camera_basis(position.3 as f64, position.4 as f64);
+    // Ein Merker für das ganze Bild: benachbarte Strahlen beginnen im selben Chunk.
+    let mut cursor = Cursor::new(scene);
 
     for py in 0..height {
         let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
@@ -1285,7 +1314,7 @@ fn render(
                 basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
                 basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
             ));
-            pixels[py * width + px] = match cast(scene, origin, direction) {
+            pixels[py * width + px] = match cast(&mut cursor, origin, direction) {
                 Some((state, distance, face)) => Pixel {
                     rgb: fog(block_color(state, face, distance), sky, distance),
                     depth: distance,
@@ -1299,9 +1328,8 @@ fn render(
     }
     overlay_entities(
         origin,
-        position.3 as f64,
-        position.4 as f64,
-        vertical_fov,
+        basis,
+        (half_width, half_height),
         width,
         height,
         &scene.entities,
@@ -1400,7 +1428,11 @@ fn view_direction(yaw: f64, pitch: f64) -> (f64, f64, f64) {
 }
 
 /// Voxel-DDA: höchstens ein Zugriff je durchquertem Block, nicht hunderte kleine Ray-Schritte.
-fn cast(scene: &Scene, origin: (f64, f64, f64), dir: (f64, f64, f64)) -> Option<(u32, f64, usize)> {
+fn cast(
+    cursor: &mut Cursor,
+    origin: (f64, f64, f64),
+    dir: (f64, f64, f64),
+) -> Option<(u32, f64, usize)> {
     let mut cell = (
         origin.0.floor() as i32,
         origin.1.floor() as i32,
@@ -1417,8 +1449,8 @@ fn cast(scene: &Scene, origin: (f64, f64, f64), dir: (f64, f64, f64)) -> Option<
     let mut face = 1usize;
     while distance <= MAX_DISTANCE {
         // Erst die billige Sichtprüfung; die Zustands-ID kostet einen Palettenzugriff mehr.
-        if scene.solid(cell.0, cell.1, cell.2) == Some(true) {
-            return Some((scene.block(cell.0, cell.1, cell.2), distance, face));
+        if cursor.solid(cell.0, cell.1, cell.2) {
+            return Some((cursor.block(cell.0, cell.1, cell.2), distance, face));
         }
         if next.0 <= next.1 && next.0 <= next.2 {
             cell.0 += step.0;
@@ -1507,36 +1539,51 @@ fn fog(color: (u8, u8, u8), sky: (u8, u8, u8), distance: f64) -> (u8, u8, u8) {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Entitäten über das gerasterte Bild legen.
+///
+/// Projiziert wird durch **dieselbe** Kamera wie die Strahlen: Richtung zur Entität in die
+/// Kamerabasis zerlegen und durch die Tiefe teilen. Vorher lief das über eine lineare
+/// Winkel-zu-Pixel-Rechnung – die stimmt nur genau in der Bildmitte und schob eine Entität bei
+/// 90° Blickfeld am Bildrand um mehrere Zeichen neben den Block, auf dem sie steht.
 fn overlay_entities(
     origin: (f64, f64, f64),
-    yaw: f64,
-    pitch: f64,
-    vertical_fov: f64,
+    basis: Basis,
+    half: (f64, f64),
     width: usize,
     height: usize,
     entities: &[Entity],
     pixels: &mut [Pixel],
 ) {
+    let (forward, right, up) = basis;
+    let (half_width, half_height) = half;
+    let dot = |a: (f64, f64, f64), b: (f64, f64, f64)| a.0 * b.0 + a.1 * b.1 + a.2 * b.2;
+
     for entity in entities {
-        let dx = entity.x - origin.0;
-        let dz = entity.z - origin.2;
-        let horizontal = (dx * dx + dz * dz).sqrt();
-        let distance = (horizontal * horizontal + (entity.y + 0.9 - origin.1).powi(2)).sqrt();
+        // Bezugspunkt ist die Körpermitte (Füße + 0,9); die Figur ist 1,8 Blöcke hoch.
+        let to = (
+            entity.x - origin.0,
+            entity.y + 0.9 - origin.1,
+            entity.z - origin.2,
+        );
+        let distance = dot(to, to).sqrt();
         if distance < 0.1 || distance > MAX_DISTANCE {
             continue;
         }
-        let target_yaw = (-dx).atan2(dz) * 180.0 / PI;
-        let target_pitch = -(entity.y + 0.9 - origin.1).atan2(horizontal) * 180.0 / PI;
-        let rel_yaw = wrap_degrees(target_yaw - yaw);
-        let rel_pitch = target_pitch - pitch;
-        if rel_yaw.abs() > HORIZONTAL_FOV * 0.55 || rel_pitch.abs() > vertical_fov * 0.65 {
+        // Tiefe entlang der Blickachse. Alles dahinter oder daneben ist nicht im Bild.
+        let depth = dot(to, forward);
+        if depth <= 1e-6 {
             continue;
         }
-        let center_x = ((rel_yaw / HORIZONTAL_FOV + 0.5) * width as f64) as isize;
-        let center_y = ((rel_pitch / vertical_fov + 0.5) * height as f64) as isize;
-        let entity_height = ((1.8 / distance) / (2.0 * (vertical_fov * PI / 360.0).tan())
-            * height as f64)
+        let sx = dot(to, right) / depth;
+        let sy = dot(to, up) / depth;
+        if sx.abs() > half_width * 1.5 || sy.abs() > half_height * 1.5 {
+            continue;
+        }
+
+        let center_x = ((sx / (2.0 * half_width) + 0.5) * width as f64 - 0.5).round() as isize;
+        let center_y = ((0.5 - sy / (2.0 * half_height)) * height as f64 - 0.5).round() as isize;
+        // Höhe in Pixeln: 1,8 Blöcke auf Tiefe `depth` ergeben 1,8/depth in Bildkoordinaten.
+        let entity_height = ((1.8 / depth) / (2.0 * half_height) * height as f64)
             .round()
             .clamp(1.0, height as f64) as isize;
         let entity_width = (entity_height / 3).max(1);
@@ -1558,17 +1605,6 @@ fn overlay_entities(
             }
         }
     }
-}
-
-fn wrap_degrees(mut value: f64) -> f64 {
-    value %= 360.0;
-    if value > 180.0 {
-        value -= 360.0;
-    }
-    if value <= -180.0 {
-        value += 360.0;
-    }
-    value
 }
 
 #[cfg(test)]
@@ -1620,6 +1656,102 @@ mod tests {
                 assert!(right.0 < -0.999);
             }
         }
+    }
+
+    /// Entitäten müssen durch **dieselbe** Kamera projiziert werden wie die Strahlen: Setzt man
+    /// eine genau auf den Strahl eines Bildpunkts, muss sie auch auf diesem Bildpunkt landen.
+    /// Die frühere lineare Winkelrechnung stimmte nur in der Bildmitte und schob eine Entität am
+    /// Rand um mehrere Zeichen neben den Block, auf dem sie steht.
+    #[test]
+    fn entitaeten_landen_auf_dem_strahl_ihres_bildpunkts() {
+        let (width, height) = (64usize, 32usize);
+        let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
+        let half_height = half_width * height as f64 / width as f64;
+        let origin = (100.5, 70.0, -40.25);
+
+        for (yaw, pitch) in [(0.0, 0.0), (37.0, -12.0), (-140.0, 25.0)] {
+            let basis = camera_basis(yaw, pitch);
+            // Bewusst auch die vier Ecken: dort war der Fehler am größten.
+            for (px, py) in [(0usize, 0usize), (63, 0), (0, 31), (63, 31), (32, 16), (10, 25)] {
+                let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
+                let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
+                let dir = normalize((
+                    basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
+                    basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
+                    basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
+                ));
+                let away = 20.0;
+                let entity = Entity {
+                    x: origin.0 + dir.0 * away,
+                    // `overlay_entities` rechnet ab Körpermitte (Füße + 0,9).
+                    y: origin.1 + dir.1 * away - 0.9,
+                    z: origin.2 + dir.2 * away,
+                    player: true,
+                };
+                let mut pixels = vec![
+                    Pixel {
+                        rgb: (0, 0, 0),
+                        depth: MAX_DISTANCE
+                    };
+                    width * height
+                ];
+                overlay_entities(
+                    origin,
+                    basis,
+                    (half_width, half_height),
+                    width,
+                    height,
+                    &[entity],
+                    &mut pixels,
+                );
+                assert_eq!(
+                    pixels[py * width + px].rgb,
+                    (70, 245, 255),
+                    "Blick {}/{}: Entität auf dem Strahl von {}/{} traf ihn nicht",
+                    yaw,
+                    pitch,
+                    px,
+                    py
+                );
+            }
+        }
+    }
+
+    /// Was hinter der Kamera steht, darf nicht im Bild auftauchen – die alte Rechnung über den
+    /// Neigungswinkel konnte einen Punkt im Rücken vorn einblenden.
+    #[test]
+    fn entitaeten_hinter_der_kamera_bleiben_draussen() {
+        let (width, height) = (32usize, 16usize);
+        let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
+        let half_height = half_width * height as f64 / width as f64;
+        let basis = camera_basis(0.0, 0.0); // Blick nach Süden (+Z)
+        let origin = (0.0, 64.0, 0.0);
+        let entity = Entity {
+            x: 0.0,
+            y: 63.1,
+            z: -8.0, // genau im Rücken
+            player: false,
+        };
+        let mut pixels = vec![
+            Pixel {
+                rgb: (0, 0, 0),
+                depth: MAX_DISTANCE
+            };
+            width * height
+        ];
+        overlay_entities(
+            origin,
+            basis,
+            (half_width, half_height),
+            width,
+            height,
+            &[entity],
+            &mut pixels,
+        );
+        assert!(
+            pixels.iter().all(|p| p.rgb == (0, 0, 0)),
+            "eine Entität hinter der Kamera wurde gezeichnet"
+        );
     }
 
     #[test]
@@ -1791,6 +1923,105 @@ mod tests {
         chunk.set_block(3, 4, 5, 0);
         assert_eq!(chunk.block(3, 4, 5), 0);
         assert!(!chunk.solid(3, 4, 5));
+    }
+
+    /// Ein Chunk mit Boden in Abschnitt 4 – nur für den Messlauf unten.
+    fn ground_chunk() -> Arc<Chunk> {
+        let mut section = Section::empty();
+        // Die untersten beiden Schichten des Abschnitts füllen (y = 0 und 1).
+        for index in 0..512 {
+            section.set(index, 1);
+        }
+        let mut sections: Vec<Option<Arc<Section>>> = vec![None; 24];
+        sections[4] = Some(Arc::new(section));
+        Arc::new(Chunk {
+            min_section: -4,
+            sections,
+        })
+    }
+
+    /// Messlauf statt Behauptung: wie lange braucht ein Bild wirklich?
+    ///
+    /// Läuft nicht im normalen Testlauf mit – die Zahl hängt vom Rechner ab. Aufruf:
+    /// `cargo test --features ultra -- --ignored --nocapture bildrate`
+    #[test]
+    #[ignore]
+    fn messlauf_bildrate() {
+        // 13x13 Chunks – genau so viele behält die Ansicht nach dem Aufräumen.
+        let mut chunks = HashMap::new();
+        for x in -6..=6 {
+            for z in -6..=6 {
+                chunks.insert((x, z), ground_chunk());
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+        };
+        let position = (8.0, 18.0, 8.0, 30.0f32, -10.0f32);
+
+        for (width, height) in [(64usize, 32usize), (160, 80)] {
+            // Einmal warmlaufen, damit die Messung nicht den ersten Zugriff mitzählt.
+            let _ = render(&scene, position, width, height, true);
+            let runs = 100;
+            let started = Instant::now();
+            for _ in 0..runs {
+                let _ = render(&scene, position, width, height, true);
+            }
+            let each = started.elapsed() / runs;
+            println!(
+                "{}x{}: {:?} je Bild  ->  {:.0} Bilder/s möglich",
+                width,
+                height,
+                each,
+                1.0 / each.as_secs_f64()
+            );
+        }
+    }
+
+    /// Der Chunk-Merker darf am Ergebnis nichts ändern – er spart nur Nachschlagevorgänge.
+    /// Deshalb hier dieselbe Szene zweimal: einmal Block für Block direkt aus der Hashtabelle,
+    /// einmal über den Merker, wie ihn der Strahl benutzt.
+    #[test]
+    fn merker_liefert_dieselben_bloecke_wie_die_hashtabelle() {
+        let mut chunks = HashMap::new();
+        for x in -2..=2 {
+            for z in -2..=2 {
+                chunks.insert((x, z), ground_chunk());
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+        };
+        let mut cursor = Cursor::new(&scene);
+        // Quer durch mehrere Chunks und auch daneben, wo keiner geladen ist.
+        for x in -40i32..40 {
+            for z in [-33i32, -16, -1, 0, 1, 15, 40] {
+                for y in [-64i32, 0, 1, 2, 300] {
+                    let direct = scene
+                        .chunks
+                        .get(&(x.div_euclid(16), z.div_euclid(16)))
+                        .map(|chunk| (chunk.solid(x, y, z), chunk.block(x, y, z)));
+                    assert_eq!(
+                        cursor.solid(x, y, z),
+                        direct.map(|(solid, _)| solid).unwrap_or(false),
+                        "solid bei {}/{}/{}",
+                        x,
+                        y,
+                        z
+                    );
+                    assert_eq!(
+                        cursor.block(x, y, z),
+                        direct.map(|(_, block)| block).unwrap_or(0),
+                        "block bei {}/{}/{}",
+                        x,
+                        y,
+                        z
+                    );
+                }
+            }
+        }
     }
 
     /// Der Decoder bekommt vom Server beliebige Bytes. Er darf daran nie in Panik geraten –

@@ -142,6 +142,11 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 None
             };
             let number = read_optional_number_format(r)?;
+            // Auch die Zahl der *Ziele* deckeln: ohne das legte ein Server, der Punkte für immer
+            // neue Zielnamen schickt, mit jedem Paket eine weitere Tabelle an.
+            if inner.scores.len() >= MAX_ENTRIES && !inner.scores.contains_key(&objective) {
+                return Ok(());
+            }
             let entries = inner.scores.entry(objective).or_default();
             if entries.len() < MAX_ENTRIES || entries.contains_key(&owner) {
                 entries.insert(
@@ -306,13 +311,17 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
         .map(|data| data.title.as_str())
         .unwrap_or(objective);
 
-    // Die Seitenleiste ist nach Punktzahl absteigend sortiert – genau wie im Spiel.
-    let mut lines: Vec<(i32, String, Option<String>)> = match inner.scores.get(objective) {
+    // Die Seitenleiste ist nach Punktzahl absteigend sortiert – genau wie im Spiel. Bei gleicher
+    // Punktzahl entscheidet der Eintragsname (auch das macht Vanilla so). Ohne dieses zweite
+    // Kriterium käme die Reihenfolge aus der Hashtabelle und die Zeilen sprängen bei jedem
+    // `:board` neu durcheinander.
+    let mut lines: Vec<(i32, &str, String, Option<String>)> = match inner.scores.get(objective) {
         Some(entries) => entries
             .iter()
             .map(|(entry, score)| {
                 (
                     score.value,
+                    entry.as_str(),
                     line_for(&inner, entry, score),
                     number_for(score, objective_data.and_then(|data| data.number.as_ref())),
                 )
@@ -320,7 +329,7 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
             .collect(),
         None => Vec::new(),
     };
-    lines.sort_by(|a, b| b.0.cmp(&a.0));
+    lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     lines.truncate(MAX_LINES);
 
     console.print("");
@@ -328,7 +337,7 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
     if lines.is_empty() {
         console.print(&console.paint(GRAY, "    (keine Zeilen)"));
     }
-    for (_, text, number) in &lines {
+    for (_, _, text, number) in &lines {
         let number = number.as_deref().map(|text| console.text(text));
         console.print(&match number {
             Some(number) => format!("    {}  {}", console.text(text), number),
@@ -337,7 +346,7 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
     }
 
     console.event("board", &format!("titel {}", title));
-    for (value, text, number) in &lines {
+    for (value, _, text, number) in &lines {
         console.event(
             "board",
             &format!(
@@ -447,6 +456,26 @@ mod tests {
             number: None,
         };
         assert_eq!(line_for(&inner, "hugo", &score), "fertige Zeile");
+    }
+
+    /// Gleiche Punktzahl kam bisher in der Reihenfolge der Hashtabelle heraus – die Zeilen
+    /// sprangen dadurch bei jedem `:board` neu durcheinander. Entscheiden muss der Eintragsname.
+    #[test]
+    fn gleiche_punktzahl_bleibt_in_fester_reihenfolge() {
+        fn sort(mut lines: Vec<(i32, &str)>) -> Vec<(i32, &str)> {
+            lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+            lines
+        }
+        let expected = vec![(9, "alpha"), (3, "aaa"), (3, "bbb"), (3, "ccc"), (1, "zzz")];
+        assert_eq!(
+            sort(vec![(3, "ccc"), (1, "zzz"), (3, "aaa"), (9, "alpha"), (3, "bbb")]),
+            expected
+        );
+        // Dieselbe Menge in anderer Ausgangsreihenfolge muss dasselbe Bild ergeben.
+        assert_eq!(
+            sort(vec![(3, "bbb"), (9, "alpha"), (3, "aaa"), (3, "ccc"), (1, "zzz")]),
+            expected
+        );
     }
 
     #[test]

@@ -195,16 +195,14 @@ impl Mover {
         self.settings.lock().unwrap().clone()
     }
 
-    /// Einstellungen ändern und sofort speichern.
+    /// Einstellungen ändern und sofort speichern (unteilbar – siehe
+    /// [`crate::options::write_atomic`]).
     fn edit(&self, change: impl FnOnce(&mut Settings)) {
         let mut settings = self.settings.lock().unwrap();
         change(&mut settings);
         settings.normalize();
-        if let Some(parent) = self.file.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(text) = serde_json::to_string_pretty(&*settings) {
-            let _ = std::fs::write(&self.file, text);
+            options::write_atomic(&self.file, &text);
         }
     }
 }

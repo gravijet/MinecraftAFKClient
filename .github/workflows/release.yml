@@ -62,19 +62,59 @@ jobs:
           \`afk-1.21.1.jar\`, \`afk-1.21.11.jar\`, \`afk-26.1.jar\` und \`afk-26.2.jar\`.
           Items-, POV-, Premium-Items- und Ultra-Varianten gibt es bewusst nur für Rust.
 
-          ## Wichtige Änderungen
+          ## Neu in 2.1.0 – Fehlerbehebungen und Tempo (nur Rust-Client)
 
-          - Tablist und Playerlist wurden vollständig aus allen Rust-Varianten entfernt.
+          **Behobene Fehler**
+
+          - **Proxy konnte den Client dauerhaft aufhängen.** \`--proxy\` hatte weder ein Zeitlimit
+            für den Verbindungsaufbau noch für die Antworten im SOCKS5-/HTTP-CONNECT-Handshake.
+            Ein Proxy, der die Verbindung annimmt und dann schweigt, blockierte den Netz-Thread
+            unbegrenzt: kein Beitritt, keine Fehlermeldung, kein Ende. Jetzt gilt dort ein
+            Zeitlimit von 20 Sekunden.
+          - **IPv6-Proxyadressen funktionierten nicht.** \`--proxy socks5://[::1]:1080\` behielt die
+            eckigen Klammern im Hostnamen, womit die Namensauflösung scheiterte; eine nackte
+            IPv6-Adresse zerfiel am Doppelpunkt.
+          - **Falsch platzierte Entities in der Live-POV.** Die Welt wurde perspektivisch
+            gezeichnet, Spieler und Mobs aber über eine lineare Winkelrechnung eingeblendet. Beides
+            stimmte nur in der Bildmitte überein – am Bildrand stand eine Figur mehrere Zeichen
+            neben dem Block, auf dem sie tatsächlich steht. Jetzt läuft beides durch dieselbe
+            Kamera; Entities hinter der Kamera bleiben zuverlässig draußen.
+          - **Scoreboard-Zeilen sprangen durcheinander.** Bei gleicher Punktzahl kam die
+            Reihenfolge aus einer Hashtabelle, \`:board\` zeigte die Zeilen also bei jedem Aufruf
+            neu gemischt. Jetzt entscheidet wie in Vanilla der Eintragsname.
+          - **Unbegrenzt wachsender Speicher beim Scoreboard.** Punkte für immer neue Zielnamen
+            legten je Paket eine weitere Tabelle an; gedeckelt war nur der Inhalt, nicht die Zahl
+            der Ziele.
+          - **Halbe Kontodatei nach einem Abbruch.** Konto- und \`movement.json\` wurden direkt
+            überschrieben. Ein Kill oder Stromausfall mitten im Schreiben hinterließ eine
+            abgeschnittene Datei – das Konto war nur noch per \`--login\` zu retten. Jetzt wird
+            daneben geschrieben und unteilbar umbenannt.
+          - **Stille Fehlgriffe bei Startargumenten.** Ein vertippter Port (\`mc.example.net:2556x\`)
+            wurde kommentarlos zu 25565, und \`--pov-size 4000x3000\` wurde stillschweigend auf
+            160x80 gestaucht. Beides meldet jetzt einen klaren Fehler. \`--fakehost "[]"\` und ein
+            Server-Transfer auf einen unmöglichen Port werden ebenfalls abgewiesen statt
+            beschnitten.
+          - Verstümmelte Startmeldung, wenn Java-Optionen mitgegeben wurden.
+
+          **Tempo und Verbrauch**
+
+          - **Live-POV rund 30–40 % schneller.** Der Raycaster schlug für jeden durchquerten Block
+            den Chunk neu in einer Hashtabelle nach – bei 64x32 Bildpunkten und gut hundert
+            Schritten je Strahl rund zwei Millionen Nachschlagevorgänge je Sekunde. Er merkt sich
+            den zuletzt benutzten Chunk jetzt. Gemessen: 4,5 → 3,1 ms je Bild bei 64x32 und
+            28 → 17 ms bei 160x80.
+          - **Gegenstandsnamen ohne Neusuche.** Die Vanilla-Namensliste wurde je Feld von vorn
+            durchlaufen; eine Doppelkiste kostete 90 Durchläufe über 40 KB Text, bei jeder
+            Änderung erneut. Jetzt entsteht einmalig ein Verzeichnis.
+
+          **Unverändert**
+
+          - Tablist und Playerlist gibt es in keiner Rust-Variante.
           - Nach einem Kick oder Verbindungsabbruch verbindet sich der Client nicht automatisch neu,
             sondern beendet sich mit Fehlerstatus. Nur ein ausdrücklich vom Server angeordneter
             Transfer auf einen Unterserver wird als Teil derselben Sitzung weiter befolgt.
-          - Items-Varianten zeigen \`:menu\`, \`:slot <nummer>\` und \`:inv\` mit echten
-            versionsabhängigen Vanilla-Namen sowie benutzerdefinierten Namen, \`§\`-Farbcodes und Lore.
-          - Premium und Ultra übertragen beim Scoreboard Titel, Anzeigenamen, Teamformatierung und
-            Zahlenformate einschließlich farbigem/festem Text oder ausgeblendeten Zahlen.
-          - Die POV decodiert live Chunks, Blockänderungen und Entities und raycastet aus der aktuellen
-            Kameraposition. Das Minecraft-Protokoll liefert keine fertigen Bildschirmbilder oder
-            Texturen; die headless POV ist deshalb eine farbige Voxelansicht im Terminal.
+          - Das Bildformat der Live-POV ist eine zugesagte Schnittstelle und bleibt, wie es ist.
+          - Die vier Java-Jars sind in diesem Release inhaltlich unverändert.
 
           Die beigefügte [RELEASE.md](https://github.com/${{ github.repository }}/releases/download/latest/RELEASE.md)
           enthält die ausführliche Auswahlhilfe, Bedienbefehle und Startbeispiele. Die vollständige

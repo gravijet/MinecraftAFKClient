@@ -128,7 +128,8 @@ fn run(options: Options) {
 fn warn_about_unused_options(console: &Console, options: &Options) {
     if !options.ignored.is_empty() {
         console.warn(&format!(
-            "{} gibt es nur im Java-Client; wird ignoriert (dieser Client verbindet nie              automatisch neu).",
+            "{} gibt es nur im Java-Client; wird ignoriert (dieser Client verbindet nie \
+             automatisch neu).",
             options.ignored.join(", ")
         ));
     }

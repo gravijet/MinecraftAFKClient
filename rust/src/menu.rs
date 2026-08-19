@@ -433,6 +433,14 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
         }
     };
 
+    // Übertragen wird die Feldnummer als Short. Alles außerhalb passt schon aufs Kabel nicht und
+    // käme beim Server als eine ganz andere Zahl an – dann lieber hier ablehnen.
+    if i16::try_from(slot).is_err() {
+        return shared
+            .console
+            .error(&format!("Feld {} gibt es in keinem Menü.", slot));
+    }
+
     let open = shared.extras.menu.open.lock().unwrap();
     let Some(current) = open.as_ref() else {
         return shared.console.error("Gerade ist kein Menü offen (:menu).");

@@ -1211,7 +1211,14 @@ fn cookie_response(shared: &Arc<Shared>, packet_id: i32, key: &str) -> Writer {
 /// verbindet sofort (ohne Backoff) zum neuen Ziel.
 fn transfer(shared: &Arc<Shared>, r: &mut Reader) -> Result<bool, String> {
     let host = r.string().map_err(|e| e.to_string())?;
-    let port = r.var_int().map_err(|e| e.to_string())? as u16;
+    // `as u16` hätte einen unsinnigen Port stillschweigend beschnitten – und wir wären dann
+    // auf irgendeinen Port gelaufen, statt den Fehler zu nennen.
+    let raw = r.var_int().map_err(|e| e.to_string())?;
+    let port = u16::try_from(raw)
+        .map_err(|_| format!("Server-Transfer mit unmöglichem Port: {}", raw))?;
+    if host.trim().is_empty() {
+        return Err("Server-Transfer ohne Zieladresse".to_string());
+    }
     shared
         .console
         .info(&format!("Server-Transfer zu {}:{}", host, port));
