@@ -348,7 +348,10 @@ fn ansi_of(style: &Style) -> String {
     let mut s = String::from("\x1b[0m");
     if let Some(c) = &style.color {
         if let Some(hex) = c.strip_prefix('#') {
-            if hex.len() == 6 {
+            // Erst auf ASCII-Hexziffern prüfen: `&hex[0..2]` schnitte sonst mitten durch ein
+            // Mehrbyte-Zeichen und risse den Client mit einem Panik-Abbruch weg. Sechs Bytes
+            // Text sind nicht zwingend sechs Zeichen – `"#a€bc"` reichte dafür schon.
+            if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 if let (Ok(r), Ok(g), Ok(b)) = (
                     u8::from_str_radix(&hex[0..2], 16),
                     u8::from_str_radix(&hex[2..4], 16),
@@ -539,6 +542,19 @@ mod tests {
         assert_eq!(render(&tag, Fmt::Plain), "Grün Rot");
         let ansi = render(&tag, Fmt::Ansi);
         assert!(ansi.contains("\x1b[92m") && ansi.contains("\x1b[91m"));
+    }
+
+    /// Eine Farbangabe aus sechs *Bytes*, aber nicht sechs ASCII-Zeichen, hat den Client
+    /// beim Zerlegen mitten durch ein Mehrbyte-Zeichen schneiden lassen – das beendete den
+    /// Prozess. Sie muss stattdessen einfach ungefärbt durchgehen.
+    #[test]
+    fn kaputte_farbangabe_stuerzt_nicht_ab() {
+        for farbe in ["#a\u{20ac}bc", "#\u{e4}\u{f6}\u{fc}", "#zzzzzz", "#12345", "#", "unsinn"] {
+            let tag = compound(vec![("text", text("Hi")), ("color", text(farbe))]);
+            assert_eq!(render(&tag, Fmt::Plain), "Hi");
+            assert!(render(&tag, Fmt::Ansi).contains("Hi"));
+            assert!(render(&tag, Fmt::Legacy).contains("Hi"));
+        }
     }
 
     /// Verschachtelte Komponenten erben den Stil des Elternteils.

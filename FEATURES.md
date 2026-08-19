@@ -20,6 +20,10 @@ Alle Varianten entstehen aus derselben Quelle. Ein nicht aktiviertes Feature wir
 versteckt: Code, Paket-IDs, Zustandstabellen und Threads dafür werden gar nicht einkompiliert.
 Tablist und Playerlist sind aus sämtlichen Rust-Varianten entfernt.
 
+Jede Bauform **nimmt trotzdem die Optionen aller anderen an** und meldet nur, dass sie sie
+ignoriert – ein Panel kann also allen Dateien dieselbe Befehlszeile schicken, ohne vorher zu
+wissen, welche vor ihm steht. Dasselbe gilt für den Java-Client in beide Richtungen.
+
 ## Grundfunktionen jeder Rust-Datei
 
 ### Verbindung
@@ -32,6 +36,7 @@ Tablist und Playerlist sind aus sämtlichen Rust-Varianten entfernt.
 | SOCKS5-/HTTP-Proxy | `--proxy <adresse>` |
 | alternativer Handshake-Host | `--fakehost <host[:port]>` |
 | Kompression/Verschlüsselung | automatisch: zlib und AES-128-CFB8 |
+| gemeldete Sichtweite | `--view-distance <2–32>`; Standard 2, in den POV-Bauformen 6 |
 | Server-Transfer | wird als Teil derselben Sitzung ohne Wartezeit befolgt |
 | Kick/Verbindungsabbruch | kein automatischer Neuverbindungsversuch; Prozess endet mit Status 1 |
 
@@ -138,7 +143,7 @@ Im Terminal werden daraus ANSI-Farben. Mit `--events` bleiben sie als `§`-Codes
 
 POV und Ultra enthalten einen echten Weltzustand. Der POV-Client startet das Rendering nach dem
 Beitritt automatisch; Ultra startet erst nach `:pov live`, damit ein normaler Ultra-Prozess nicht
-ungefragt das Terminal übernimmt.
+ungefragt das Terminal übernimmt. Beides lässt sich mit `--pov an|aus` umdrehen.
 
 | Befehl | Wirkung |
 | --- | --- |
@@ -146,7 +151,13 @@ ungefragt das Terminal übernimmt.
 | `:pov stop` | Rendering stoppen |
 | `:pov frame` | ein einzelnes aktuelles Bild |
 | `:pov size <breite> <höhe>` | interne Auflösung 24–160 × 12–80 |
+| `:pov fps <n>` | Bilder je Sekunde, 1–20 |
 | `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Anzahl |
+
+Dieselben Einstellungen gibt es als Startargument, damit ein Panel sie setzen kann, **bevor** das
+erste Bild rausgeht: `--pov an|aus`, `--pov-size <breite>x<höhe>`, `--pov-fps <n>`. Ohne Angabe
+zeichnet der POV-Client mit 64x32 – wer eine andere Größe will, muss sie beim Start mitgeben oder
+vor `:pov live` setzen.
 
 Die POV liest tatsächlich die Serverpakete:
 
@@ -161,6 +172,54 @@ Entitäts-Overlays, Flächenlicht und Distanznebel. Es folgt Server-Teleports so
 `:go` live. Minecraft schickt einem headless Protokollclient keine fertigen Frames und keine
 Blocktexturen; die POV ist deshalb eine farbige Terminal-Voxelansicht der wirklichen Geometrie,
 kein abgegriffenes Bild aus dem offiziellen Spielrenderer.
+
+### Bildformat der Live-POV
+
+Das Format ist eine **zugesagte Schnittstelle**: ein Panel darf es fest einlesen. Alles geht auf
+die **Standardfehlerausgabe** (nicht auf die Standardausgabe – dort steht weiterhin nur Chat) und
+wird nach jedem Bild geleert.
+
+```text
+[H                                   <- nur im Dauerbetrieb, vor jedem Bild
+POV  x=9.5 y=-60.0 z=-8.5  Blick 0/0  Chunks 213  (:pov stop)
+
+[38;2;R;G;Bm[48;2;R;G;Bm▀  … je Spalte einmal …  [0m
+
+… Höhe/2 solcher Zeilen …
+```
+
+* Eine Terminalzeile trägt **zwei** Bildzeilen: `▀` mit Vordergrundfarbe = oberes Pixel,
+  Hintergrundfarbe = unteres. Bei 160x80 sind das 40 Zeilen à 160 Zeichen.
+* Ein Bild beginnt immer an der Kopfzeile `POV  x=…`; sie ist zugleich das Ende des vorherigen.
+* `▀` ist UTF-8 (`E2 96 80`). Wer den Datenstrom stückweise liest, muss die Bytes über einen
+  Dekodierer laufen lassen – ein `toString('utf8')` je Datenstück zerreißt das Zeichen an der
+  Stückgrenze und kappt ab dort jedes Bild.
+* Mit `--no-color` kommt statt der Farbzeilen eine Helligkeitsrampe ` .:-=+*#%@`, eine
+  Terminalzeile je Bildzeile. Ein Panel, das Farbe erwartet, sollte `--no-color` also **nicht**
+  setzen.
+* **Unveränderte Bilder werden ausgelassen.** Steht der Bot still, kommt trotzdem mindestens alle
+  2 Sekunden ein Bild – Stille heißt also nicht, dass die Ansicht tot ist.
+
+### Speicherbedarf
+
+Die POV-Bauformen sind die einzigen, die Chunks überhaupt auswerten; alle anderen werfen die Pakete
+weg. Gemessen an einem identischen Arbeitspunkt (441 gesendete Chunks, Live-Ansicht an):
+
+| | Resident |
+| --- | --- |
+| vorherige Fassung | 42 940 K |
+| jetzt | 10 132 K |
+
+Der Messlauf steht als Test im Baum und lässt sich nachfahren:
+
+```bash
+cd rust && cargo test --release --features pov-client -- --ignored --nocapture speicher
+```
+
+Der Unterschied kommt aus vier Stellen: Palettenindizes als `u8`/`u16` statt `u32`, reine
+Luft-Abschnitte werden gar nicht erst behalten, Abschnitte hängen einzeln an einem `Arc` (ein
+Blockwechsel kopiert nicht mehr den ganzen Chunk), und Chunks weiter als 6 Chunks von der Kamera
+fallen wieder raus.
 
 ## Tastenzustand und Anti-AFK
 
@@ -220,6 +279,8 @@ Die maßgeblichen Module sind getrennt:
 | `rust/src/pov.rs` | Chunks, Blocks, Entities und Renderer |
 | `rust/src/antiafk.rs` | Anti-AFK |
 | `rust/src/movement.rs` | manuelle Bewegung/Routen |
+| `rust/tests/common/mod.rs` | Nachbau eines Minecraft-Servers für die Tests |
+| `rust/tests/live.rs` | Ende-zu-Ende-Tests gegen diesen Server, mit dem echten Programm |
 
 ## Woher Paket-IDs und Feldreihenfolgen kommen
 
@@ -227,3 +288,8 @@ Alle Paket-IDs und versionsabhängigen Feldreihenfolgen stammen aus der Registri
 und den Lese-/Schreibcodecs der jeweils gepinnten MCProtocolLib-Fassung. Unterschiede liegen in
 `rust/src/proto.rs` und an den dokumentierten Parserzweigen. Tests prüfen unter anderem eindeutige
 Paket-IDs, Textformatierung, Item-Komponenten, Chunk-Paletten und Koordinaten-Packing.
+
+Dazu kommen Ende-zu-Ende-Tests: `rust/tests/` startet die **wirklich gebaute Datei** gegen einen
+nachgebauten Server und prüft Beitritt, Chat, Befehle, Teleportbestätigung, gemeldete Sichtweite,
+das Bildformat der Live-POV und das Verhalten bei bösartigen Chunk-Daten. `cargo test --features
+ultra` deckt damit alles ab, was ein Server tatsächlich schickt.

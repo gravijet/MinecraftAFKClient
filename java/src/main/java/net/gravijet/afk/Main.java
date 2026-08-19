@@ -54,6 +54,12 @@ public class Main {
 
     private static void run(Options options, String version) {
         Console console = new Console(options.color, options.quiet);
+        // Das Panel schickt allen Bauformen dieselbe Befehlszeile. Was dieses Jar davon nicht
+        // kann, wird angenommen und einmal benannt – statt beim Start abzubrechen.
+        if (!options.ignored.isEmpty()) {
+            console.warn(String.join(", ", options.ignored)
+                    + " gibt es nur im Rust-Client; wird ignoriert.");
+        }
         migrateConfigDir();
 
         AuthManager auth = new AuthManager(configDir());
@@ -230,6 +236,7 @@ public class Main {
                       --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)
                       --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)
                       --chat-delay <ms>       Mindestabstand ausgehender Nachrichten (1000)
+                      --view-distance <2-32>  gemeldete Sichtweite in Chunks (2)
                       --no-color              keine Farben
                   -q, --quiet                 keine Statusmeldungen, nur Chat
                       --login                 Microsoft-Konto anmelden und beenden
@@ -238,6 +245,10 @@ public class Main {
 
                 Beispiel:
                   java -jar afk-%s.jar mc.example.net -c 300:/afk
+
+                Optionen, die es nur im Rust-Client gibt (--offline, --proxy, --fakehost, --on,
+                --events, --antiafk, --sneak, --pov...), nimmt dieses Jar an und meldet beim
+                Start, dass es sie nicht umsetzt.
 
                 Ausgabe: Chat auf der Standardausgabe, alles andere auf der Standardfehlerausgabe.
                 Eingabe: jede Zeile geht als Chat raus, mit '/' vorn als Serverbefehl.

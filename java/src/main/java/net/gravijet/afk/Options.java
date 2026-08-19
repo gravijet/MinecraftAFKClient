@@ -40,6 +40,36 @@ public final class Options {
     public long chatMinDelayMs = 1000;
 
     /**
+     * Sichtweite in Chunks, die dem Server gemeldet wird. Der Client wertet keinen einzigen Chunk
+     * aus – MCProtocolLib entpackt sie trotzdem alle in Objekte, und genau das ist der größte
+     * Posten im Speicherbedarf. Mit dem kleinsten erlaubten Wert fällt der Löwenanteil weg.
+     */
+    public int viewDistance = 2;
+
+    /**
+     * Optionen, die es nur im Rust-Client gibt. Ein Panel schickt allen Bauformen dieselbe
+     * Befehlszeile – dieses Jar darf daran nicht scheitern, sondern nimmt sie an und sagt, dass
+     * es sie nicht kann. Der Wert sagt, ob dahinter noch ein Argument steht.
+     */
+    private static final java.util.Map<String, Boolean> RUST_ONLY = java.util.Map.ofEntries(
+            java.util.Map.entry("--offline", true),
+            java.util.Map.entry("--cracked", true),
+            java.util.Map.entry("--proxy", true),
+            java.util.Map.entry("--fakehost", true),
+            java.util.Map.entry("--on", true),
+            java.util.Map.entry("--on-cooldown", true),
+            java.util.Map.entry("--antiafk", true),
+            java.util.Map.entry("--pov", true),
+            java.util.Map.entry("--pov-size", true),
+            java.util.Map.entry("--pov-groesse", true),
+            java.util.Map.entry("--pov-fps", true),
+            java.util.Map.entry("--events", false),
+            java.util.Map.entry("--sneak", false));
+
+    /** Optionen der Befehlszeile, die dieses Jar angenommen, aber nicht umgesetzt hat. */
+    public final List<String> ignored = new ArrayList<>();
+
+    /**
      * Startargumente auswerten.
      *
      * @param minecraftVersion Version dieses Jars – {@code --mc} darf nur genau dazu passen.
@@ -85,15 +115,25 @@ public final class Options {
                         o.maxBackoffSeconds = Math.max(1, number(value(args, ++i, "--max-backoff"), "--max-backoff"));
                 case "--chat-delay" ->
                         o.chatMinDelayMs = Math.max(MIN_CHAT_DELAY_MS, number(value(args, ++i, "--chat-delay"), "--chat-delay"));
+                case "--view-distance", "--sichtweite" -> o.viewDistance =
+                        (int) Math.min(32, Math.max(2, number(value(args, ++i, "--view-distance"), "--view-distance")));
                 case "--no-reconnect" -> o.autoReconnect = false;
                 case "--no-color" -> o.color = false;
                 case "-q", "--quiet" -> o.quiet = true;
                 default -> {
-                    if (arg.startsWith("-") || !o.server.isEmpty()) {
+                    Boolean takesValue = RUST_ONLY.get(arg);
+                    if (takesValue != null) {
+                        // Nur im Rust-Client vorhanden: annehmen, überspringen, später melden.
+                        if (takesValue) {
+                            value(args, ++i, arg);
+                        }
+                        o.ignored.add(arg);
+                    } else if (arg.startsWith("-") || !o.server.isEmpty()) {
                         throw new IllegalArgumentException(
                                 "Unbekannte Option '" + arg + "'. --help zeigt alle.");
+                    } else {
+                        o.server = arg;
                     }
-                    o.server = arg;
                 }
             }
         }

@@ -11,6 +11,21 @@
 //! * 1.21.1: NBT-Höhenkarten, Long-Array-Länge in jeder Palette, ein Blockzähler je Abschnitt.
 //! * 1.21.11: Höhenkarten-Liste, fest berechnete Palettenlänge, ein Blockzähler.
 //! * 26.1/26.2: wie 1.21.11, zusätzlich ein Fluidzähler je Abschnitt.
+//!
+//! Bricht ein Chunk trotzdem, wird nicht geraten und auch nicht aufgegeben: [`Format::probe`]
+//! probiert die wenigen möglichen Spielarten durch und merkt sich die, die den Puffer restlos
+//! aufgeht. Ein Protokollupdate kostet damit höchstens den ersten Chunk.
+//!
+//! **Speicher.** Ein Abschnitt liegt als Palette plus ein Index je Block (ein Byte, solange die
+//! Palette klein bleibt) im Speicher – nicht als 4096 volle Zustands-IDs. Reine Luftabschnitte
+//! werden gar nicht erst behalten. Zusammen mit der kleinen angeforderten Sichtweite bleibt die
+//! Live-Ansicht damit im einstelligen MB-Bereich statt im dreistelligen.
+//!
+//! **Ausgabeformat.** Ein Bild besteht aus einer Kopfzeile `POV x=… (:pov stop)` und danach je
+//! Terminalzeile einer Reihe Halbblöcke `▀` mit Vorder- und Hintergrundfarbe (ein Zeichen = zwei
+//! Bildpunkte). Ohne Farbe kommt stattdessen eine Helligkeitsrampe, eine Zeichenzeile je
+//! Bildzeile. Das Format ist Teil der Schnittstelle nach außen – ein Panel liest es mit –, es
+//! wird deshalb nicht ohne Not geändert.
 
 use crate::buf::{Reader, Writer};
 use crate::client::Shared;
@@ -21,22 +36,34 @@ use crate::proto::In;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SECTION_BLOCKS: usize = 16 * 16 * 16;
 const SECTION_BIOMES: usize = 4 * 4 * 4;
+/// Notbremse. Normalerweise begrenzt die angeforderte Sichtweite die Zahl der Chunks vorher.
 const MAX_CHUNKS: usize = 1024;
 const MAX_ENTITIES: usize = 4096;
 const MAX_SECTIONS: usize = 256;
-const RENDER_INTERVAL: Duration = Duration::from_millis(125);
+/// Weiter entfernte Chunks kann die Ansicht nie sehen: [`MAX_DISTANCE`] sind 72 Blöcke, ein Strahl
+/// erreicht damit höchstens den fünften Chunk in jede Richtung. Alles darüber wird verworfen,
+/// sobald ein neuer Chunk ankommt – ohne das lassen Server, die nie ein `ForgetChunk` schicken,
+/// den Speicher unbegrenzt wachsen.
+const KEEP_CHUNK_RADIUS: i32 = 6;
 const HORIZONTAL_FOV: f64 = 90.0;
 const MAX_DISTANCE: f64 = 72.0;
 const DEFAULT_WIDTH: usize = 64;
 /// Pixelhöhe; ANSI stellt je Terminalzeile zwei Pixel mit `▀` dar.
 const DEFAULT_HEIGHT: usize = 32;
+const MIN_WIDTH: usize = 24;
+const MAX_WIDTH: usize = 160;
+const MIN_HEIGHT: usize = 12;
+const MAX_HEIGHT: usize = 80;
+/// Auch ein unverändertes Bild wird spätestens so oft wiederholt – ein Programm davor soll an
+/// der Stille nicht ablesen, die Ansicht sei tot.
+const REPEAT_UNCHANGED: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dimension {
@@ -76,48 +103,190 @@ impl Dimension {
     }
 }
 
+// ===================== Abschnitte =====================
+
+/// Ein Index je Block. Fast jeder Abschnitt kommt mit höchstens 256 verschiedenen Zuständen aus –
+/// dann kostet er 4 KB statt 8 KB.
 #[derive(Clone)]
-struct Section {
-    /// Reihenfolge des Protokolls: `(y << 8) | (z << 4) | x`.
-    blocks: Box<[u32]>,
+enum Indices {
+    Small(Box<[u8]>),
+    Large(Box<[u16]>),
 }
 
+impl Indices {
+    fn new(values: &[u16], palette_len: usize) -> Indices {
+        if palette_len <= u8::MAX as usize + 1 {
+            Indices::Small(values.iter().map(|v| *v as u8).collect())
+        } else {
+            Indices::Large(values.to_vec().into_boxed_slice())
+        }
+    }
+
+    fn get(&self, index: usize) -> u16 {
+        match self {
+            Indices::Small(data) => data[index] as u16,
+            Indices::Large(data) => data[index],
+        }
+    }
+
+    fn set(&mut self, index: usize, value: u16) {
+        match self {
+            Indices::Small(data) => data[index] = value as u8,
+            Indices::Large(data) => data[index] = value,
+        }
+    }
+
+    /// Auf die breite Darstellung umstellen, sobald die Palette über 256 Einträge wächst.
+    fn widen(&mut self) {
+        if let Indices::Small(data) = self {
+            *self = Indices::Large(data.iter().map(|v| *v as u16).collect());
+        }
+    }
+}
+
+/// Ein Chunk-Abschnitt: Palette plus ein Index je Block. Eintrag 0 ist immer Luft, damit die
+/// Sichtprüfung ein einziger Vergleich ist.
+#[derive(Clone)]
+struct Section {
+    palette: Vec<u32>,
+    indices: Indices,
+}
+
+impl Section {
+    fn state(&self, index: usize) -> u32 {
+        let slot = self.indices.get(index) as usize;
+        self.palette.get(slot).copied().unwrap_or(0)
+    }
+
+    fn is_air(&self, index: usize) -> bool {
+        self.indices.get(index) == 0
+    }
+
+    fn set(&mut self, index: usize, state: u32) {
+        if state == 0 {
+            return self.indices.set(index, 0);
+        }
+        let slot = match self.palette.iter().position(|value| *value == state) {
+            Some(slot) => slot,
+            None => {
+                if self.palette.len() >= u16::MAX as usize {
+                    return; // absurd bunter Abschnitt: der letzte Zustand bleibt eben stehen
+                }
+                self.palette.push(state);
+                if self.palette.len() > u8::MAX as usize + 1 {
+                    self.indices.widen();
+                }
+                self.palette.len() - 1
+            }
+        };
+        self.indices.set(index, slot as u16);
+    }
+
+    fn empty() -> Section {
+        Section {
+            palette: vec![0],
+            indices: Indices::Small(vec![0u8; SECTION_BLOCKS].into_boxed_slice()),
+        }
+    }
+}
+
+// ===================== Chunks =====================
+
+/// Welche Spielart des Abschnittsformats der Server spricht. Wird einmal ermittelt und dann
+/// behalten – siehe [`Format::probe`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Format {
+    /// Palettendaten ohne Längenangabe (ab 1.21.11).
+    modern_palette: bool,
+    /// Zusätzlicher Flüssigkeitszähler je Abschnitt (ab 26.1).
+    fluid_count: bool,
+}
+
+impl Format {
+    fn code(self) -> u32 {
+        (self.modern_palette as u32) | ((self.fluid_count as u32) << 1)
+    }
+
+    fn from_code(code: u32) -> Format {
+        Format {
+            modern_palette: code & 1 != 0,
+            fluid_count: code & 2 != 0,
+        }
+    }
+
+    /// Alle vier Spielarten, die bevorzugte zuerst.
+    fn candidates(preferred: Format) -> [Format; 4] {
+        let mut all = [
+            preferred,
+            Format {
+                modern_palette: !preferred.modern_palette,
+                ..preferred
+            },
+            Format {
+                fluid_count: !preferred.fluid_count,
+                ..preferred
+            },
+            Format {
+                modern_palette: !preferred.modern_palette,
+                fluid_count: !preferred.fluid_count,
+            },
+        ];
+        all.sort_by_key(|f| (f.code() != preferred.code()) as u8);
+        all
+    }
+
+    /// Chunk lesen und dabei die passende Spielart bestimmen. Bevorzugt wird die, die den Puffer
+    /// restlos aufgeht **und** die erwartete Zahl Abschnitte liefert.
+    fn probe(
+        preferred: Format,
+        dimension: &Dimension,
+        data: &[u8],
+    ) -> io::Result<(Chunk, Format)> {
+        let mut first_error = None;
+        let mut fallback: Option<(Chunk, Format)> = None;
+        for format in Format::candidates(preferred) {
+            match Chunk::decode(format, dimension, data) {
+                Ok(chunk) => {
+                    if chunk.sections.len() == dimension.section_count() {
+                        return Ok((chunk, format));
+                    }
+                    fallback.get_or_insert((chunk, format));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        fallback.ok_or_else(|| {
+            first_error.unwrap_or_else(|| crate::buf::err("POV: Chunk nicht lesbar"))
+        })
+    }
+}
+
+/// Ein Chunk ist billig zu klonen: die Abschnitte hängen einzeln an einem `Arc`, eine
+/// Blockänderung kopiert deshalb nur den einen betroffenen Abschnitt.
 #[derive(Clone)]
 struct Chunk {
     min_section: i32,
-    sections: Vec<Option<Section>>,
+    /// `None` = reine Luft; solche Abschnitte belegen keinen Speicher.
+    sections: Vec<Option<Arc<Section>>>,
 }
 
 impl Chunk {
-    fn decode(
-        proto_modern: bool,
-        fluid_count: bool,
-        dimension: &Dimension,
-        data: &[u8],
-    ) -> io::Result<Chunk> {
+    /// Abschnitte lesen, bis der Puffer leer ist. Bewusst nicht „genau `section_count` Stück":
+    /// meldet ein Server eine andere Welthöhe, als seine Registry sagt, folgt die Ansicht dem,
+    /// was wirklich im Paket steht, statt jeden Chunk zu verwerfen.
+    fn decode(format: Format, dimension: &Dimension, data: &[u8]) -> io::Result<Chunk> {
         let mut r = Reader::new(data);
         let mut sections = Vec::with_capacity(dimension.section_count());
-        for _ in 0..dimension.section_count() {
-            let block_count = r.i16()?;
-            if !(0..=SECTION_BLOCKS as i16).contains(&block_count) {
-                return Err(crate::buf::err("POV: Blockzaehler unplausibel"));
+        while r.remaining() > 0 {
+            if sections.len() >= MAX_SECTIONS {
+                return Err(crate::buf::err("POV: zu viele Chunk-Abschnitte"));
             }
-            if fluid_count {
-                r.i16()?;
-            }
-            let mut blocks = read_palette(&mut r, SECTION_BLOCKS, 8, proto_modern)?;
-            // Biome wird für die Geometrie nicht gebraucht, muss aber exakt übersprungen werden.
-            let _ = read_palette(&mut r, SECTION_BIOMES, 3, proto_modern)?;
-
-            if block_count == 0 {
-                sections.push(None);
-            } else {
-                normalize_air(&mut blocks, block_count as usize);
-                sections.push(Some(Section { blocks }));
-            }
+            sections.push(read_section(&mut r, format)?);
         }
-        if r.remaining() != 0 {
-            return Err(crate::buf::err("POV: Chunk hat unerwartete Restdaten"));
+        if sections.is_empty() {
+            return Err(crate::buf::err("POV: Chunk ohne Abschnitte"));
         }
         Ok(Chunk {
             min_section: dimension.min_y.div_euclid(16),
@@ -125,42 +294,72 @@ impl Chunk {
         })
     }
 
-    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
-        let section_y = y.div_euclid(16) - self.min_section;
-        let Some(Some(section)) = usize::try_from(section_y)
+    fn section_index(&self, y: i32) -> Option<usize> {
+        usize::try_from(y.div_euclid(16) - self.min_section)
             .ok()
-            .and_then(|index| self.sections.get(index))
-        else {
+            .filter(|index| *index < self.sections.len())
+    }
+
+    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
+        let Some(Some(section)) = self.section_index(y).map(|index| &self.sections[index]) else {
             return 0;
         };
-        let index = ((y.rem_euclid(16) as usize) << 8)
-            | ((z.rem_euclid(16) as usize) << 4)
-            | x.rem_euclid(16) as usize;
-        section.blocks[index]
+        section.state(local_index(x, y, z))
+    }
+
+    /// `true`, wenn an der Stelle etwas Sichtbares steht. Billiger als [`Chunk::block`], weil die
+    /// Palette dafür gar nicht angefasst werden muss.
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        let Some(Some(section)) = self.section_index(y).map(|index| &self.sections[index]) else {
+            return false;
+        };
+        !section.is_air(local_index(x, y, z))
     }
 
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
-        let section_y = y.div_euclid(16) - self.min_section;
-        let Some(index) = usize::try_from(section_y)
-            .ok()
-            .filter(|i| *i < self.sections.len())
-        else {
+        let Some(index) = self.section_index(y) else {
             return;
         };
         if self.sections[index].is_none() {
             if state == 0 {
                 return;
             }
-            self.sections[index] = Some(Section {
-                blocks: vec![0; SECTION_BLOCKS].into_boxed_slice(),
-            });
+            self.sections[index] = Some(Arc::new(Section::empty()));
         }
-        let local = ((y.rem_euclid(16) as usize) << 8)
-            | ((z.rem_euclid(16) as usize) << 4)
-            | x.rem_euclid(16) as usize;
-        self.sections[index].as_mut().unwrap().blocks[local] = state;
+        // `make_mut` kopiert höchstens diesen einen Abschnitt – nicht den ganzen Chunk.
+        let section = Arc::make_mut(self.sections[index].as_mut().unwrap());
+        section.set(local_index(x, y, z), state);
     }
 }
+
+/// Reihenfolge des Protokolls: `(y << 8) | (z << 4) | x`.
+fn local_index(x: i32, y: i32, z: i32) -> usize {
+    ((y.rem_euclid(16) as usize) << 8) | ((z.rem_euclid(16) as usize) << 4) | x.rem_euclid(16) as usize
+}
+
+/// Einen Abschnitt lesen. `None` = reine Luft.
+fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section>>> {
+    let block_count = r.i16()?;
+    if !(0..=SECTION_BLOCKS as i16).contains(&block_count) {
+        return Err(crate::buf::err("POV: Blockzaehler unplausibel"));
+    }
+    if format.fluid_count {
+        let fluid = r.i16()?;
+        if !(0..=SECTION_BLOCKS as i16).contains(&fluid) {
+            return Err(crate::buf::err("POV: Fluidzaehler unplausibel"));
+        }
+    }
+    let palette = read_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
+    // Biome braucht die Geometrie nicht – nur exakt überspringen.
+    skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
+
+    if block_count == 0 {
+        return Ok(None);
+    }
+    Ok(compact(palette, block_count as usize).map(Arc::new))
+}
+
+// ===================== Welt =====================
 
 #[derive(Clone, Copy)]
 struct Entity {
@@ -175,6 +374,8 @@ struct World {
     chunks: HashMap<(i32, i32), Arc<Chunk>>,
     entities: HashMap<i32, Entity>,
     own_entity: i32,
+    /// Zuletzt bekannter eigener Chunk – daran hängt das Verwerfen weit entfernter Chunks.
+    center: (i32, i32),
 }
 
 impl Default for World {
@@ -184,6 +385,7 @@ impl Default for World {
             chunks: HashMap::new(),
             entities: HashMap::new(),
             own_entity: -1,
+            center: (0, 0),
         }
     }
 }
@@ -191,7 +393,9 @@ impl Default for World {
 impl World {
     fn clear_visible(&mut self) {
         self.chunks.clear();
+        self.chunks.shrink_to_fit();
         self.entities.clear();
+        self.entities.shrink_to_fit();
     }
 
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
@@ -199,6 +403,14 @@ impl World {
         if let Some(chunk) = self.chunks.get_mut(&key) {
             Arc::make_mut(chunk).set_block(x, y, z, state);
         }
+    }
+
+    /// Alles wegwerfen, was die Ansicht ohnehin nie erreicht.
+    fn prune(&mut self) {
+        let (cx, cz) = self.center;
+        self.chunks.retain(|(x, z), _| {
+            (x - cx).abs() <= KEEP_CHUNK_RADIUS && (z - cz).abs() <= KEEP_CHUNK_RADIUS
+        });
     }
 }
 
@@ -209,10 +421,16 @@ struct Scene {
 }
 
 impl Scene {
-    fn block(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+    fn solid(&self, x: i32, y: i32, z: i32) -> Option<bool> {
         self.chunks
             .get(&(x.div_euclid(16), z.div_euclid(16)))
-            .map(|chunk| chunk.block(x, y, z))
+            .map(|chunk| chunk.solid(x, y, z))
+    }
+
+    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
+        self.chunks
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+            .map_or(0, |chunk| chunk.block(x, y, z))
     }
 }
 
@@ -223,19 +441,34 @@ pub struct Pov {
     renderer_running: AtomicBool,
     width: AtomicUsize,
     height: AtomicUsize,
+    /// Bilder je Sekunde.
+    fps: AtomicUsize,
     parse_errors: AtomicU32,
+    /// Zuletzt erkannte Spielart des Abschnittsformats (siehe [`Format`]).
+    format: AtomicU32,
+    /// Prüfsumme des zuletzt geschriebenen Bildes – unveränderte Bilder werden ausgelassen.
+    last_frame: AtomicU64,
+    /// Wann das letzte Bild geschrieben wurde (ms seit `started`).
+    last_frame_ms: AtomicU64,
+    started: Instant,
 }
 
 impl Pov {
-    pub fn new(_options: &Options) -> Pov {
+    pub fn new(options: &Options) -> Pov {
+        let (width, height) = options.pov_size.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
         Pov {
             world: Mutex::new(World::default()),
             dimensions: Mutex::new(Vec::new()),
             live: AtomicBool::new(false),
             renderer_running: AtomicBool::new(false),
-            width: AtomicUsize::new(DEFAULT_WIDTH),
-            height: AtomicUsize::new(DEFAULT_HEIGHT),
+            width: AtomicUsize::new(width.clamp(MIN_WIDTH, MAX_WIDTH)),
+            height: AtomicUsize::new(height.clamp(MIN_HEIGHT, MAX_HEIGHT)),
+            fps: AtomicUsize::new(options.pov_fps.clamp(1, 20)),
             parse_errors: AtomicU32::new(0),
+            format: AtomicU32::new(u32::MAX),
+            last_frame: AtomicU64::new(0),
+            last_frame_ms: AtomicU64::new(0),
+            started: Instant::now(),
         }
     }
 
@@ -245,6 +478,18 @@ impl Pov {
 
     pub fn clear(&self) {
         self.world.lock().unwrap().clear_visible();
+        self.last_frame.store(0, Ordering::Relaxed);
+    }
+
+    /// Bevorzugte Formatspielart: die zuletzt erfolgreiche, sonst die der Protokollversion.
+    fn preferred_format(&self, shared: &Shared) -> Format {
+        match self.format.load(Ordering::Relaxed) {
+            u32::MAX => Format {
+                modern_palette: shared.proto.modern,
+                fluid_count: shared.proto.extra.section_fluid_count,
+            },
+            code => Format::from_code(code),
+        }
     }
 
     fn scene(&self) -> Scene {
@@ -318,7 +563,13 @@ pub fn respawn(shared: &Arc<Shared>, r: &mut Reader) {
 
 pub fn on_join(shared: &Arc<Shared>) {
     shared.extras.pov.clear();
-    if cfg!(feature = "pov-client") {
+    // Die eigene POV-Bauform startet von selbst, Ultra erst auf `:pov live` – `--pov an|aus`
+    // dreht beides um, ohne die Weltdaten abzuschalten.
+    let autostart = shared
+        .options()
+        .pov_autostart
+        .unwrap_or(cfg!(feature = "pov-client"));
+    if autostart {
         shared.extras.pov.live.store(true, Ordering::SeqCst);
         start_renderer(shared);
     }
@@ -410,16 +661,40 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
         crate::nbt::read_network(r)?;
     }
     let data = r.byte_array()?;
-    let dimension = shared.extras.pov.world.lock().unwrap().dimension.clone();
-    let chunk = Chunk::decode(
-        shared.proto.modern,
-        shared.proto.extra.section_fluid_count,
-        &dimension,
-        &data,
-    )?;
-    let mut world = shared.extras.pov.world.lock().unwrap();
+
+    let pov = &shared.extras.pov;
+    let dimension = pov.world.lock().unwrap().dimension.clone();
+    let preferred = pov.preferred_format(shared);
+    let (chunk, format) = Format::probe(preferred, &dimension, &data)?;
+    if pov.format.swap(format.code(), Ordering::Relaxed) != format.code() {
+        // Nur beim Wechsel melden – sonst stünde es bei jedem Chunk in der Ausgabe.
+        if format != preferred {
+            shared.console.info(&format!(
+                "POV: Chunk-Format erkannt ({} Abschnitte, {}Fluidzaehler).",
+                chunk.sections.len(),
+                if format.fluid_count { "mit " } else { "ohne " }
+            ));
+        }
+    }
+
+    // Der eigene Chunk ist der Bezugspunkt fürs Verwerfen. Er wird hier gesetzt und nicht im
+    // Renderer: sonst würde bei gestoppter Ansicht um den Nullpunkt herum aufgeräumt.
+    let center = shared.position().map(|(x, _, z, _, _)| {
+        (
+            (x.floor() as i32).div_euclid(16),
+            (z.floor() as i32).div_euclid(16),
+        )
+    });
+
+    let mut world = pov.world.lock().unwrap();
+    if let Some(center) = center {
+        world.center = center;
+    }
     if world.chunks.len() < MAX_CHUNKS || world.chunks.contains_key(&(x, z)) {
         world.chunks.insert((x, z), Arc::new(chunk));
+    }
+    if center.is_some() {
+        world.prune();
     }
     Ok(())
 }
@@ -537,55 +812,80 @@ fn read_entity_sync(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 
 // ===================== Palette und Koordinaten =====================
 
+/// Eine gelesene Palette samt Häufigkeiten. Die Häufigkeiten fallen beim Auspacken ohnehin an –
+/// sie noch einmal über eine Hashtabelle zu zählen, wäre je Abschnitt ein zweiter Durchlauf.
+struct RawPalette {
+    values: Vec<u32>,
+    indices: Vec<u16>,
+    counts: Vec<u32>,
+}
+
+/// Kopf einer Palette lesen: Bitbreite und (bei indirekten Paletten) die Einträge.
+/// Rückgabe: (Bitbreite, Einträge oder `None` für die globale Palette).
+fn palette_head(
+    r: &mut Reader,
+    max_indirect_bits: u8,
+) -> io::Result<(u8, Option<Vec<u32>>)> {
+    let bits = r.u8()?;
+    if bits > 32 {
+        return Err(crate::buf::err("POV: Palette breiter als 32 Bit"));
+    }
+    if bits == 0 || bits <= max_indirect_bits {
+        let count = if bits == 0 { 1 } else { r.var_int()? };
+        if !(1..=4096).contains(&count) {
+            return Err(crate::buf::err("POV: lokale Palette unplausibel"));
+        }
+        let mut values = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            values.push(r.var_int()? as u32);
+        }
+        return Ok((bits, Some(values)));
+    }
+    Ok((bits, None))
+}
+
+/// Zahl der Longs hinter der Palette – und in den alten Protokollen die Prüfung der Längenangabe.
+fn palette_longs(r: &mut Reader, size: usize, bits: u8, modern: bool) -> io::Result<usize> {
+    let per_long = 64usize / bits as usize;
+    if per_long == 0 {
+        return Err(crate::buf::err("POV: ungueltige Palettenbreite"));
+    }
+    let expected = size.div_ceil(per_long);
+    if modern {
+        return Ok(expected);
+    }
+    let encoded = r.var_int()?;
+    if encoded < 0 || encoded as usize != expected {
+        return Err(crate::buf::err("POV: falsche Palettenlaenge"));
+    }
+    Ok(expected)
+}
+
 fn read_palette(
     r: &mut Reader,
     size: usize,
     max_indirect_bits: u8,
     modern: bool,
-) -> io::Result<Box<[u32]>> {
-    let bits = r.u8()?;
-    if bits > 32 {
-        return Err(crate::buf::err("POV: Palette breiter als 32 Bit"));
-    }
+) -> io::Result<RawPalette> {
+    let (bits, local) = palette_head(r, max_indirect_bits)?;
+
     if bits == 0 {
-        let state = r.var_int()? as u32;
+        let values = local.unwrap_or_else(|| vec![0]);
         if !modern {
             let longs = r.var_int()?;
             if longs != 0 {
                 return Err(crate::buf::err("POV: Singleton-Palette mit Daten"));
             }
         }
-        return Ok(vec![state; size].into_boxed_slice());
+        return Ok(RawPalette {
+            counts: vec![size as u32],
+            values,
+            indices: vec![0; size],
+        });
     }
-
-    let palette = if bits <= max_indirect_bits {
-        let count = r.var_int()?;
-        if !(1..=4096).contains(&count) {
-            return Err(crate::buf::err("POV: lokale Palette unplausibel"));
-        }
-        let mut palette = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            palette.push(r.var_int()? as u32);
-        }
-        Some(palette)
-    } else {
-        None
-    };
 
     let per_long = 64usize / bits as usize;
-    if per_long == 0 {
-        return Err(crate::buf::err("POV: ungueltige Palettenbreite"));
-    }
-    let expected = size.div_ceil(per_long);
-    let longs = if modern {
-        expected
-    } else {
-        let encoded = r.var_int()?;
-        if encoded < 0 || encoded as usize != expected {
-            return Err(crate::buf::err("POV: falsche Palettenlaenge"));
-        }
-        encoded as usize
-    };
+    let longs = palette_longs(r, size, bits, modern)?;
     let mut data = Vec::with_capacity(longs);
     for _ in 0..longs {
         data.push(r.i64()? as u64);
@@ -596,64 +896,163 @@ fn read_palette(
     } else {
         (1u64 << bits) - 1
     };
-    let mut out = Vec::with_capacity(size);
-    for index in 0..size {
-        let packed =
-            ((data[index / per_long] >> ((index % per_long) * bits as usize)) & mask) as usize;
-        let state = match &palette {
-            Some(palette) => *palette
-                .get(packed)
-                .ok_or_else(|| crate::buf::err("POV: Palettenindex ausserhalb"))?,
-            None => packed as u32,
-        };
-        out.push(state);
+
+    // Indirekte Palette: der gepackte Wert ist direkt der Paletteneintrag.
+    if let Some(values) = local {
+        let mut counts = vec![0u32; values.len()];
+        let mut indices = Vec::with_capacity(size);
+        for index in 0..size {
+            let packed = unpack(&data, index, per_long, bits, mask)?;
+            if packed >= values.len() {
+                return Err(crate::buf::err("POV: Palettenindex ausserhalb"));
+            }
+            counts[packed] += 1;
+            indices.push(packed as u16);
+        }
+        return Ok(RawPalette {
+            values,
+            indices,
+            counts,
+        });
     }
-    Ok(out.into_boxed_slice())
+
+    // Globale Palette: eine örtliche Palette daraus bauen, damit der Abschnitt klein bleibt.
+    let mut values: Vec<u32> = Vec::new();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut seen: HashMap<u32, u16> = HashMap::new();
+    let mut indices = Vec::with_capacity(size);
+    for index in 0..size {
+        let state = unpack(&data, index, per_long, bits, mask)? as u32;
+        let slot = match seen.get(&state) {
+            Some(slot) => *slot,
+            None => {
+                if values.len() >= u16::MAX as usize {
+                    return Err(crate::buf::err("POV: Abschnitt mit zu vielen Zustaenden"));
+                }
+                let slot = values.len() as u16;
+                values.push(state);
+                counts.push(0);
+                seen.insert(state, slot);
+                slot
+            }
+        };
+        counts[slot as usize] += 1;
+        indices.push(slot);
+    }
+    Ok(RawPalette {
+        values,
+        indices,
+        counts,
+    })
 }
 
-/// Der Abschnitt überträgt die exakte Zahl nicht-luftiger Blöcke. Damit lassen sich neben State
-/// 0 auch `cave_air` und `void_air` erkennen, ohne versionsabhängige Block-State-Tabellen.
-fn normalize_air(blocks: &mut [u32], non_air: usize) {
-    let air_total = SECTION_BLOCKS.saturating_sub(non_air);
+/// Palette nur überspringen – für die Biome, die die Ansicht nicht braucht.
+fn skip_palette(
+    r: &mut Reader,
+    size: usize,
+    max_indirect_bits: u8,
+    modern: bool,
+) -> io::Result<()> {
+    let (bits, _) = palette_head(r, max_indirect_bits)?;
+    if bits == 0 {
+        if !modern {
+            let longs = r.var_int()?;
+            if longs != 0 {
+                return Err(crate::buf::err("POV: Singleton-Palette mit Daten"));
+            }
+        }
+        return Ok(());
+    }
+    let longs = palette_longs(r, size, bits, modern)?;
+    r.skip(longs * 8)
+}
+
+/// Einen Eintrag aus den gepackten Longs holen – mit Bereichsprüfung statt blindem Zugriff.
+fn unpack(data: &[u64], index: usize, per_long: usize, bits: u8, mask: u64) -> io::Result<usize> {
+    let long = *data
+        .get(index / per_long)
+        .ok_or_else(|| crate::buf::err("POV: Palettendaten zu kurz"))?;
+    Ok(((long >> ((index % per_long) * bits as usize)) & mask) as usize)
+}
+
+/// Aus der gelesenen Palette einen Abschnitt bauen: Luftzustände auf Eintrag 0 zusammenlegen,
+/// alles Übrige dahinter. `None` = der Abschnitt besteht doch nur aus Luft.
+///
+/// Welche Zustände Luft sind, verrät der Blockzähler des Abschnitts: er zählt alle Blöcke, die
+/// **nicht** Luft sind, und Luft gibt es in Vanilla in genau drei Ausprägungen (`air`,
+/// `cave_air`, `void_air`). Gesucht wird deshalb eine Teilmenge von höchstens drei Einträgen,
+/// deren Häufigkeiten die fehlende Zahl genau ergeben – das geht in einem Durchlauf.
+fn compact(raw: RawPalette, non_air: usize) -> Option<Section> {
+    let RawPalette {
+        values,
+        indices,
+        counts,
+    } = raw;
+    let air = air_entries(&values, &counts, SECTION_BLOCKS.saturating_sub(non_air));
+
+    // Neue Palette: Eintrag 0 ist Luft.
+    let mut palette = vec![0u32];
+    let mut remap = vec![0u16; values.len()];
+    for (slot, value) in values.iter().enumerate() {
+        if air[slot] {
+            continue;
+        }
+        remap[slot] = palette.len() as u16;
+        palette.push(*value);
+    }
+    if palette.len() == 1 {
+        return None; // doch nur Luft
+    }
+
+    let mapped: Vec<u16> = indices.iter().map(|slot| remap[*slot as usize]).collect();
+    let indices = Indices::new(&mapped, palette.len());
+    Some(Section { palette, indices })
+}
+
+/// Welche Paletteneinträge sind Luft? `air_total` ist die Zahl der Luftblöcke im Abschnitt.
+fn air_entries(values: &[u32], counts: &[u32], air_total: usize) -> Vec<bool> {
+    let mut air = vec![false; values.len()];
     if air_total == 0 {
-        return;
+        return air;
     }
-    let mut counts: HashMap<u32, usize> = HashMap::new();
-    for state in blocks.iter().copied() {
-        *counts.entry(state).or_default() += 1;
+    // Zustand 0 ist in jeder Protokollversion `minecraft:air`.
+    let mut rest = air_total as i64;
+    for (slot, value) in values.iter().enumerate() {
+        if *value == 0 {
+            air[slot] = true;
+            rest -= counts[slot] as i64;
+        }
     }
-    let mut air_states = Vec::new();
-    let zero = counts.remove(&0).unwrap_or(0);
-    if zero > 0 {
-        air_states.push(0);
+    if rest <= 0 {
+        return air;
     }
-    let remaining = air_total.saturating_sub(zero);
-    if remaining > 0 {
-        // Exakte Teilsumme der übrigen Häufigkeiten; Palette und Ziel sind klein (<=4096).
-        let entries: Vec<(u32, usize)> = counts.into_iter().collect();
-        let mut previous: Vec<Option<(usize, usize)>> = vec![None; remaining + 1];
-        previous[0] = Some((usize::MAX, 0));
-        for (index, (_, count)) in entries.iter().enumerate() {
-            for sum in (0..=remaining.saturating_sub(*count)).rev() {
-                if previous[sum].is_some() && previous[sum + count].is_none() {
-                    previous[sum + count] = Some((index, sum));
-                }
+    let rest = rest as u32;
+
+    // Ein einzelner weiterer Zustand (der Normalfall: cave_air).
+    let open: Vec<usize> = (0..values.len()).filter(|slot| !air[*slot]).collect();
+    if let Some(slot) = open.iter().find(|slot| counts[**slot] == rest) {
+        air[*slot] = true;
+        return air;
+    }
+    // Sonst zwei – mehr als drei Luftzustände gibt es in Minecraft nicht.
+    let mut by_count: HashMap<u32, usize> = HashMap::with_capacity(open.len());
+    for slot in &open {
+        by_count.entry(counts[*slot]).or_insert(*slot);
+    }
+    for slot in &open {
+        let Some(missing) = rest.checked_sub(counts[*slot]) else {
+            continue;
+        };
+        if let Some(other) = by_count.get(&missing) {
+            if other != slot {
+                air[*slot] = true;
+                air[*other] = true;
+                return air;
             }
         }
-        if previous[remaining].is_some() {
-            let mut sum = remaining;
-            while sum > 0 {
-                let (index, before) = previous[sum].unwrap();
-                air_states.push(entries[index].0);
-                sum = before;
-            }
-        }
     }
-    for state in blocks {
-        if air_states.contains(state) {
-            *state = 0;
-        }
-    }
+    // Nichts Eindeutiges gefunden: lieber alles stehen lassen, als Blöcke zu erfinden.
+    air
 }
 
 fn unpack_block_pos(value: i64) -> (i32, i32, i32) {
@@ -682,6 +1081,7 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
     match parts.next().unwrap_or("live").to_lowercase().as_str() {
         "live" | "start" | "an" | "on" => {
             shared.extras.pov.live.store(true, Ordering::SeqCst);
+            shared.extras.pov.last_frame.store(0, Ordering::Relaxed);
             start_renderer(shared);
             shared
                 .console
@@ -689,46 +1089,65 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         }
         "stop" | "aus" | "off" => {
             shared.extras.pov.live.store(false, Ordering::SeqCst);
-            shared.console.pov_frame("\x1b[0m\x1b[2J\x1b[H");
+            if shared.console.is_color() {
+                shared.console.pov_frame("", "\x1b[0m\x1b[2J\x1b[H");
+            }
             shared.console.info("Live-POV beendet.");
         }
-        "frame" | "bild" | "once" => draw_once(shared, false),
+        "frame" | "bild" | "once" => draw_once(shared, false, true),
         "size" | "groesse" | "größe" => {
             let width = parts.next().and_then(|v| v.parse::<usize>().ok());
             let height = parts.next().and_then(|v| v.parse::<usize>().ok());
             match (width, height) {
                 (Some(width), Some(height)) => {
+                    let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
+                    let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
+                    shared.extras.pov.width.store(width, Ordering::Relaxed);
+                    shared.extras.pov.height.store(height, Ordering::Relaxed);
+                    shared.extras.pov.last_frame.store(0, Ordering::Relaxed);
                     shared
-                        .extras
-                        .pov
-                        .width
-                        .store(width.clamp(24, 160), Ordering::Relaxed);
-                    shared
-                        .extras
-                        .pov
-                        .height
-                        .store(height.clamp(12, 80), Ordering::Relaxed);
-                    shared.console.info(&format!(
-                        "POV-Groesse: {}x{} Pixel.",
-                        width.clamp(24, 160),
-                        height.clamp(12, 80)
-                    ));
+                        .console
+                        .info(&format!("POV-Groesse: {}x{} Pixel.", width, height));
                 }
                 _ => shared
                     .console
-                    .error("Nutzung: :pov size <breite> <hoehe>   z. B. :pov size 80 40"),
+                    .error("Nutzung: :pov size <breite> <hoehe>   z. B. :pov size 160 80"),
             }
         }
+        "fps" | "takt" => match parts.next().and_then(|v| v.parse::<usize>().ok()) {
+            Some(fps) => {
+                let fps = fps.clamp(1, 20);
+                shared.extras.pov.fps.store(fps, Ordering::Relaxed);
+                shared
+                    .console
+                    .info(&format!("POV: {} Bilder je Sekunde.", fps));
+            }
+            None => shared.console.error("Nutzung: :pov fps <1-20>"),
+        },
         "info" | "status" => {
-            let world = shared.extras.pov.world.lock().unwrap();
+            let pov = &shared.extras.pov;
+            let world = pov.world.lock().unwrap();
+            let sections: usize = world
+                .chunks
+                .values()
+                .map(|chunk| chunk.sections.iter().flatten().count())
+                .sum();
+            let dimension = world.dimension.clone();
+            let chunks = world.chunks.len();
+            let entities = world.entities.len();
+            drop(world);
             shared.console.info(&format!(
-                "POV: {} · y={}..{} · {} Chunks · {} Entities · {}",
-                world.dimension.name,
-                world.dimension.min_y,
-                world.dimension.min_y + world.dimension.height - 1,
-                world.chunks.len(),
-                world.entities.len(),
-                if shared.extras.pov.live.load(Ordering::Relaxed) {
+                "POV: {} · y={}..{} · {} Chunks · {} Abschnitte · {} Entities · {}x{} · {} fps · {}",
+                dimension.name,
+                dimension.min_y,
+                dimension.min_y + dimension.height - 1,
+                chunks,
+                sections,
+                entities,
+                pov.width.load(Ordering::Relaxed),
+                pov.height.load(Ordering::Relaxed),
+                pov.fps.load(Ordering::Relaxed),
+                if pov.live.load(Ordering::Relaxed) {
                     "live"
                 } else {
                     "gestoppt"
@@ -737,7 +1156,7 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         }
         _ => shared
             .console
-            .error("Nutzung: :pov live|stop|frame|size <breite> <hoehe>|info"),
+            .error("Nutzung: :pov live|stop|frame|size <breite> <hoehe>|fps <1-20>|info"),
     }
 }
 
@@ -755,14 +1174,19 @@ fn start_renderer(shared: &Arc<Shared>) {
     if thread::Builder::new()
         .name("afk-pov".into())
         .spawn(move || {
-            owned.console.pov_frame("\x1b[2J\x1b[H");
+            if owned.console.is_color() {
+                owned.console.pov_frame("", "\x1b[2J\x1b[H");
+            }
             while owned.running.load(Ordering::Relaxed)
                 && owned.extras.pov.live.load(Ordering::Relaxed)
             {
+                let started = Instant::now();
                 if owned.in_game.load(Ordering::Relaxed) {
-                    draw_once(&owned, true);
+                    draw_once(&owned, true, false);
                 }
-                thread::sleep(RENDER_INTERVAL);
+                let interval =
+                    Duration::from_millis(1000 / owned.extras.pov.fps.load(Ordering::Relaxed).max(1) as u64);
+                thread::sleep(interval.saturating_sub(started.elapsed()));
             }
             owned
                 .extras
@@ -780,17 +1204,46 @@ fn start_renderer(shared: &Arc<Shared>) {
     }
 }
 
-fn draw_once(shared: &Arc<Shared>, home: bool) {
+/// Ein Bild zeichnen. `home` setzt den Cursor davor zurück (Live-Betrieb im Terminal),
+/// `force` schreibt auch ein unverändertes Bild.
+fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
     let Some(position) = shared.position() else {
         return;
     };
-    let scene = shared.extras.pov.scene();
-    let width = shared.extras.pov.width.load(Ordering::Relaxed);
-    let height = shared.extras.pov.height.load(Ordering::Relaxed);
-    let frame = render(&scene, position, width, height, shared.console.is_color());
+    let pov = &shared.extras.pov;
+    let scene = pov.scene();
+    let width = pov.width.load(Ordering::Relaxed);
+    let height = pov.height.load(Ordering::Relaxed);
+    let color = shared.console.is_color();
+    let frame = render(&scene, position, width, height, color);
+
+    if !force && !frame_changed(pov, &frame) {
+        return;
+    }
+    // Cursor-Steuerung und Bild in einem Zug – sonst rutscht eine Statuszeile dazwischen.
     shared
         .console
-        .pov_frame(&format!("{}{}", if home { "\x1b[H" } else { "" }, frame));
+        .pov_frame(if home && color { "\x1b[H" } else { "" }, &frame);
+}
+
+/// Unveränderte Bilder auslassen – das spart bei einem stillstehenden Bot fast die ganze
+/// Ausgabe. Spätestens nach [`REPEAT_UNCHANGED`] wird trotzdem wieder geschrieben, damit ein
+/// Programm davor aus der Stille nicht schließt, die Ansicht sei tot.
+fn frame_changed(pov: &Pov, frame: &str) -> bool {
+    // FNV-1a: ein Durchlauf, keine Allokation.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in frame.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    let now = pov.started.elapsed().as_millis() as u64;
+    let previous = pov.last_frame.swap(hash, Ordering::Relaxed);
+    let since = now.saturating_sub(pov.last_frame_ms.load(Ordering::Relaxed));
+    if previous == hash && since < REPEAT_UNCHANGED.as_millis() as u64 {
+        return false;
+    }
+    pov.last_frame_ms.store(now, Ordering::Relaxed);
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -807,7 +1260,6 @@ fn render(
     color: bool,
 ) -> String {
     let origin = (position.0, position.1 + 1.62, position.2);
-    let vertical_fov = HORIZONTAL_FOV * height as f64 / width as f64;
     let mut pixels = vec![
         Pixel {
             rgb: (0, 0, 0),
@@ -816,14 +1268,24 @@ fn render(
         width * height
     ];
 
+    // Echte Zentralprojektion statt gleichmäßig verteilter Winkel: sonst „biegt" sich der
+    // Horizont bei 90° Blickfeld sichtbar nach außen.
+    let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
+    let half_height = half_width * height as f64 / width as f64;
+    let vertical_fov = 2.0 * half_height.atan().to_degrees();
+    let basis = camera_basis(position.3 as f64, position.4 as f64);
+
     for py in 0..height {
+        let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
+        let sky = sky_color(py, height);
         for px in 0..width {
-            let yaw = position.3 as f64 + ((px as f64 + 0.5) / width as f64 - 0.5) * HORIZONTAL_FOV;
-            let pitch =
-                position.4 as f64 + ((py as f64 + 0.5) / height as f64 - 0.5) * vertical_fov;
-            let direction = view_direction(yaw, pitch);
-            let sky = sky_color(py, height);
-            let pixel = match cast(scene, origin, direction) {
+            let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
+            let direction = normalize((
+                basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
+                basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
+                basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
+            ));
+            pixels[py * width + px] = match cast(scene, origin, direction) {
                 Some((state, distance, face)) => Pixel {
                     rgb: fog(block_color(state, face, distance), sky, distance),
                     depth: distance,
@@ -833,21 +1295,20 @@ fn render(
                     depth: MAX_DISTANCE,
                 },
             };
-            pixels[py * width + px] = pixel;
         }
     }
     overlay_entities(
-        scene,
         origin,
         position.3 as f64,
         position.4 as f64,
         vertical_fov,
         width,
         height,
+        &scene.entities,
         &mut pixels,
     );
 
-    let mut out = String::with_capacity(width * height * if color { 20 } else { 2 });
+    let mut out = String::with_capacity(width * height * if color { 24 } else { 2 } + 128);
     out.push_str(&format!(
         "POV  x={:.1} y={:.1} z={:.1}  Blick {:.0}/{:.0}  Chunks {}  (:pov stop)\n",
         position.0,
@@ -858,14 +1319,14 @@ fn render(
         scene.chunks.len()
     ));
     if color {
+        // Zwei Bildzeilen je Terminalzeile: Vordergrundfarbe oben, Hintergrundfarbe unten.
         for y in (0..height).step_by(2) {
             for x in 0..width {
                 let top = pixels[y * width + x].rgb;
                 let bottom = pixels[(y + 1).min(height - 1) * width + x].rgb;
-                out.push_str(&format!(
-                    "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
-                    top.0, top.1, top.2, bottom.0, bottom.1, bottom.2
-                ));
+                push_color(&mut out, "\x1b[38;2;", top);
+                push_color(&mut out, "\x1b[48;2;", bottom);
+                out.push('▀');
             }
             out.push_str("\x1b[0m\n");
         }
@@ -881,6 +1342,51 @@ fn render(
         }
     }
     out
+}
+
+/// `\x1b[38;2;r;g;bm` ohne `format!` – bei 160x80 sind das sonst 12 800 Allokationen je Bild.
+fn push_color(out: &mut String, prefix: &str, rgb: (u8, u8, u8)) {
+    out.push_str(prefix);
+    push_u8(out, rgb.0);
+    out.push(';');
+    push_u8(out, rgb.1);
+    out.push(';');
+    push_u8(out, rgb.2);
+    out.push('m');
+}
+
+fn push_u8(out: &mut String, value: u8) {
+    if value >= 100 {
+        out.push((b'0' + value / 100) as char);
+    }
+    if value >= 10 {
+        out.push((b'0' + (value / 10) % 10) as char);
+    }
+    out.push((b'0' + value % 10) as char);
+}
+
+/// Blickrichtung, Rechts- und Oben-Vektor der Kamera.
+type Basis = ((f64, f64, f64), (f64, f64, f64), (f64, f64, f64));
+
+fn camera_basis(yaw: f64, pitch: f64) -> Basis {
+    let forward = view_direction(yaw, pitch);
+    // Rechts liegt waagerecht (kein Rollen) – in Minecraft ist das (cos yaw, 0, sin yaw)·(-1).
+    let (sin, cos) = yaw.to_radians().sin_cos();
+    let right = (-cos, 0.0, -sin);
+    let up = (
+        right.1 * forward.2 - right.2 * forward.1,
+        right.2 * forward.0 - right.0 * forward.2,
+        right.0 * forward.1 - right.1 * forward.0,
+    );
+    (forward, right, up)
+}
+
+fn normalize(v: (f64, f64, f64)) -> (f64, f64, f64) {
+    let length = (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt();
+    if length < 1e-12 {
+        return (0.0, 0.0, 1.0);
+    }
+    (v.0 / length, v.1 / length, v.2 / length)
 }
 
 fn view_direction(yaw: f64, pitch: f64) -> (f64, f64, f64) {
@@ -910,10 +1416,9 @@ fn cast(scene: &Scene, origin: (f64, f64, f64), dir: (f64, f64, f64)) -> Option<
     let mut distance = 0.0;
     let mut face = 1usize;
     while distance <= MAX_DISTANCE {
-        if let Some(state) = scene.block(cell.0, cell.1, cell.2) {
-            if state != 0 {
-                return Some((state, distance, face));
-            }
+        // Erst die billige Sichtprüfung; die Zustands-ID kostet einen Palettenzugriff mehr.
+        if scene.solid(cell.0, cell.1, cell.2) == Some(true) {
+            return Some((scene.block(cell.0, cell.1, cell.2), distance, face));
         }
         if next.0 <= next.1 && next.0 <= next.2 {
             cell.0 += step.0;
@@ -1002,17 +1507,18 @@ fn fog(color: (u8, u8, u8), sky: (u8, u8, u8), distance: f64) -> (u8, u8, u8) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn overlay_entities(
-    scene: &Scene,
     origin: (f64, f64, f64),
     yaw: f64,
     pitch: f64,
     vertical_fov: f64,
     width: usize,
     height: usize,
+    entities: &[Entity],
     pixels: &mut [Pixel],
 ) {
-    for entity in &scene.entities {
+    for entity in entities {
         let dx = entity.x - origin.0;
         let dz = entity.z - origin.2;
         let horizontal = (dx * dx + dz * dz).sqrt();
@@ -1070,6 +1576,27 @@ mod tests {
     use super::*;
     use crate::buf::Writer;
 
+    const LEGACY: Format = Format {
+        modern_palette: false,
+        fluid_count: false,
+    };
+    const MODERN: Format = Format {
+        modern_palette: true,
+        fluid_count: false,
+    };
+    const MODERN_FLUID: Format = Format {
+        modern_palette: true,
+        fluid_count: true,
+    };
+
+    fn dimension(sections: i32) -> Dimension {
+        Dimension {
+            name: "test".into(),
+            min_y: 0,
+            height: sections * 16,
+        }
+    }
+
     #[test]
     fn blickrichtung_folgt_minecraft_winkeln() {
         let south = view_direction(0.0, 0.0);
@@ -1077,6 +1604,22 @@ mod tests {
         let west = view_direction(90.0, 0.0);
         assert!(west.0 < -0.999 && west.2.abs() < 1e-9);
         assert!(view_direction(0.0, -90.0).1 > 0.999);
+    }
+
+    /// Die Kamerabasis muss rechtwinklig sein, sonst kippt oder schert das Bild.
+    #[test]
+    fn kamerabasis_steht_senkrecht() {
+        for (yaw, pitch) in [(0.0, 0.0), (37.0, -20.0), (-140.0, 45.0)] {
+            let (forward, right, up) = camera_basis(yaw, pitch);
+            let dot = |a: (f64, f64, f64), b: (f64, f64, f64)| a.0 * b.0 + a.1 * b.1 + a.2 * b.2;
+            assert!(dot(forward, right).abs() < 1e-9, "{}/{}", yaw, pitch);
+            assert!(dot(forward, up).abs() < 1e-9, "{}/{}", yaw, pitch);
+            assert!(dot(right, up).abs() < 1e-9, "{}/{}", yaw, pitch);
+            // Rechts zeigt bei Blick nach Süden nach Westen (−X) – wie `:go rechts`.
+            if yaw == 0.0 {
+                assert!(right.0 < -0.999);
+            }
+        }
     }
 
     #[test]
@@ -1093,38 +1636,182 @@ mod tests {
         assert_eq!(unpack_chunk_pos(packed as i64), (42, -99));
     }
 
-    #[test]
-    fn singleton_abschnitt_legacy_und_modern() {
-        for modern in [false, true] {
-            let mut w = Writer::default();
-            w.u16(0); // Blockzahl
-            w.u8(0); // Singleton Blocks
-            w.var_int(0); // Luft
-            if !modern {
+    /// Ein Abschnitt: Zähler, Blockpalette, Biompalette. `states` sind 4096 Zustands-IDs.
+    fn write_section(w: &mut Writer, format: Format, states: &[u32], non_air: usize) {
+        w.u16(non_air as u16);
+        if format.fluid_count {
+            w.u16(0);
+        }
+        let mut palette: Vec<u32> = Vec::new();
+        for state in states {
+            if !palette.contains(state) {
+                palette.push(*state);
+            }
+        }
+        if palette.len() == 1 {
+            w.u8(0);
+            w.var_int(palette[0] as i32);
+            if !format.modern_palette {
                 w.var_int(0);
             }
-            w.u8(0); // Singleton Biome
-            w.var_int(1);
-            if !modern {
-                w.var_int(0);
+        } else {
+            let bits = (4u8..=8).find(|b| 1usize << b >= palette.len()).unwrap();
+            w.u8(bits);
+            w.var_int(palette.len() as i32);
+            for value in &palette {
+                w.var_int(*value as i32);
             }
-            let dimension = Dimension {
-                name: "test".into(),
-                min_y: 0,
-                height: 16,
-            };
-            let chunk = Chunk::decode(modern, false, &dimension, &w.data).unwrap();
-            assert_eq!(chunk.block(0, 0, 0), 0);
+            let per_long = 64 / bits as usize;
+            let longs = SECTION_BLOCKS.div_ceil(per_long);
+            if !format.modern_palette {
+                w.var_int(longs as i32);
+            }
+            let mut data = vec![0u64; longs];
+            for (index, state) in states.iter().enumerate() {
+                let slot = palette.iter().position(|v| v == state).unwrap() as u64;
+                data[index / per_long] |= slot << ((index % per_long) * bits as usize);
+            }
+            for long in data {
+                w.i64(long as i64);
+            }
+        }
+        // Biome: Singleton
+        w.u8(0);
+        w.var_int(1);
+        if !format.modern_palette {
+            w.var_int(0);
         }
     }
 
     #[test]
+    fn singleton_abschnitt_legacy_und_modern() {
+        for format in [LEGACY, MODERN, MODERN_FLUID] {
+            let mut w = Writer::default();
+            write_section(&mut w, format, &[0u32; SECTION_BLOCKS], 0);
+            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            assert_eq!(chunk.block(0, 0, 0), 0);
+            assert!(chunk.sections[0].is_none(), "reine Luft braucht keinen Platz");
+        }
+    }
+
+    /// Genau der Fall, der bisher den ganzen Prozess abgeschossen hat: ein Luftzustand, dessen
+    /// Häufigkeit größer ist als die Zahl der gesuchten Luftblöcke.
+    #[test]
+    fn haeufigkeit_groesser_als_luftmenge_stuerzt_nicht_ab() {
+        let values = [7u32, 42];
+        let counts = [394u32, 12];
+        let air = air_entries(&values, &counts, 90);
+        assert!(!air[0] && !air[1], "nichts darf erfunden werden");
+    }
+
+    /// Der Regelfall unter Tage: Zustand 0 fehlt, `cave_air` trägt die ganze Luftmenge.
+    #[test]
+    fn cave_air_wird_ueber_den_blockzaehler_erkannt() {
+        let values = [12u32, 5000, 1];
+        let counts = [1000u32, 2000, 1096];
+        let air = air_entries(&values, &counts, 2000);
+        assert!(air[1] && !air[0] && !air[2]);
+    }
+
+    /// Drei Luftzustände (air + cave_air + void_air) müssen sich ebenfalls auflösen lassen.
+    #[test]
+    fn drei_luftzustaende_werden_gefunden() {
+        let values = [0u32, 5000, 6000, 1];
+        let counts = [100u32, 200, 300, 3496];
+        let air = air_entries(&values, &counts, 600);
+        assert!(air[0] && air[1] && air[2] && !air[3]);
+    }
+
+    #[test]
     fn luft_wird_ueber_blockzaehler_erkannt() {
-        let mut blocks = vec![7u32; SECTION_BLOCKS];
-        blocks[..3000].fill(42); // cave_air-artiger zweiter Luftzustand
-        blocks[3000..3500].fill(0);
-        normalize_air(&mut blocks, SECTION_BLOCKS - 3500);
-        assert!(blocks[..3500].iter().all(|state| *state == 0));
-        assert!(blocks[3500..].iter().all(|state| *state == 7));
+        let mut states = vec![7u32; SECTION_BLOCKS];
+        states[..3000].fill(42); // cave_air-artiger zweiter Luftzustand
+        states[3000..3500].fill(0);
+        let mut w = Writer::default();
+        write_section(&mut w, MODERN, &states, SECTION_BLOCKS - 3500);
+        let chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        for index in 0..SECTION_BLOCKS {
+            let (x, y, z) = (
+                (index & 15) as i32,
+                (index >> 8) as i32,
+                ((index >> 4) & 15) as i32,
+            );
+            if index < 3500 {
+                assert_eq!(chunk.block(x, y, z), 0, "Block {} sollte Luft sein", index);
+            } else {
+                assert_eq!(chunk.block(x, y, z), 7, "Block {}", index);
+            }
+        }
+    }
+
+    /// Ein voller Abschnitt mit mehreren Zuständen muss Block für Block wieder herauskommen.
+    #[test]
+    fn palette_kommt_blockgenau_zurueck() {
+        let mut states = vec![0u32; SECTION_BLOCKS];
+        for (index, state) in states.iter_mut().enumerate() {
+            *state = (index % 5) as u32 + 1;
+        }
+        for format in [LEGACY, MODERN, MODERN_FLUID] {
+            let mut w = Writer::default();
+            write_section(&mut w, format, &states, SECTION_BLOCKS);
+            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            for index in 0..SECTION_BLOCKS {
+                let (x, y, z) = (
+                    (index & 15) as i32,
+                    (index >> 8) as i32,
+                    ((index >> 4) & 15) as i32,
+                );
+                assert_eq!(chunk.block(x, y, z), states[index], "Block {}", index);
+            }
+        }
+    }
+
+    /// Spricht der Server doch eine andere Spielart, findet `probe` sie – statt jeden Chunk zu
+    /// verwerfen, bis jemand die Tabelle von Hand nachzieht.
+    #[test]
+    fn falsches_format_wird_erkannt() {
+        let states = vec![1u32; SECTION_BLOCKS];
+        let mut w = Writer::default();
+        write_section(&mut w, MODERN_FLUID, &states, SECTION_BLOCKS);
+        let (chunk, format) = Format::probe(LEGACY, &dimension(1), &w.data).expect("erkannt");
+        assert_eq!(format, MODERN_FLUID);
+        assert_eq!(chunk.block(0, 0, 0), 1);
+    }
+
+    /// Setzt der Server einen Block, darf das den Rest des Chunks nicht verändern.
+    #[test]
+    fn blockaenderung_trifft_nur_den_einen_block() {
+        let states = vec![1u32; SECTION_BLOCKS];
+        let mut w = Writer::default();
+        write_section(&mut w, MODERN, &states, SECTION_BLOCKS);
+        let mut chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        chunk.set_block(3, 4, 5, 77);
+        assert_eq!(chunk.block(3, 4, 5), 77);
+        assert_eq!(chunk.block(3, 4, 6), 1);
+        chunk.set_block(3, 4, 5, 0);
+        assert_eq!(chunk.block(3, 4, 5), 0);
+        assert!(!chunk.solid(3, 4, 5));
+    }
+
+    /// Der Decoder bekommt vom Server beliebige Bytes. Er darf daran nie in Panik geraten –
+    /// `panic = "abort"` würde sonst den ganzen Client abschießen.
+    #[test]
+    fn beliebige_bytes_stuerzen_nicht_ab() {
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..400 {
+            let len = (random() % 4096) as usize;
+            let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            for format in [LEGACY, MODERN, MODERN_FLUID] {
+                let _ = Chunk::decode(format, &dimension(24), &data);
+            }
+            let _ = Format::probe(MODERN, &dimension(24), &data);
+            assert!(round < 400);
+        }
     }
 }

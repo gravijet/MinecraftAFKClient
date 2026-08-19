@@ -147,10 +147,15 @@ impl Console {
     /// Einen vollständigen POV-Frame direkt auf die Fehlerausgabe schreiben. Die normale
     /// Ausgabe bleibt zeilenorientiert; nur die ausdrücklich gestartete Live-Ansicht setzt den
     /// Cursor mit ANSI neu. Chat auf stdout bleibt davon vollständig getrennt.
+    ///
+    /// `prefix` (die Cursor-Steuerung) geht **unter derselben Sperre** raus wie das Bild.
+    /// Zwei getrennte Aufrufe ließen einen Zustandshinweis eines anderen Threads dazwischen
+    /// rutschen – ein Programm davor sähe dann eine Statuszeile mitten im Bild.
     #[cfg(feature = "pov")]
-    pub fn pov_frame(&self, frame: &str) {
+    pub fn pov_frame(&self, prefix: &str, frame: &str) {
         let mut err = std::io::stderr().lock();
-        let _ = write!(err, "{}", frame);
+        let _ = err.write_all(prefix.as_bytes());
+        let _ = err.write_all(frame.as_bytes());
         let _ = err.flush();
     }
 

@@ -23,7 +23,16 @@ Spielsitzung ist.
 
 ## POV bedienen
 
-Der POV-Client beginnt automatisch. Beim Ultra-Client stehen diese örtlichen Befehle bereit:
+Der POV-Client beginnt automatisch (mit 64x32), der Ultra-Client erst auf Befehl. Beide Vorgaben
+lassen sich beim Start umstellen:
+
+| Startargument | Wirkung |
+| --- | --- |
+| `--pov an` / `--pov aus` | Ansicht gleich nach dem Beitritt starten bzw. eben nicht |
+| `--pov-size 160x80` | Bildgröße von Anfang an, ohne den Umweg über `:pov size` |
+| `--pov-fps 4` | Bilder je Sekunde (1–20, Standard 8) |
+
+Örtliche Befehle im laufenden Client:
 
 | Befehl | Wirkung |
 | --- | --- |
@@ -31,7 +40,11 @@ Der POV-Client beginnt automatisch. Beim Ultra-Client stehen diese örtlichen Be
 | `:pov stop` | laufende Ansicht stoppen |
 | `:pov frame` | genau ein aktuelles Bild zeichnen |
 | `:pov size 80 40` | interne Bildgröße setzen (24–160 × 12–80 Pixel) |
+| `:pov fps 4` | Takt ändern |
 | `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Zahl und Zustand anzeigen |
+
+Die Bilder gehen auf die **Standardfehlerausgabe**; das genaue Format steht in
+[FEATURES.md](FEATURES.md#bildformat-der-live-pov) und ist als Schnittstelle zugesagt.
 
 Die Ansicht ist kein Textdump von Koordinaten: Der Client decodiert die tatsächlich geladenen
 Chunk-Paletten, hält Blockänderungen und Entities live nach und raycastet das Bild aus der aktuellen

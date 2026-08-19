@@ -81,14 +81,21 @@ fn start(shared: &Arc<Shared>) {
     if !shared.in_game.load(Ordering::Relaxed) {
         return; // beim nächsten Beitritt startet on_join ihn
     }
-    // Wer den Schalter von false auf true dreht, ist der eine Thread.
-    if shared
+    // Wer den Schalter von false auf true dreht, ist der eine Thread. Ist gerade noch einer am
+    // Aufräumen (`:antiafk off` direkt gefolgt von `:antiafk on`), wird kurz auf ihn gewartet –
+    // sonst stünde am Ende gar keiner mehr da.
+    let mut tries = 0;
+    while shared
         .extras
         .antiafk_running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return;
+        tries += 1;
+        if tries > 20 {
+            return; // es läuft wirklich noch einer – der liest das neue Intervall selbst
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 
     let generation = shared.generation.load(Ordering::SeqCst);

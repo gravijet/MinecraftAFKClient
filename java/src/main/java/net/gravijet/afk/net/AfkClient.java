@@ -577,7 +577,7 @@ public class AfkClient {
     private void sendClientSettings() {
         Session current = session;
         if (current != null && current.isConnected()) {
-            current.send(Net.clientInformation());
+            current.send(Net.clientInformation(options.viewDistance));
         }
     }
 

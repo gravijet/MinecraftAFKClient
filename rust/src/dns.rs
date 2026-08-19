@@ -19,29 +19,37 @@ pub fn resolve_srv(host: &str) -> Option<(String, u16)> {
     if host.parse::<std::net::IpAddr>().is_ok() {
         return None; // IP-Adresse: nichts aufzulösen
     }
-    let query = build_query(&format!("_minecraft._tcp.{}", host))?;
+    // Zufällige Transaktions-ID und Prüfung derselben in der Antwort: eine feste Kennung wäre
+    // für jeden, der auf dem Weg mitliest, eine Einladung, eine eigene Antwort vorzulegen.
+    let mut id = [0u8; 2];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    let query = build_query(&format!("_minecraft._tcp.{}", host), id)?;
     for resolver in RESOLVERS {
-        if let Some(answer) = ask(resolver, &query) {
+        if let Some(answer) = ask(resolver, &query, id) {
             return Some(answer);
         }
     }
     None
 }
 
-fn ask(resolver: &str, query: &[u8]) -> Option<(String, u16)> {
+fn ask(resolver: &str, query: &[u8], id: [u8; 2]) -> Option<(String, u16)> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.set_read_timeout(Some(TIMEOUT)).ok()?;
     socket.set_write_timeout(Some(TIMEOUT)).ok()?;
     socket.send_to(query, resolver).ok()?;
 
     let mut buf = [0u8; 512];
-    let (len, _) = socket.recv_from(&mut buf).ok()?;
-    parse_answer(&buf[..len])
+    let (len, from) = socket.recv_from(&mut buf).ok()?;
+    // Nur die Antwort des gefragten Resolvers zählt.
+    if from.to_string() != resolver {
+        return None;
+    }
+    parse_answer(&buf[..len], id)
 }
 
-fn build_query(name: &str) -> Option<Vec<u8>> {
+fn build_query(name: &str, id: [u8; 2]) -> Option<Vec<u8>> {
     let mut q = Vec::with_capacity(64);
-    q.extend_from_slice(&[0x13, 0x37]); // Transaktions-ID (fest, wir prüfen nur eine Antwort)
+    q.extend_from_slice(&id); // Transaktions-ID
     q.extend_from_slice(&[0x01, 0x00]); // Standardabfrage, Rekursion erwünscht
     q.extend_from_slice(&[0x00, 0x01]); // 1 Frage
     q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // keine Antworten/Autoritäten
@@ -59,8 +67,12 @@ fn build_query(name: &str) -> Option<Vec<u8>> {
     Some(q)
 }
 
-fn parse_answer(msg: &[u8]) -> Option<(String, u16)> {
-    if msg.len() < 12 || msg[0] != 0x13 || msg[1] != 0x37 {
+fn parse_answer(msg: &[u8], id: [u8; 2]) -> Option<(String, u16)> {
+    if msg.len() < 12 || msg[0] != id[0] || msg[1] != id[1] {
+        return None;
+    }
+    // Antwortbit gesetzt und Rückgabecode 0 – sonst ist es keine gültige Auskunft.
+    if msg[2] & 0x80 == 0 || msg[3] & 0x0F != 0 {
         return None;
     }
     let questions = u16::from_be_bytes([msg[4], msg[5]]);

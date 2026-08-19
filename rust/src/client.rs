@@ -43,6 +43,11 @@ const MAX_MESSAGE_CHARS: usize = 256;
 const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
 
+/// So viele Zeilen dürfen höchstens warten. Mehr kann bei einem Mindestabstand von einer
+/// Sekunde ohnehin niemand sinnvoll abarbeiten; ohne Grenze könnte eine dauerfeuernde
+/// `--on chat:`-Regel den Speicher langsam volllaufen lassen.
+const MAX_QUEUE: usize = 64;
+
 /// Warteschlange ausgehender Nachrichten – mit `clear()`, damit bei einem Server-Transfer keine
 /// veralteten Zeilen nachträglich im Chat landen.
 struct Queue {
@@ -166,7 +171,11 @@ impl Client {
                 .error("Nicht verbunden – Nachricht nicht gesendet.");
             return;
         }
-        self.shared.queue.push(input.to_string());
+        if !self.shared.queue.push(input.to_string()) {
+            self.shared
+                .console
+                .warn("Sendewarteschlange voll – die älteste Zeile ist herausgefallen.");
+        }
     }
 
     /// Örtlicher Befehl aus der Eingabeschleife (alles mit `:` vorn). Zusatzbefehle bekommen
@@ -234,9 +243,17 @@ impl Client {
 }
 
 impl Queue {
-    fn push(&self, item: String) {
-        self.items.lock().unwrap().push_back(item);
+    /// `false` = die Warteschlange war voll und die älteste Zeile ist herausgefallen.
+    fn push(&self, item: String) -> bool {
+        let mut items = self.items.lock().unwrap();
+        let dropped = items.len() >= MAX_QUEUE;
+        if dropped {
+            items.pop_front();
+        }
+        items.push_back(item);
+        drop(items);
         self.signal.notify_one();
+        !dropped
     }
 
     fn clear(&self) {
@@ -246,9 +263,23 @@ impl Queue {
 
 impl Shared {
     pub(crate) fn send(&self, packet: Writer) {
-        if let Some(writer) = self.writer.lock().unwrap().as_mut() {
-            let _ = writer.send(packet);
+        let mut guard = self.writer.lock().unwrap();
+        if let Some(writer) = guard.as_mut() {
+            if writer.send(packet).is_err() {
+                // `write_all` wiederholt nur Unterbrechungen selbst; was hier ankommt, ist ein
+                // echter Fehler oder der Schreib-Zeitablauf – in beiden Fällen kann schon ein
+                // halber Rahmen draußen sein. Weiterschreiben hieße Müll schicken, also Socket
+                // zu und die Verbindung sauber neu aufbauen lassen.
+                writer.shutdown();
+                *guard = None;
+            }
         }
+    }
+
+    /// Startargumente – die Zusatzteile lesen daraus ihre eigenen Einstellungen.
+    #[cfg(feature = "pov")]
+    pub(crate) fn options(&self) -> &Options {
+        &self.options
     }
 
     pub(crate) fn position(&self) -> Option<Position> {
@@ -279,7 +310,8 @@ impl Shared {
         for action in self.rules.fire(event) {
             self.console
                 .info(&format!("Regel ({}): {}", event.name(), action));
-            self.queue.push(action);
+            // Läuft die Warteschlange über, ist die älteste Zeile ohnehin die uninteressanteste.
+            let _ = self.queue.push(action);
         }
     }
 
@@ -425,6 +457,9 @@ fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
 // ===================== Netz-Thread =====================
 
 fn net_loop(shared: Arc<Shared>) {
+    // Ein Server, der uns im Kreis weiterreicht, darf keine Endlosschleife auf voller Last
+    // erzeugen: je Transfer in Folge wird ein Stück länger gewartet.
+    let mut transfers: u32 = 0;
     while shared.running.load(Ordering::Relaxed) {
         let result = run_connection(&shared);
 
@@ -450,7 +485,17 @@ fn net_loop(shared: Arc<Shared>) {
 
         if shared.intentional.swap(false, Ordering::SeqCst) {
             // Server-Transfer ist ein ausdrücklicher Protokollwechsel, kein Reconnect nach
-            // einem Kick. Deshalb wird nur in diesem Fall sofort weiterverbunden.
+            // einem Kick. Deshalb wird nur in diesem Fall weiterverbunden.
+            transfers = transfers.saturating_add(1);
+            if transfers > 3 {
+                let wait = Duration::from_millis(250 * u64::from(transfers.min(20)));
+                shared.console.warn(&format!(
+                    "{}. Transfer in Folge – warte {} ms.",
+                    transfers,
+                    wait.as_millis()
+                ));
+                thread::sleep(wait);
+            }
             continue;
         }
         shared
@@ -811,6 +856,9 @@ fn handle_game(
         In::StartConfiguration => {
             // Der Server holt uns zurück in die Konfigurationsphase (z. B. Ressourcen-Neuladen).
             shared.in_game.store(false, Ordering::SeqCst);
+            // Wir verlassen die Welt: die alte Position gilt nicht mehr, und alles, was sich
+            // darauf stützt (Bewegung, Live-Ansicht), soll das sofort merken.
+            *shared.position.lock().unwrap() = None;
             shared.send(Writer::packet(game.sb_configuration_acknowledged));
             session.state = State::Configuration;
         }
@@ -1108,10 +1156,15 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
 // ===================== gemeinsame Bausteine =====================
 
 /// Spieleinstellungen wie ein echter Client (manche Server erwarten das vor dem Spielbeitritt).
+///
+/// Die gemeldete Sichtweite ist der wirksamste Sparhebel des ganzen Clients: ohne Live-Ansicht
+/// wird kein einziger Chunk gelesen, der Server schickt sie aber trotzdem – und jedes Byte davon
+/// muss entschlüsselt und entpackt werden. Mit der kleinsten erlaubten Sichtweite (2) fällt der
+/// allergrößte Teil dieses Verkehrs einfach weg. Siehe [`crate::options::DEFAULT_VIEW_DISTANCE`].
 fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     let mut w = Writer::packet(packet_id);
     w.string("de_DE");
-    w.u8(8); // Sichtweite (Chunks) – wir laden ohnehin nichts
+    w.u8(shared.options.view_distance.clamp(2, 32));
     w.var_int(0); // ChatVisibility: FULL
     w.bool(true); // Chatfarben
     w.u8(0x7F); // alle Skin-Teile sichtbar

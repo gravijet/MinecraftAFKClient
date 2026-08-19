@@ -92,7 +92,29 @@ pub struct Options {
     pub antiafk_seconds: u64,
     /// Dauerhaft geduckt beitreten. Nur im Premium-Build wirksam.
     pub sneak: bool,
+
+    /// Sichtweite in Chunks, die dem Server gemeldet wird. Klein zu bleiben ist der billigste
+    /// Hebel überhaupt: der Server schickt dann viel weniger Chunkdaten, die der Client sonst
+    /// entschlüsseln und entpacken müsste, ohne sie je zu benutzen.
+    pub view_distance: u8,
+    /// Startet die Live-Ansicht von selbst? `None` = keine Angabe, dann entscheidet die
+    /// Bauform: die POV-Datei fängt selbst an, Ultra wartet auf `:pov live`. `--pov an|aus`
+    /// dreht das in beide Richtungen um.
+    pub pov_autostart: Option<bool>,
+    /// Bildgröße in Pixeln, falls auf der Kommandozeile vorgegeben.
+    pub pov_size: Option<(usize, usize)>,
+    /// Bilder je Sekunde.
+    pub pov_fps: usize,
+
+    /// Optionen, die dieser Client angenommen, aber nicht umgesetzt hat (weil es sie nur im
+    /// Java-Client gibt). Wird beim Start einmal genannt.
+    pub ignored: Vec<String>,
 }
+
+/// Sichtweite, die der jeweilige Build sinnvollerweise anfordert. Ohne Live-Ansicht liest der
+/// Client keinen einzigen Chunk – dann ist das Minimum genau richtig. Mit Live-Ansicht reicht
+/// etwas mehr als die 72 Blöcke, die die Ansicht überhaupt weit sieht.
+pub const DEFAULT_VIEW_DISTANCE: u8 = if cfg!(feature = "pov") { 6 } else { 2 };
 
 impl Default for Options {
     fn default() -> Self {
@@ -112,6 +134,11 @@ impl Default for Options {
             chat_min_delay_ms: 1000,
             antiafk_seconds: 0,
             sneak: false,
+            view_distance: DEFAULT_VIEW_DISTANCE,
+            pov_autostart: None,
+            pov_size: None,
+            pov_fps: 8,
+            ignored: Vec::new(),
         }
     }
 }
@@ -166,6 +193,25 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 };
             }
             "--sneak" => o.sneak = true,
+            "--view-distance" | "--sichtweite" => {
+                o.view_distance =
+                    number(&value("--view-distance")?, "--view-distance")?.clamp(2, 32) as u8
+            }
+            "--pov" | "--ansicht" => {
+                let mode = value("--pov")?;
+                o.pov_autostart = match mode.trim().to_ascii_lowercase().as_str() {
+                    "an" | "on" | "live" | "ein" | "1" => Some(true),
+                    "aus" | "off" | "0" => Some(false),
+                    other => {
+                        return Err(format!(
+                            "--pov nimmt 'an' oder 'aus', nicht '{}'.",
+                            other
+                        ))
+                    }
+                };
+            }
+            "--pov-size" | "--pov-groesse" => o.pov_size = Some(parse_size(&value("--pov-size")?)?),
+            "--pov-fps" => o.pov_fps = number(&value("--pov-fps")?, "--pov-fps")?.clamp(1, 20) as usize,
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
                 o.protocol = Protocol::find(&name).ok_or_else(|| {
@@ -184,6 +230,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             "--no-color" => o.color = false,
             "-q" | "--quiet" => o.quiet = true,
+
+            // Nur der Java-Client verbindet nach einem Abbruch neu. Ein Panel schickt allen
+            // Bauformen dieselbe Befehlszeile – daran darf der Start nicht scheitern.
+            "--no-reconnect" => o.ignored.push(arg.clone()),
+            "--reconnect-delay" | "--max-backoff" => {
+                value(&arg)?;
+                o.ignored.push(arg.clone());
+            }
 
             other if !other.starts_with('-') && o.server.is_empty() => o.server = other.to_string(),
             other => return Err(format!("Unbekannte Option '{}'. --help zeigt alle.", other)),
@@ -206,12 +260,43 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
     Ok(Command::Run(Box::new(o)))
 }
 
+/// `--pov-size 160x80` (auch `160*80` oder `160 80`).
+fn parse_size(input: &str) -> Result<(usize, usize), String> {
+    let text = input.trim().to_ascii_lowercase();
+    let (width, height) = text
+        .split_once(['x', '*', ':'])
+        .or_else(|| text.split_once(char::is_whitespace))
+        .ok_or_else(|| format!("--pov-size braucht <breite>x<hoehe>, z. B. 160x80. Bekommen: '{}'", input))?;
+    let parse = |part: &str, what: &str| {
+        part.trim()
+            .parse::<usize>()
+            .map_err(|_| format!("--pov-size: {} ist keine Zahl: '{}'", what, part))
+    };
+    Ok((parse(width, "Breite")?, parse(height, "Hoehe")?))
+}
+
 /// `--fakehost lobby.example.net` oder `--fakehost lobby.example.net:25565`.
 ///
 /// Steht kein Port dabei, wird der des echten Servers eingesetzt – das erledigt der Client,
 /// hier steht dann die 0.
 fn parse_fakehost(input: &str) -> Result<(String, u16), String> {
     let text = input.trim();
+    // `[::1]:25565` bzw. eine nackte IPv6-Adresse dürfen nicht am Doppelpunkt zerfallen.
+    if let Some(end) = text.strip_prefix('[').and_then(|v| v.find(']')) {
+        let host = text[1..end + 1].to_string();
+        let rest = &text[end + 2..];
+        let port = match rest.strip_prefix(':') {
+            Some(port) => port
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| format!("--fakehost: Port ist keine Zahl: '{}'", port))?,
+            None => 0,
+        };
+        return Ok((host, port));
+    }
+    if text.matches(':').count() > 1 {
+        return Ok((text.to_string(), 0)); // nackte IPv6-Adresse
+    }
     let (host, port) = match text.rsplit_once(':') {
         Some((host, port)) => (
             host,
@@ -441,6 +526,46 @@ mod tests {
         assert_eq!(options(&["x", "--antiafk", "0"]).antiafk_seconds, 0);
         assert_eq!(options(&["x", "--antiafk", "3"]).antiafk_seconds, 15);
         assert_eq!(options(&["x", "--antiafk", "90"]).antiafk_seconds, 90);
+    }
+
+    /// Ein Panel schickt allen Bauformen dieselbe Befehlszeile. Optionen, die es nur im
+    /// Java-Client gibt, dürfen den Start deshalb nicht abbrechen.
+    #[test]
+    fn java_optionen_werden_angenommen_und_gemeldet() {
+        let o = options(&[
+            "x",
+            "--no-reconnect",
+            "--reconnect-delay",
+            "5",
+            "--max-backoff",
+            "60",
+        ]);
+        assert_eq!(o.ignored, vec!["--no-reconnect", "--reconnect-delay", "--max-backoff"]);
+        assert_eq!(o.server, "x");
+        // Ein echter Tippfehler bleibt ein Fehler.
+        assert!(parse_args(&["x", "--kein-schalter"]).is_err());
+    }
+
+    /// Ohne Live-Ansicht wird kein Chunk gelesen – dann muss die kleinste Sichtweite raus.
+    #[test]
+    fn sichtweite_hat_grenzen() {
+        assert_eq!(options(&["x"]).view_distance, DEFAULT_VIEW_DISTANCE);
+        assert_eq!(options(&["x", "--view-distance", "0"]).view_distance, 2);
+        assert_eq!(options(&["x", "--view-distance", "99"]).view_distance, 32);
+        assert_eq!(options(&["x", "--view-distance", "12"]).view_distance, 12);
+    }
+
+    #[test]
+    fn pov_groesse_und_takt() {
+        assert_eq!(options(&["x", "--pov-size", "160x80"]).pov_size, Some((160, 80)));
+        assert_eq!(options(&["x", "--pov-size", "80*40"]).pov_size, Some((80, 40)));
+        assert_eq!(options(&["x", "--pov-fps", "99"]).pov_fps, 20);
+        // Ohne Angabe entscheidet die Bauform, nicht die Optionsauswertung.
+        assert_eq!(options(&["x"]).pov_autostart, None);
+        assert_eq!(options(&["x", "--pov", "an"]).pov_autostart, Some(true));
+        assert_eq!(options(&["x", "--pov", "aus"]).pov_autostart, Some(false));
+        assert!(parse_args(&["x", "--pov-size", "gross"]).is_err());
+        assert!(parse_args(&["x", "--pov", "vielleicht"]).is_err());
     }
 
     #[test]

@@ -50,8 +50,11 @@ java -jar afk-26.1.jar mc.example.net -c 300:/afk
 ## Optionen
 
 Die Grundoptionen verstehen beide Clients gleich. Die mit **R** markierten gibt es nur im
-Rust-Client, die mit **P** nur im Premium-Build (der schlanke Rust-Client nimmt sie an und sagt,
-dass er sie ignoriert – so kann das Panel allen Bauformen dieselbe Befehlszeile schicken).
+Rust-Client, die mit **P** nur im Premium-Build, die mit **V** nur in den POV-Bauformen. Jede
+Bauform **nimmt auch die Optionen der anderen an** und sagt nur, dass sie sie ignoriert – so kann
+das Panel allen Bauformen dieselbe Befehlszeile schicken. Das gilt in beide Richtungen: der
+Java-Client schluckt `--offline`, `--proxy`, `--pov …`, der Rust-Client `--no-reconnect`,
+`--reconnect-delay`, `--max-backoff`.
 
 | Option | Bedeutung |
 | --- | --- |
@@ -66,11 +69,15 @@ dass er sie ignoriert – so kann das Panel allen Bauformen dieselbe Befehlszeil
 | `--on <auslöser>=<aktion>` | **R** Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
 | `--on-cooldown <sek>` | **R** Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
 | `--chat-delay <ms>` | Mindestabstand ausgehender Nachrichten (Standard 1000, gegen Spam-Kick) |
+| `--view-distance <n>` | dem Server gemeldete Sichtweite in Chunks, 2–32. Standard 2 – die POV-Bauformen 6, weil nur sie Chunks überhaupt auswerten. Kleiner heißt weniger Bandbreite, CPU und RAM. Auch `--sichtweite`. |
 | `--no-color` | keine ANSI-Farben |
 | `-q`, `--quiet` | keine Statusmeldungen – wirklich nur Chat |
 | `--events` | **R** zusätzlich maschinenlesbare `@event …`-Zeilen (auch mit `-q`) |
 | `--antiafk <sek>` | **P** alle `sek` Sekunden eine kleine Bewegung (mindestens 15, `0` = aus) |
 | `--sneak` | **P** beim Beitritt geduckt bleiben |
+| `--pov <an\|aus>` | **V** Live-Ansicht gleich nach dem Beitritt starten. Standard: POV-Datei `an`, Ultra `aus`. |
+| `--pov-size <b>x<h>` | **V** Auflösung der Live-Ansicht, 24–160 × 12–80 (Standard 64x32). Trennzeichen `x`, `*`, `:` oder Leerzeichen; auch `--pov-groesse`. |
+| `--pov-fps <n>` | **V** Bilder je Sekunde, 1–20 (Standard 8) |
 | `--login` | Microsoft-Konto anmelden und beenden |
 | `--accounts` | gespeicherte Konten auflisten und beenden |
 | `-h`, `--help` | Hilfe |
@@ -90,6 +97,9 @@ Der Client ist bewusst pipe-fähig – kein Rohmodus-Terminal, keine Statuszeile
   wirklich schiefgeht.
 * **Standardeingabe**: jede Zeile geht als Chat-Nachricht raus, mit `/` vorn als Serverbefehl.
   Endet die Eingabe (kein Terminal), läuft der Client einfach weiter.
+* **Live-POV**: die Bilder gehen ebenfalls auf die Standardfehlerausgabe, in einem festen,
+  maschinenlesbaren Format – siehe [FEATURES.md](FEATURES.md#bildformat-der-live-pov). Das Format
+  ist eine zugesagte Schnittstelle und ändert sich nicht ohne Not.
 
 Damit reicht ein Prozess-Start mit Pipes; ein eigenes Protokoll braucht es nicht.
 
@@ -164,7 +174,12 @@ Einzeln:
 ```bash
 ./gradlew :java:shadowJar -Pmc=26.1     # -> java/build/libs/afk-26.1.jar
 cd rust && cargo build --release        # -> rust/target/release/afk[.exe]
+cd rust && cargo test --features ultra  # Unit- und Ende-zu-Ende-Tests
 ```
+
+`cargo test` startet für die Ende-zu-Ende-Tests einen nachgebauten Minecraft-Server im selben
+Prozess und lässt die wirklich gebaute Datei dagegen laufen – Beitritt, Chat, Befehle, gemeldete
+Sichtweite und das Bildformat der Live-POV werden also am Socket geprüft, nicht nur im Kopf.
 
 Gradle braucht ein **JDK 21** (unter Java 25 startet es nicht); die fertigen Jars laufen auf jedem
 Java ab 21. Der Rust-Client braucht nur eine stabile Rust-Toolchain – unter Windows mit

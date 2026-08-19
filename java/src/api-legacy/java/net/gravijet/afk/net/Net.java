@@ -71,10 +71,15 @@ final class Net {
         session.connect();
     }
 
-    /** Spieleinstellungen wie ein echter Client (manche Server erwarten das). */
-    static Packet clientInformation() {
+    /**
+     * Spieleinstellungen wie ein echter Client (manche Server erwarten das).
+     *
+     * <p>Die Sichtweite ist dabei kein Beiwerk: Sie entscheidet, wie viele Chunkdaten der Server
+     * schickt – und die entpackt die Bibliothek alle, auch wenn dieser Client sie nie ansieht.
+     */
+    static Packet clientInformation(int viewDistance) {
         return new ServerboundClientInformationPacket(
-                "de_DE", 8, ChatVisibility.FULL, true,
+                "de_DE", Math.min(32, Math.max(2, viewDistance)), ChatVisibility.FULL, true,
                 SKIN_PARTS, HandPreference.RIGHT_HAND,
                 false, true);
     }

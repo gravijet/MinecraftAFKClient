@@ -1290,7 +1290,9 @@ fn route(shared: &Arc<Shared>, arg: &str) {
                 },
             };
             shared.mover.edit(|s| {
-                s.route.remove(index);
+                if index < s.route.len() {
+                    s.route.remove(index);
+                }
             });
             console.info(&format!("Wegpunkt {} entfernt.", index + 1));
         }

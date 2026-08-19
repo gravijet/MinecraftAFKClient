@@ -25,12 +25,6 @@ impl<'a> Reader<'a> {
         self.data.len() - self.pos
     }
 
-    pub fn rest(&mut self) -> &'a [u8] {
-        let out = &self.data[self.pos..];
-        self.pos = self.data.len();
-        out
-    }
-
     pub fn bytes(&mut self, n: usize) -> io::Result<&'a [u8]> {
         if self.remaining() < n {
             return Err(err("Paket zu kurz"));
@@ -241,21 +235,51 @@ pub fn uuid_to_dashed(u: &[u8; 16]) -> String {
 
 /// UUID-Text (mit oder ohne Bindestriche) -> 16 Bytes
 pub fn uuid_from_str(s: &str) -> Option<[u8; 16]> {
-    let clean: String = s.chars().filter(|c| *c != '-').collect();
+    // Über Bytes, nicht über Zeichen: `&text[i..i + 2]` schnitte sonst mitten durch ein
+    // Mehrbyte-Zeichen und beendete den Prozess. 32 Bytes sind nicht zwingend 32 Zeichen,
+    // und die UUID kommt aus einer Serverantwort bzw. aus einer Kontodatei.
+    let clean: Vec<u8> = s.bytes().filter(|b| *b != b'-').collect();
     if clean.len() != 32 {
         return None;
     }
+    let digit = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
     let mut out = [0u8; 16];
     for i in 0..16 {
-        out[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+        out[i] = (digit(clean[i * 2])? << 4) | digit(clean[i * 2 + 1])?;
     }
     Some(out)
 }
 
 pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+        s.push(DIGITS[(*b >> 4) as usize] as char);
+        s.push(DIGITS[(*b & 0x0f) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 32 Bytes sind nicht 32 Zeichen: Ein solcher Text darf `None` liefern, nicht abstürzen.
+    #[test]
+    fn uuid_aus_unsinn_stuerzt_nicht_ab() {
+        let echt = "069a79f4-44e9-4726-a5be-fca90e38aaf5";
+        assert!(uuid_from_str(echt).is_some());
+        assert_eq!(uuid_to_dashed(&uuid_from_str(echt).unwrap()), echt);
+        assert!(uuid_from_str(&"ä".repeat(16)).is_none());
+        assert!(uuid_from_str("€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€").is_none());
+        assert!(uuid_from_str("zz9a79f444e94726a5befca90e38aaf5").is_none());
+        assert!(uuid_from_str("").is_none());
+        assert!(uuid_from_str("069a79f4").is_none());
+    }
+
+    #[test]
+    fn hex_schreibt_wie_format() {
+        assert_eq!(hex(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(hex(&[]), "");
+    }
 }

@@ -126,6 +126,12 @@ fn run(options: Options) {
 /// Das Panel schickt allen Bauformen dieselben Argumente. Damit `--antiafk` im schlanken Build
 /// nicht still verpufft, wird hier einmal gesagt, was dieser Build nicht kann.
 fn warn_about_unused_options(console: &Console, options: &Options) {
+    if !options.ignored.is_empty() {
+        console.warn(&format!(
+            "{} gibt es nur im Java-Client; wird ignoriert (dieser Client verbindet nie              automatisch neu).",
+            options.ignored.join(", ")
+        ));
+    }
     #[cfg(feature = "antiafk")]
     let _ = options;
     #[cfg(not(feature = "antiafk"))]
@@ -140,7 +146,13 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
             console.warn("--sneak braucht den Premium- oder Ultra-Client; wird ignoriert.");
         }
     }
-    #[cfg(feature = "state")]
+    #[cfg(not(feature = "pov"))]
+    {
+        if options.pov_size.is_some() || options.pov_autostart.is_some() {
+            console.warn("--pov/--pov-size brauchen die POV- oder Ultra-Datei; wird ignoriert.");
+        }
+    }
+    #[cfg(all(feature = "state", feature = "pov"))]
     let _ = console;
 }
 
@@ -249,6 +261,7 @@ fn print_usage() {
          \x20 -m, --mc <version>          Protokoll: {}  (Standard: {})\n\
          \x20     --proxy <adresse>       socks5://[nutzer:pass@]host:port oder http://...\n\
          \x20     --fakehost <host[:port]> diese Adresse im Handshake statt der echten\n\
+         \x20     --view-distance <2-32>  gemeldete Sichtweite in Chunks (Standard: {})\n\
          \n\
          Befehle und Makros:\n\
          \x20 -c, --cmd [sek:]<befehl>    Befehl nach dem Beitritt, mehrfach angebbar.\n\
@@ -265,7 +278,7 @@ fn print_usage() {
          \x20 -q, --quiet                 keine Statusmeldungen, nur Chat\n\
          \x20     --events                zusaetzlich '@event ...'-Zeilen zum Mitlesen\n\
          \x20 -h, --help                  diese Hilfe\n\
-         {}\n\
+         {}{}\n\
          Beispiel:\n\
          \x20 afk mc.example.net --mc 26.1 -c 300:/afk --on death=/spawn\n\
          \n\
@@ -290,10 +303,19 @@ fn print_usage() {
         },
         Protocol::names(),
         proto::DEFAULT.name,
+        options::DEFAULT_VIEW_DISTANCE,
         if cfg!(feature = "antiafk") {
             "\nPremium:\n\
              \x20     --antiafk <sek>         alle <sek> eine kleine Bewegung (min. 15, 0 = aus)\n\
              \x20     --sneak                 beim Beitritt geduckt bleiben\n"
+        } else {
+            ""
+        },
+        if cfg!(feature = "pov") {
+            "\nLive-Ansicht:\n\
+             \x20     --pov an|aus            Ansicht beim Beitritt starten (POV an, Ultra aus)\n\
+             \x20     --pov-size <b>x<h>      Bildgroesse in Pixeln, z. B. 160x80 (Standard 64x32)\n\
+             \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n"
         } else {
             ""
         },

@@ -6,9 +6,8 @@
 use crate::buf::{err, Reader, Writer};
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use flate2::Compression;
+use flate2::{Compression, Decompress, FlushDecompress};
 use std::io::{self, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -16,41 +15,64 @@ use std::time::Duration;
 /// Antwortet der Server so lange nicht, gilt die Verbindung als tot (Server sendet KeepAlive
 /// im 15-Sekunden-Takt – 120 s Stille heißt: da kommt nichts mehr).
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// Nimmt die Gegenstelle nichts mehr an, darf das Senden nicht ewig blockieren: der Sender hält
+/// dabei die Schreibsperre, an der auch der Netz-Thread hängt (KeepAlive!).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ===================== AES-128-CFB8 =====================
 
+/// CFB8 mit einem Schieberegister doppelter Länge: statt je Byte 15 Bytes umzukopieren, wandert
+/// nur ein Zeiger weiter. Bei Chunkverkehr geht jedes empfangene Byte hier durch.
 pub struct Cfb8 {
     aes: Aes128,
-    iv: [u8; 16],
+    /// 32 Byte Ringspeicher; die gültigen 16 Byte beginnen bei `at`.
+    register: [u8; 32],
+    at: usize,
 }
 
 impl Cfb8 {
     pub fn new(key: &[u8; 16]) -> Self {
+        let mut register = [0u8; 32];
+        register[..16].copy_from_slice(key); // Minecraft nutzt den Schlüssel zugleich als IV
         Cfb8 {
             aes: Aes128::new(key.into()),
-            iv: *key, // Minecraft nutzt den Schlüssel zugleich als IV
+            register,
+            at: 0,
         }
+    }
+
+    /// Ein Byte: AES über die aktuellen 16 Registerbytes, dann das Chiffrat hinten anhängen.
+    /// Das Register wandert dabei nach rechts durch den Puffer und wird nur alle 16 Bytes
+    /// einmal an den Anfang zurückgefaltet – statt bei jedem Byte 15 Bytes umzukopieren.
+    #[inline]
+    fn step(&mut self, cipher_byte: impl FnOnce(u8) -> (u8, u8)) -> u8 {
+        if self.at == 16 {
+            self.register.copy_within(16..32, 0);
+            self.at = 0;
+        }
+        let iv: [u8; 16] = self.register[self.at..self.at + 16].try_into().unwrap();
+        let mut block = iv.into();
+        self.aes.encrypt_block(&mut block);
+        let (out, feedback) = cipher_byte(block[0]);
+        self.register[self.at + 16] = feedback;
+        self.at += 1;
+        out
     }
 
     pub fn encrypt(&mut self, data: &mut [u8]) {
         for byte in data.iter_mut() {
-            let mut block = self.iv.into();
-            self.aes.encrypt_block(&mut block);
-            let cipher = *byte ^ block[0];
-            self.iv.copy_within(1.., 0);
-            self.iv[15] = cipher;
-            *byte = cipher;
+            let plain = *byte;
+            *byte = self.step(|key| {
+                let cipher = plain ^ key;
+                (cipher, cipher)
+            });
         }
     }
 
     pub fn decrypt(&mut self, data: &mut [u8]) {
         for byte in data.iter_mut() {
-            let mut block = self.iv.into();
-            self.aes.encrypt_block(&mut block);
             let cipher = *byte;
-            *byte = cipher ^ block[0];
-            self.iv.copy_within(1.., 0);
-            self.iv[15] = cipher;
+            *byte = self.step(|key| (cipher ^ key, cipher));
         }
     }
 }
@@ -62,15 +84,21 @@ pub struct PacketReader {
     dec: Option<Cfb8>,
     threshold: i32,
     frame: Vec<u8>,
+    /// Ein einziger zlib-Zustand für die ganze Verbindung: `ZlibDecoder::new` je Paket würde
+    /// bei Chunkverkehr tausende Male einen 32-KB-Fensterpuffer anlegen und wegwerfen.
+    inflate: Decompress,
 }
 
 impl PacketReader {
     pub fn new(stream: TcpStream) -> Self {
         PacketReader {
-            stream: BufReader::with_capacity(4096, stream),
+            // 32 KB statt 4 KB: ein Chunk-Paket kommt selten in einem Stück, und jeder
+            // `read_exact` unter der Puffergröße ist ein Systemaufruf weniger.
+            stream: BufReader::with_capacity(32 * 1024, stream),
             dec: None,
             threshold: -1,
             frame: Vec::new(),
+            inflate: Decompress::new(true),
         }
     }
 
@@ -129,18 +157,22 @@ impl PacketReader {
         // Mit Kompression: VarInt „Länge im entpackten Zustand"; 0 = unkomprimiert übertragen.
         let mut r = Reader::new(&self.frame);
         let uncompressed_len = r.var_int()?;
-        let rest = r.rest();
+        let start = self.frame.len() - r.remaining();
         if uncompressed_len == 0 {
-            out.extend_from_slice(rest);
-        } else {
-            if uncompressed_len < 0 || uncompressed_len > 32 * 1024 * 1024 {
-                return Err(err("Unplausible entpackte Laenge"));
-            }
-            out.reserve(uncompressed_len as usize);
-            ZlibDecoder::new(rest).read_to_end(out)?;
-            if out.len() != uncompressed_len as usize {
-                return Err(err("Entpackte Laenge weicht ab"));
-            }
+            out.extend_from_slice(&self.frame[start..]);
+            return Ok(());
+        }
+        if uncompressed_len < 0 || uncompressed_len > 32 * 1024 * 1024 {
+            return Err(err("Unplausible entpackte Laenge"));
+        }
+        let expected = uncompressed_len as usize;
+        out.reserve(expected);
+        self.inflate.reset(true);
+        self.inflate
+            .decompress_vec(&self.frame[start..], out, FlushDecompress::Finish)
+            .map_err(|e| err(&format!("zlib: {}", e)))?;
+        if out.len() != expected {
+            return Err(err("Entpackte Laenge weicht ab"));
         }
         Ok(())
     }
@@ -161,6 +193,14 @@ impl PacketWriter {
 
     pub fn set_threshold(&mut self, threshold: i32) {
         self.threshold = threshold;
+    }
+
+    /// Verbindung hart schließen. Nach einem gescheiterten Schreibvorgang ist der Strom
+    /// unbrauchbar – ein Zeitablauf kann mitten im Rahmen zugeschlagen haben, dann steht die
+    /// Gegenstelle auf einer halben Paketlänge. Der lesende Thread bekommt dadurch sofort ein
+    /// Dateiende, statt bis zum Lese-Zeitablauf weiterzuschlafen.
+    pub fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 
     pub fn send(&mut self, packet: Writer) -> io::Result<()> {
@@ -212,6 +252,7 @@ pub fn connect(
     };
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let write_half = stream.try_clone()?;
     Ok((
         PacketReader::new(stream),
@@ -221,4 +262,66 @@ pub fn connect(
             threshold: -1,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Vergleichsimplementierung: CFB8 direkt aus der Definition, ohne Ringspeicher.
+    fn reference(key: &[u8; 16], data: &[u8], encrypt: bool) -> Vec<u8> {
+        let aes = Aes128::new(key.into());
+        let mut iv = *key;
+        let mut out = Vec::with_capacity(data.len());
+        for byte in data {
+            let mut block = iv.into();
+            aes.encrypt_block(&mut block);
+            let (result, feedback) = if encrypt {
+                let cipher = byte ^ block[0];
+                (cipher, cipher)
+            } else {
+                (byte ^ block[0], *byte)
+            };
+            iv.copy_within(1.., 0);
+            iv[15] = feedback;
+            out.push(result);
+        }
+        out
+    }
+
+    /// Der Ringspeicher muss Byte für Byte dasselbe liefern wie die einfache Fassung – auch
+    /// über die Registergrenze hinweg (deshalb deutlich mehr als 32 Bytes).
+    #[test]
+    fn cfb8_stimmt_mit_der_definition_ueberein() {
+        let key = [
+            9u8, 1, 2, 3, 250, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 200,
+        ];
+        let plain: Vec<u8> = (0..500u32).map(|i| (i * 37 % 251) as u8).collect();
+
+        let mut mine = plain.clone();
+        Cfb8::new(&key).encrypt(&mut mine);
+        assert_eq!(mine, reference(&key, &plain, true));
+
+        let mut back = mine.clone();
+        Cfb8::new(&key).decrypt(&mut back);
+        assert_eq!(back, plain);
+    }
+
+    /// Der Zustand darf sich nicht daran stören, wie die Bytes auf Aufrufe verteilt sind –
+    /// aus dem Netz kommen sie in beliebigen Stücken.
+    #[test]
+    fn cfb8_haengt_nicht_an_der_stueckelung() {
+        let key = [42u8; 16];
+        let plain: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+
+        let mut whole = plain.clone();
+        Cfb8::new(&key).encrypt(&mut whole);
+
+        let mut piecewise = plain.clone();
+        let mut cipher = Cfb8::new(&key);
+        for chunk in piecewise.chunks_mut(7) {
+            cipher.encrypt(chunk);
+        }
+        assert_eq!(whole, piecewise);
+    }
 }
