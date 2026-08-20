@@ -13,7 +13,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use rsa::pkcs8::EncodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -723,7 +723,18 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
 
     // Auflegen, sobald der Chat draußen ist: Der Client muss die Zeilen dann trotzdem noch
     // vollständig ausgeben, bevor er sich beendet.
+    //
+    // Nur die **Schreibrichtung** schließen und danach weiter mitlesen. Ein hartes Schließen mit
+    // noch ungelesenen Daten im eigenen Empfangspuffer schickt ein RST – und ein RST wirft dem
+    // Client seinen Empfangspuffer weg, mitsamt der Chatzeilen, die noch darin stehen. Der Test
+    // prüfte dann nicht mehr den Client, sondern das Verhalten des Netzstapels.
     if plan.close_after_chat {
+        let _ = out
+            .lock()
+            .unwrap()
+            .stream
+            .shutdown(std::net::Shutdown::Write);
+        while conn.recv().is_some() {}
         return;
     }
 
@@ -798,9 +809,10 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
         } else if id == chat {
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::Chat(c.string()));
-        } else {
-            let _ = tx.send(Note::Packet(id, payload.len()));
         }
+        // Zusätzlich immer die rohe Länge: Sie verrät, ob ein Paket den Aufbau der jeweiligen
+        // Protokollversion hat – ein Feld zu viel oder zu wenig fällt genau daran auf.
+        let _ = tx.send(Note::Packet(id, payload.len()));
     }
 }
 
@@ -1064,6 +1076,158 @@ fn write_mixed_section(data: &mut Buf, ids: &Ids) {
     }
 }
 
+// ===================== Proxys =====================
+//
+// Zwei winzige Proxys, damit der `--proxy`-Weg des Clients an einem echten Socket läuft und nicht
+// nur im Kopf. Beide nehmen genau eine Verbindung an, führen ihr Handshake durch und reichen
+// danach nur noch Bytes durch – ab dann ist es eine ganz gewöhnliche TCP-Verbindung.
+
+/// SOCKS5 nach RFC 1928 (Anmeldung nach RFC 1929, falls `login` gesetzt ist).
+pub fn start_socks5(target: u16, login: Option<(String, String)>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut client, _)) = listener.accept() else {
+            return;
+        };
+        // Begrüßung: Version, Zahl der angebotenen Verfahren, die Verfahren selbst.
+        let mut head = [0u8; 2];
+        if client.read_exact(&mut head).is_err() || head[0] != 0x05 {
+            return;
+        }
+        let mut methods = vec![0u8; head[1] as usize];
+        if client.read_exact(&mut methods).is_err() {
+            return;
+        }
+        let want = if login.is_some() { 0x02 } else { 0x00 };
+        if !methods.contains(&want) {
+            let _ = client.write_all(&[0x05, 0xFF]);
+            return;
+        }
+        if client.write_all(&[0x05, want]).is_err() {
+            return;
+        }
+
+        if let Some((user, pass)) = &login {
+            let mut version = [0u8; 2];
+            if client.read_exact(&mut version).is_err() || version[0] != 0x01 {
+                return;
+            }
+            let mut name = vec![0u8; version[1] as usize];
+            if client.read_exact(&mut name).is_err() {
+                return;
+            }
+            let mut length = [0u8; 1];
+            if client.read_exact(&mut length).is_err() {
+                return;
+            }
+            let mut password = vec![0u8; length[0] as usize];
+            if client.read_exact(&mut password).is_err() {
+                return;
+            }
+            let ok = name == user.as_bytes() && password == pass.as_bytes();
+            let _ = client.write_all(&[0x01, u8::from(!ok)]);
+            if !ok {
+                return;
+            }
+        }
+
+        // CONNECT: Version, Befehl, reserviert, Adresstyp – danach die Adresse und der Port.
+        let mut request = [0u8; 4];
+        if client.read_exact(&mut request).is_err() || request[1] != 0x01 {
+            return;
+        }
+        let skip = match request[3] {
+            0x01 => 4,
+            0x04 => 16,
+            0x03 => {
+                let mut length = [0u8; 1];
+                if client.read_exact(&mut length).is_err() {
+                    return;
+                }
+                length[0] as usize
+            }
+            _ => return,
+        };
+        let mut address = vec![0u8; skip + 2]; // Adresse + Port
+        if client.read_exact(&mut address).is_err() {
+            return;
+        }
+        // Erfolg, gebundene Adresse 0.0.0.0:0 (der Client wirft sie ohnehin weg).
+        if client
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .is_err()
+        {
+            return;
+        }
+
+        let Ok(server) = TcpStream::connect(("127.0.0.1", target)) else {
+            return;
+        };
+        pump(client, server);
+    });
+    port
+}
+
+/// HTTP-CONNECT: Kopf lesen, `200` antworten, danach durchreichen.
+pub fn start_http_proxy(target: u16) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((client, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = std::io::BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || !line.starts_with("CONNECT ") {
+            return;
+        }
+        // Kopfzeilen bis zur Leerzeile.
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) if line.trim_end_matches(['\r', '\n']).is_empty() => break,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+        let mut client = client;
+        if client
+            .write_all(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: Test\r\n\r\n")
+            .is_err()
+        {
+            return;
+        }
+        let Ok(server) = TcpStream::connect(("127.0.0.1", target)) else {
+            return;
+        };
+        pump(client, server);
+    });
+    port
+}
+
+/// Beide Richtungen durchreichen, bis eine Seite auflegt.
+fn pump(a: TcpStream, b: TcpStream) {
+    let back = (a.try_clone().unwrap(), b.try_clone().unwrap());
+    for (mut from, mut to) in [(a, back.1), (b, back.0)] {
+        thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match from.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if to.write_all(&buffer[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = to.shutdown(std::net::Shutdown::Both);
+        });
+    }
+}
+
 // ===================== Client starten =====================
 
 /// Der gestartete Client. Bricht ein Test ab, muss der Prozess trotzdem weg – sonst hält er
@@ -1097,6 +1261,12 @@ impl Drop for Client {
 /// Startet das gebaute Binary gegen den Testserver. Mit `AFK_TEST_BIN` lässt sich stattdessen
 /// eine fertige Datei prüfen – praktisch, um eine ältere Fassung gegen die neue zu messen.
 pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
+    spawn_client_at("127.0.0.1", port, mc, extra)
+}
+
+/// Wie [`spawn_client`], aber mit frei gewählter Zieladresse – für den Weg über einen Proxy,
+/// wo der Client den Namen dem Proxy überlässt.
+pub fn spawn_client_at(host: &str, port: u16, mc: &str, extra: &[&str]) -> Client {
     let binary =
         std::env::var("AFK_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_afk").to_string());
 
@@ -1116,7 +1286,7 @@ pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
 
     let mut command = std::process::Command::new(binary);
     command
-        .arg(format!("127.0.0.1:{}", port))
+        .arg(format!("{}:{}", host, port))
         .arg("--mc")
         .arg(mc)
         .arg("--offline")

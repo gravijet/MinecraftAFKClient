@@ -91,10 +91,15 @@ fn beitritt_und_chat_mit_verschluesselung() {
         let mut stdin = child.stdin.take().unwrap();
         let out = common::collect(child.stdout.take().unwrap());
 
-        let (kurz, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
-        assert!(kurz, "{:?}: kein Chat. Ausgabe:\n{}", compression, log);
+        // Ein Warten auf die zuletzt geschickte Zeile – siehe `beitritt_und_chat_mit_kompression`.
         let (lang, log) = common::wait_for(&out, TIMEOUT, &"V".repeat(600));
         assert!(lang, "{:?}: die lange Zeile fehlt. Ausgabe:\n{}", compression, log);
+        assert!(
+            log.contains("Willkommen auf dem Testserver"),
+            "{:?}: die kurze Zeile fehlt. Ausgabe:\n{}",
+            compression,
+            log
+        );
 
         // Und in die Gegenrichtung – dort verschlüsselt der Client selbst.
         let _ = writeln!(stdin, "/{}", "y".repeat(600));
@@ -127,10 +132,17 @@ fn beitritt_und_chat_mit_kompression() {
         let mut stdin = child.stdin.take().unwrap();
         let out = common::collect(child.stdout.take().unwrap());
 
-        let (kurz, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
-        assert!(kurz, "Schwelle {}: kein Chat. Ausgabe:\n{}", threshold, log);
+        // **Ein** Warten auf die zuletzt geschickte Zeile: `wait_for` sammelt alles davor mit und
+        // gibt es zurück. Zwei Aufrufe nacheinander gingen schief – der erste nimmt beide Zeilen
+        // mit und der zweite fängt mit leerem Puffer an.
         let (lang, log) = common::wait_for(&out, TIMEOUT, &"L".repeat(600));
         assert!(lang, "Schwelle {}: die lange Zeile fehlt. Ausgabe:\n{}", threshold, log);
+        assert!(
+            log.contains("Willkommen auf dem Testserver"),
+            "Schwelle {}: die kurze Zeile fehlt. Ausgabe:\n{}",
+            threshold,
+            log
+        );
 
         // Und in die Gegenrichtung: ein langer Befehl muss beim Server heil ankommen.
         let befehl = format!("/{}", "x".repeat(600));
@@ -289,6 +301,44 @@ fn server_transfer_wird_befolgt() {
         log
     );
     let _ = child.kill();
+}
+
+/// Die Spielverbindung muss auch über einen Proxy zustande kommen.
+///
+/// SOCKS5 mit und ohne Anmeldung sowie HTTP-CONNECT sind von Hand umgesetzt – ein paar Dutzend
+/// Zeilen, die genau einmal je Verbindungsaufbau laufen und deshalb nie jemandem auffallen, wenn
+/// sie falsch sind. Geprüft wird gegen zwei winzige echte Proxys, nicht gegen Attrappen.
+#[test]
+fn verbindung_ueber_proxy() {
+    for (name, login) in [
+        ("socks5 ohne Anmeldung", None),
+        ("socks5 mit Anmeldung", Some(("hugo".to_string(), "geheim".to_string()))),
+        ("http-connect", None),
+    ] {
+        let server = common::start(&common::MC_26_1, plan_with_ground());
+        let (proxy_port, url) = if name == "http-connect" {
+            let port = common::start_http_proxy(server.port);
+            (port, format!("http://127.0.0.1:{}", port))
+        } else {
+            let port = common::start_socks5(server.port, login.clone());
+            match &login {
+                Some((user, pass)) => (
+                    port,
+                    format!("socks5://{}:{}@127.0.0.1:{}", user, pass, port),
+                ),
+                None => (port, format!("socks5://127.0.0.1:{}", port)),
+            }
+        };
+        assert_ne!(proxy_port, server.port);
+
+        // Die Zieladresse löst der Proxy auf – deshalb ein Name statt 127.0.0.1.
+        let mut child =
+            common::spawn_client_at("localhost", server.port, "26.1", &["--no-color", "--proxy", &url]);
+        let out = common::collect(child.stdout.take().unwrap());
+        let (found, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
+        assert!(found, "{}: kein Beitritt über den Proxy. Ausgabe:\n{}", name, log);
+        let _ = child.kill();
+    }
 }
 
 /// Cookies müssen den Transfer überleben – genau dafür gibt es sie.
@@ -456,9 +506,14 @@ fn volle_fehlerausgabe_blockiert_den_netz_thread_nicht() {
         ],
     );
     // stderr bleibt absichtlich ungelesen – genau das ist der Fall, um den es geht.
-    let out = common::collect(child.stdout.take().unwrap());
-    let (joined, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
-    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
+    // Die Standardausgabe wird zwar gelesen, taugt hier aber nicht als Beitrittsmerkmal: Sie
+    // läuft gleich mit tausenden Zeilen voll, und bei Überlauf fällt die älteste heraus – auch
+    // die erste. Gefragt wird deshalb der Testserver selbst.
+    let _out = common::collect(child.stdout.take().unwrap());
+    assert!(
+        common::wait_note(&server.notes, TIMEOUT, |note| matches!(note, Note::Joined)),
+        "kein Beitritt"
+    );
 
     let ids = &common::MC_26_1;
     for _ in 0..3 {
@@ -541,6 +596,53 @@ fn use_item_paket_passt_zur_version() {
 }
 
 // ===================== Live-POV =====================
+
+/// Das Chat-Paket hat ab 1.21.11 ein Byte mehr als in 1.21.1: die Prüfsumme am Ende.
+///
+/// Genau wie bei `:use` ist das der Fehler, den man am Client nicht sieht: Ein Feld zu viel oder
+/// zu wenig bringt den Paket-Decoder des Servers aus dem Tritt, und die Verbindung ist weg.
+/// Geprüft wird deshalb am Socket, wie lang das Paket wirklich ankommt.
+#[test]
+fn chat_paket_passt_zur_version() {
+    // "test" = 1 Byte Länge + 4 Byte Text, dazu Zeitstempel und Salt (je 8), das Signaturflag,
+    // der Quittungs-Offset und das 20-Bit-Bitfeld (3 Byte) – ab 1.21.11 plus Prüfsumme.
+    for (ids, expected) in [(&common::MC_1_21_1, 26usize), (&common::MC_26_1, 27usize)] {
+        let mut plan = plan_with_ground();
+        plan.chat.clear();
+        let server = common::start(ids, plan);
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color", "-q"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let err = common::collect(child.stderr.take().unwrap());
+        // Erst wenn der Server uns im Spiel hat, nimmt der Sender überhaupt etwas an. Als
+        // Merkmal dient die Teleport-Bestätigung: Sie kommt nur aus der Spielphase, also erst,
+        // nachdem der Client das Login-Paket verarbeitet hat. Ein fester Schlaf wäre auf einem
+        // ausgelasteten Rechner mal zu kurz und sonst immer zu lang.
+        let accept = ids.sb_accept_teleportation;
+        assert!(
+            common::wait_note(&server.notes, TIMEOUT, |note| {
+                matches!(note, Note::Packet(id, _) if *id == accept)
+            }),
+            "{}: der Client kam nicht in die Spielphase",
+            ids.name
+        );
+        let _ = writeln!(stdin, "test");
+        let _ = stdin.flush();
+
+        let sb_chat = ids.sb_chat;
+        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Packet(id, len) if *id == sb_chat && *len == expected)
+        });
+        if !ok {
+            // Nur im Fehlerfall noch einmal mitlesen, um die Meldung des Clients zu zeigen.
+            let (_, log) = common::wait_for(&err, Duration::from_millis(200), "kommt nie");
+            panic!(
+                "{}: das Chat-Paket hat nicht {} Byte. Ausgabe:\n{}",
+                ids.name, expected, log
+            );
+        }
+        let _ = child.kill();
+    }
+}
 
 /// Das Bildformat ist Schnittstelle nach außen: Kopfzeile `POV …`, danach je Terminalzeile eine
 /// Reihe Halbblöcke mit Vorder- und Hintergrundfarbe. Ändert sich das, muss jedes Panel nach.
