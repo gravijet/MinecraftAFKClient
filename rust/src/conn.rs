@@ -3,9 +3,9 @@
 //! CFB8 ist hier von Hand implementiert (ein Byte pro Block) – das sind zwanzig Zeilen und
 //! spart eine weitere Abhängigkeit. Die Rechenlast ist bei Chat-Verkehr vernachlässigbar.
 
-use crate::buf::{err, Reader, Writer};
+use crate::buf::{err, push_var_int, Reader, Writer};
 use aes::cipher::{BlockEncrypt, KeyInit};
-use aes::Aes128;
+use aes::{Aes128, Block};
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Decompress, FlushDecompress};
 use std::io::{self, BufReader, Read, Write};
@@ -44,15 +44,19 @@ impl Cfb8 {
     /// Ein Byte: AES über die aktuellen 16 Registerbytes, dann das Chiffrat hinten anhängen.
     /// Das Register wandert dabei nach rechts durch den Puffer und wird nur alle 16 Bytes
     /// einmal an den Anfang zurückgefaltet – statt bei jedem Byte 15 Bytes umzukopieren.
+    ///
+    /// Verschlüsselt wird von Quelle nach Ziel (`encrypt_block_b2b`): der Block muss dadurch
+    /// nicht erst in eine eigene Variable kopiert werden. Bei Chunkverkehr läuft jedes einzelne
+    /// empfangene Byte hier durch, da zählt jede eingesparte 16-Byte-Kopie.
     #[inline]
     fn step(&mut self, cipher_byte: impl FnOnce(u8) -> (u8, u8)) -> u8 {
         if self.at == 16 {
             self.register.copy_within(16..32, 0);
             self.at = 0;
         }
-        let iv: [u8; 16] = self.register[self.at..self.at + 16].try_into().unwrap();
-        let mut block = iv.into();
-        self.aes.encrypt_block(&mut block);
+        let iv: &[u8; 16] = self.register[self.at..self.at + 16].try_into().unwrap();
+        let mut block = Block::default();
+        self.aes.encrypt_block_b2b(iv.into(), &mut block);
         let (out, feedback) = cipher_byte(block[0]);
         self.register[self.at + 16] = feedback;
         self.at += 1;
@@ -162,7 +166,7 @@ impl PacketReader {
             out.extend_from_slice(&self.frame[start..]);
             return Ok(());
         }
-        if uncompressed_len < 0 || uncompressed_len > 32 * 1024 * 1024 {
+        if !(0..=32 * 1024 * 1024).contains(&uncompressed_len) {
             return Err(err("Unplausible entpackte Laenge"));
         }
         let expected = uncompressed_len as usize;
@@ -184,6 +188,12 @@ pub struct PacketWriter {
     stream: TcpStream,
     enc: Option<Cfb8>,
     threshold: i32,
+    /// Wiederverwendete Puffer für den Paketrahmen. Ohne sie legt **jedes** gesendete Paket zwei
+    /// bis drei kurzlebige Vektoren an; bei zwanzig Positionspaketen je Sekunde (Bewegung,
+    /// Anti-AFK) ist das reine Verwaltungsarbeit. Der Zugriff ist unkritisch: `send` läuft nur
+    /// unter der Schreibsperre in [`crate::client::Shared::send`].
+    body: Vec<u8>,
+    frame: Vec<u8>,
 }
 
 impl PacketWriter {
@@ -204,33 +214,30 @@ impl PacketWriter {
     }
 
     pub fn send(&mut self, packet: Writer) -> io::Result<()> {
-        let payload = packet.data;
+        let payload = &packet.data;
 
-        let frame = if self.threshold < 0 {
-            payload
+        self.body.clear();
+        if self.threshold < 0 {
+            self.body.extend_from_slice(payload);
         } else if payload.len() >= self.threshold as usize {
-            let mut out = Writer::default();
-            out.var_int(payload.len() as i32);
-            let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
-            z.write_all(&payload)?;
-            out.raw(&z.finish()?);
-            out.data
+            // Mit Kompression: VarInt „Länge im entpackten Zustand", dahinter der zlib-Strom.
+            push_var_int(&mut self.body, payload.len() as i32);
+            let mut z = ZlibEncoder::new(std::mem::take(&mut self.body), Compression::fast());
+            z.write_all(payload)?;
+            self.body = z.finish()?;
         } else {
-            let mut out = Writer::default();
-            out.var_int(0);
-            out.raw(&payload);
-            out.data
-        };
+            push_var_int(&mut self.body, 0); // 0 = unkomprimiert übertragen
+            self.body.extend_from_slice(payload);
+        }
 
-        let mut framed = Writer::default();
-        framed.var_int(frame.len() as i32);
-        framed.raw(&frame);
-        let mut bytes = framed.data;
+        self.frame.clear();
+        push_var_int(&mut self.frame, self.body.len() as i32);
+        self.frame.extend_from_slice(&self.body);
 
         if let Some(enc) = &mut self.enc {
-            enc.encrypt(&mut bytes);
+            enc.encrypt(&mut self.frame);
         }
-        self.stream.write_all(&bytes)
+        self.stream.write_all(&self.frame)
     }
 }
 
@@ -260,6 +267,8 @@ pub fn connect(
             stream: write_half,
             enc: None,
             threshold: -1,
+            body: Vec::with_capacity(256),
+            frame: Vec::with_capacity(256),
         },
     ))
 }

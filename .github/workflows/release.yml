@@ -62,50 +62,64 @@ jobs:
           \`afk-1.21.1.jar\`, \`afk-1.21.11.jar\`, \`afk-26.1.jar\` und \`afk-26.2.jar\`.
           Items-, POV-, Premium-Items- und Ultra-Varianten gibt es bewusst nur für Rust.
 
-          ## Neu in 2.1.0 – Fehlerbehebungen und Tempo (nur Rust-Client)
+          ## Neu in 2.2.0 – Fehlerbehebungen und Tempo (nur Rust-Client)
 
           **Behobene Fehler**
 
-          - **Proxy konnte den Client dauerhaft aufhängen.** \`--proxy\` hatte weder ein Zeitlimit
-            für den Verbindungsaufbau noch für die Antworten im SOCKS5-/HTTP-CONNECT-Handshake.
-            Ein Proxy, der die Verbindung annimmt und dann schweigt, blockierte den Netz-Thread
-            unbegrenzt: kein Beitritt, keine Fehlermeldung, kein Ende. Jetzt gilt dort ein
-            Zeitlimit von 20 Sekunden.
-          - **IPv6-Proxyadressen funktionierten nicht.** \`--proxy socks5://[::1]:1080\` behielt die
-            eckigen Klammern im Hostnamen, womit die Namensauflösung scheiterte; eine nackte
-            IPv6-Adresse zerfiel am Doppelpunkt.
-          - **Falsch platzierte Entities in der Live-POV.** Die Welt wurde perspektivisch
-            gezeichnet, Spieler und Mobs aber über eine lineare Winkelrechnung eingeblendet. Beides
-            stimmte nur in der Bildmitte überein – am Bildrand stand eine Figur mehrere Zeichen
-            neben dem Block, auf dem sie tatsächlich steht. Jetzt läuft beides durch dieselbe
-            Kamera; Entities hinter der Kamera bleiben zuverlässig draußen.
-          - **Scoreboard-Zeilen sprangen durcheinander.** Bei gleicher Punktzahl kam die
-            Reihenfolge aus einer Hashtabelle, \`:board\` zeigte die Zeilen also bei jedem Aufruf
-            neu gemischt. Jetzt entscheidet wie in Vanilla der Eintragsname.
-          - **Unbegrenzt wachsender Speicher beim Scoreboard.** Punkte für immer neue Zielnamen
-            legten je Paket eine weitere Tabelle an; gedeckelt war nur der Inhalt, nicht die Zahl
-            der Ziele.
-          - **Halbe Kontodatei nach einem Abbruch.** Konto- und \`movement.json\` wurden direkt
-            überschrieben. Ein Kill oder Stromausfall mitten im Schreiben hinterließ eine
-            abgeschnittene Datei – das Konto war nur noch per \`--login\` zu retten. Jetzt wird
-            daneben geschrieben und unteilbar umbenannt.
-          - **Stille Fehlgriffe bei Startargumenten.** Ein vertippter Port (\`mc.example.net:2556x\`)
-            wurde kommentarlos zu 25565, und \`--pov-size 4000x3000\` wurde stillschweigend auf
-            160x80 gestaucht. Beides meldet jetzt einen klaren Fehler. \`--fakehost "[]"\` und ein
-            Server-Transfer auf einen unmöglichen Port werden ebenfalls abgewiesen statt
-            beschnitten.
-          - Verstümmelte Startmeldung, wenn Java-Optionen mitgegeben wurden.
+          - **\`:use\` hat auf 1.21.1 die Verbindung gekostet.** Die Blickrichtung steht erst ab
+            1.21.2 mit im \`ServerboundUseItemPacket\`; der Client hängte sie in allen Versionen an.
+            Auf 1.21.1 kamen dadurch acht Byte zu viel an, der Paket-Decoder des Servers geriet aus
+            dem Tritt und die Sitzung war weg. Jetzt richtet sich das Paket nach der Version – am
+            Socket geprüft (2 gegen 10 Byte Nutzdaten).
+          - **\`--on chat:\` traf Umlaute nicht.** Der Auslöser wurde nur nach ASCII-Regeln
+            kleingeschrieben, die Chat-Zeile dagegen vollständig. \`--on "chat:Du bist ÜBERFÄLLIG=/lobby"\`
+            konnte deshalb nie zutreffen – ausgerechnet auf deutschsprachigen Servern.
+          - **\`@event\`-Zeilen zerbrachen an mehrzeiligen Servermeldungen.** Kick-Gründe sind
+            regelmäßig mehrzeilig, Scoreboard-Zeilen und Lore ebenfalls. Der Umbruch riss die Zeile
+            auseinander, und alles dahinter sah für ein Panel aus wie eine gewöhnliche Statuszeile.
+            Die zugesagte Regel „genau eine Zeile je Ereignis" gilt jetzt wirklich.
+          - **SRV-Auflösung fragte auch nach einer verbindlichen Antwort weiter.** Die meisten
+            Server haben gar keinen SRV-Eintrag; der erste Resolver sagte das auch, gefragt wurden
+            trotzdem alle drei. Bei blockiertem UDP kostete das vor **jedem** Verbindungsversuch
+            4,5 Sekunden. Jetzt endet die Suche mit der ersten gültigen Auskunft; nur eine echte
+            Störung (SERVFAIL, Zeitablauf) geht an den nächsten Resolver weiter.
+          - **Eine einzige unbrauchbare Eingabezeile machte den Client dauerhaft taub.** Ein Signal
+            oder ein Byte, das kein UTF-8 ist, beendete die Eingabeschleife endgültig – der Client
+            nahm danach keine Zeile mehr an, obwohl die Standardeingabe offen war.
+          - **\`:look\` konnte sich endlos drehen.** Setzt der Server die Blickrichtung laufend
+            zurück (Anticheat, Fahrzeug), lief die Drehschleife ohne Zeitlimit mit zwanzig Paketen
+            je Sekunde weiter, ohne je zurückzukommen. Jetzt gilt dieselbe Notbremse wie beim Laufen.
+          - **Reguläre Unterserver-Wechsel wurden irgendwann ausgebremst.** Der Zähler gegen
+            Weiterreich-Schleifen lief über die ganze Laufzeit weiter, statt nur schnell
+            aufeinanderfolgende Transfers zu zählen: ab dem vierten Wechsel gab es eine Warnung
+            und eine wachsende Wartezeit für einen völlig normalen Vorgang.
+          - **Anti-AFK bremste beim Beitritt den Netz-Thread.** Der Start wartete bis zu 200 ms auf
+            einen noch aufräumenden Vorgänger – und zwar im Netz-Thread, der in dieser Zeit keine
+            KeepAlive-Pakete beantwortete. Das Warten läuft jetzt im eigenen Thread.
+          - **Live-Ansicht konnte nach einem Neustart stumm bleiben.** Zwischen dem Ende des
+            Zeichners und dem Freigeben seines Merkers wurde ein neuer Start abgewiesen; die
+            Ansicht galt dann als „live" und zeichnete trotzdem nie wieder.
+          - **Grenzen gegen bösartige oder kaputte Server.** Netzwerk-NBT konnte aus wenigen
+            Megabyte Paketdaten fast ein Gigabyte Speicher machen (eine Liste aus Einzelbytes wird
+            beim Einlesen um das Dreißigfache größer); Cookies wuchsen unbegrenzt weiter. Beides
+            ist jetzt gedeckelt. Eine negative Paket-ID traf außerdem auf die \`-1\`-Einträge der
+            Versionstabelle und wurde als ein Paket verarbeitet, das der Server nie gesendet hat.
+          - **Port 0** wird als Serveradresse jetzt abgewiesen statt an den Netzstapel gereicht.
 
           **Tempo und Verbrauch**
 
-          - **Live-POV rund 30–40 % schneller.** Der Raycaster schlug für jeden durchquerten Block
-            den Chunk neu in einer Hashtabelle nach – bei 64x32 Bildpunkten und gut hundert
-            Schritten je Strahl rund zwei Millionen Nachschlagevorgänge je Sekunde. Er merkt sich
-            den zuletzt benutzten Chunk jetzt. Gemessen: 4,5 → 3,1 ms je Bild bei 64x32 und
-            28 → 17 ms bei 160x80.
-          - **Gegenstandsnamen ohne Neusuche.** Die Vanilla-Namensliste wurde je Feld von vorn
-            durchlaufen; eine Doppelkiste kostete 90 Durchläufe über 40 KB Text, bei jeder
-            Änderung erneut. Jetzt entsteht einmalig ein Verzeichnis.
+          - **Live-POV noch einmal 12–14 % schneller.** Der Strahl merkt sich jetzt den
+            16x16x16-Abschnitt statt nur den Chunk: solange er in derselben Höhenscheibe bleibt,
+            entfallen Höhenrechnung, Bereichsprüfung und zwei Zeigerebenen. Gemessen auf demselben
+            Rechner: 2,11 → 1,86 ms je Bild bei 64x32 und 12,70 → 11,09 ms bei 160x80.
+          - **Kein Neuanlegen der Bildpuffer.** Szene, Bildpunkte und Ausgabezeichenkette werden
+            von Bild zu Bild weiterverwendet – bei 160x80 und acht Bildern je Sekunde waren das
+            mehrere Megabyte Allokation je Sekunde, nur um sie sofort wieder wegzuwerfen.
+          - **Chat-Ausgabe ohne Zwischenzeichenketten.** Der Stil jedes Textbausteins wurde als
+            eigene Zeichenkette angelegt und sofort verworfen; jetzt wird direkt in die Zeile
+            geschrieben. Das ist der Dauerbetrieb auch des schlanken Clients.
+          - **Verschlüsselung mit einer 16-Byte-Kopie weniger je Byte** und **wiederverwendete
+            Sendepuffer**: ein Paket legte bisher zwei bis drei kurzlebige Vektoren an.
 
           **Unverändert**
 

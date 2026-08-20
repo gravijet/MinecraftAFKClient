@@ -109,7 +109,8 @@ echo "/list" | afk mc.example.net -q
 ```
 
 Mit `--events` kommen auf der Fehlerausgabe zusätzlich Zeilen der Form `@event <name> <angaben>` –
-sie kommen **auch mit `-q`** durch, sind nie eingefärbt und lassen sich stumpf mit
+sie kommen **auch mit `-q`** durch, sind nie eingefärbt, stehen immer auf **genau einer Zeile**
+(Umbrüche aus Servermeldungen werden zu Leerzeichen) und lassen sich stumpf mit
 `startswith("@event ")` herausfiltern:
 
 | Zeile | wann |

@@ -525,7 +525,7 @@ fn escape(
     }
 
     // Abwechselnd links/rechts, je Runde einen Block weiter: 1,5 – 1,5 – 2,5 – 2,5 – 3,5 …
-    let left = attempt % 2 == 0;
+    let left = attempt.is_multiple_of(2);
     let blocks = 1.5 + ((attempt - 2) / 2) as f64;
     shared.console.info(&format!(
         "Immer noch blockiert – weiche {:.1} Blöcke nach {} aus ...",
@@ -642,6 +642,11 @@ fn strafe(
 }
 
 /// Kopf über mehrere Ticks auf die Zielrichtung drehen (nicht ruckartig in einem Tick).
+///
+/// Mit derselben Notbremse wie beim Laufen: Ein Server, der unsere Blickrichtung laufend
+/// zurücksetzt (Anticheat, Fahrzeug, Fesselung), hätte diese Schleife sonst **endlos** mit
+/// zwanzig Paketen je Sekunde am Leben gehalten – ohne Meldung und ohne dass `:look` je
+/// zurückkäme.
 fn turn_to(
     shared: &Arc<Shared>,
     job: Job,
@@ -652,6 +657,8 @@ fn turn_to(
     let target_yaw = wrap_degrees(target_yaw);
     let target_pitch = target_pitch.clamp(-90.0, 90.0);
     let step = settings.turn_speed as f32;
+    let limit = Duration::from_secs(settings.max_walk_seconds);
+    let started = Instant::now();
     let mut next = Instant::now();
 
     loop {
@@ -667,6 +674,9 @@ fn turn_to(
         let dpitch = target_pitch - pitch;
         if dyaw.abs() < 0.01 && dpitch.abs() < 0.01 {
             return Outcome::Arrived;
+        }
+        if started.elapsed() > limit {
+            return Outcome::Timeout;
         }
         send_move(
             shared,
@@ -1478,7 +1488,7 @@ mod tests {
     /// Ausweichen heißt: erst springen, dann abwechselnd zur Seite und mit jeder Runde weiter.
     #[test]
     fn ausweichen_wechselt_die_seite_und_wird_weiter() {
-        let plan = |attempt: u32| (attempt % 2 == 0, 1.5 + ((attempt - 2) / 2) as f64);
+        let plan = |attempt: u32| (attempt.is_multiple_of(2), 1.5 + ((attempt - 2) / 2) as f64);
         assert_eq!(plan(2), (true, 1.5)); // links
         assert_eq!(plan(3), (false, 1.5)); // rechts
         assert_eq!(plan(4), (true, 2.5));

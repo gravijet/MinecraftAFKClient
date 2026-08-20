@@ -206,6 +206,7 @@ pub struct Ids {
     pub sb_chunk_batch_received: i32,
     pub sb_accept_teleportation: i32,
     pub sb_move: i32,
+    pub sb_use_item: i32,
 }
 
 pub static MC_26_1: Ids = Ids {
@@ -224,6 +225,7 @@ pub static MC_26_1: Ids = Ids {
     sb_chunk_batch_received: 11,
     sb_accept_teleportation: 0,
     sb_move: 31,
+    sb_use_item: 67,
 };
 
 pub static MC_1_21_1: Ids = Ids {
@@ -242,6 +244,7 @@ pub static MC_1_21_1: Ids = Ids {
     sb_chunk_batch_received: 8,
     sb_accept_teleportation: 0,
     sb_move: 27,
+    sb_use_item: 57,
 };
 
 // ===================== Server =====================
@@ -249,7 +252,9 @@ pub static MC_1_21_1: Ids = Ids {
 /// Was der Testserver an den Testfall zurückmeldet.
 #[derive(Debug, Clone)]
 pub enum Note {
-    Packet(i32),
+    /// Paket-ID und Länge der Nutzdaten. Die Länge verrät, ob ein Paket den Aufbau der jeweiligen
+    /// Protokollversion hat – ein Feld zu viel oder zu wenig fällt genau dort auf.
+    Packet(i32, usize),
     Command(String),
     Chat(String),
     /// Sichtweite aus `ClientInformation` – daran hängt, wie viele Chunkdaten der Server schickt.
@@ -447,7 +452,7 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::Chat(c.string()));
         } else {
-            let _ = tx.send(Note::Packet(id));
+            let _ = tx.send(Note::Packet(id, payload.len()));
         }
     }
 }

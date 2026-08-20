@@ -333,7 +333,7 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
     lines.truncate(MAX_LINES);
 
     console.print("");
-    console.print(&format!("  {}", console.paint(BOLD, &console.text(&title))));
+    console.print(&format!("  {}", console.paint(BOLD, &console.text(title))));
     if lines.is_empty() {
         console.print(&console.paint(GRAY, "    (keine Zeilen)"));
     }

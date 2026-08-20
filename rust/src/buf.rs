@@ -106,7 +106,7 @@ impl<'a> Reader<'a> {
 
     pub fn string(&mut self) -> io::Result<String> {
         let len = self.var_int()?;
-        if len < 0 || len > 1024 * 1024 {
+        if !(0..=1024 * 1024).contains(&len) {
             return Err(err("String-Laenge unplausibel"));
         }
         let raw = self.bytes(len as usize)?;
@@ -135,7 +135,7 @@ impl<'a> Reader<'a> {
     #[cfg(feature = "extras")]
     pub fn skip_string(&mut self) -> io::Result<()> {
         let len = self.var_int()?;
-        if len < 0 || len > 1024 * 1024 {
+        if !(0..=1024 * 1024).contains(&len) {
             return Err(err("String-Laenge unplausibel"));
         }
         self.skip(len as usize)
@@ -144,6 +144,22 @@ impl<'a> Reader<'a> {
 
 // ===================== Schreiben =====================
 
+/// VarInt an einen beliebigen Bytepuffer anhängen.
+///
+/// Ausgelagert, weil der Rahmenbau in [`crate::conn`] dieselbe Kodierung braucht, dort aber
+/// keinen ganzen [`Writer`] anlegen soll – der wäre je Paket eine weitere kurzlebige Allokation.
+pub fn push_var_int(out: &mut Vec<u8>, value: i32) {
+    let mut v = value as u32;
+    loop {
+        if v & !0x7F == 0 {
+            out.push(v as u8);
+            return;
+        }
+        out.push((v as u8 & 0x7F) | 0x80);
+        v >>= 7;
+    }
+}
+
 #[derive(Default)]
 pub struct Writer {
     pub data: Vec<u8>,
@@ -151,9 +167,13 @@ pub struct Writer {
 
 impl Writer {
     /// Neues Paket mit gegebener ID (VarInt) beginnen.
+    ///
+    /// 64 Byte Startgröße, nicht 32: das Positionspaket der Bewegung ist mit ID allein schon
+    /// 35 Byte lang und wuchs damit bisher bei **jedem** der zwanzig Pakete je Sekunde einmal
+    /// nach. Die paar Byte mehr kosten nichts – der Puffer lebt nur bis zum Absenden.
     pub fn packet(id: i32) -> Self {
         let mut w = Writer {
-            data: Vec::with_capacity(32),
+            data: Vec::with_capacity(64),
         };
         w.var_int(id);
         w
@@ -188,15 +208,7 @@ impl Writer {
     }
 
     pub fn var_int(&mut self, value: i32) {
-        let mut v = value as u32;
-        loop {
-            if v & !0x7F == 0 {
-                self.data.push(v as u8);
-                return;
-            }
-            self.data.push((v as u8 & 0x7F) | 0x80);
-            v >>= 7;
-        }
+        push_var_int(&mut self.data, value);
     }
 
     pub fn string(&mut self, value: &str) {

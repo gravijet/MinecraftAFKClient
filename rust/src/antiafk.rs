@@ -81,35 +81,37 @@ fn start(shared: &Arc<Shared>) {
     if !shared.in_game.load(Ordering::Relaxed) {
         return; // beim nächsten Beitritt startet on_join ihn
     }
-    // Wer den Schalter von false auf true dreht, ist der eine Thread. Ist gerade noch einer am
-    // Aufräumen (`:antiafk off` direkt gefolgt von `:antiafk on`), wird kurz auf ihn gewartet –
-    // sonst stünde am Ende gar keiner mehr da.
-    let mut tries = 0;
-    while shared
-        .extras
-        .antiafk_running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        tries += 1;
-        if tries > 20 {
-            return; // es läuft wirklich noch einer – der liest das neue Intervall selbst
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
     let generation = shared.generation.load(Ordering::SeqCst);
     let owned = Arc::clone(shared);
-    let started = thread::Builder::new()
+    let _ = thread::Builder::new()
         .name("afk-antiafk".into())
         .spawn(move || {
+            // Wer den Schalter von false auf true dreht, ist der eine Thread. Ist gerade noch
+            // einer am Aufräumen (`:antiafk off` direkt gefolgt von `:antiafk on`, oder ein
+            // Unterserver-Wechsel), wird kurz auf ihn gewartet – sonst stünde am Ende gar keiner
+            // mehr da.
+            //
+            // Gewartet wird im **eigenen** Thread. Vorher lief diese Schleife im Aufrufer, und
+            // der ist beim Beitritt der Netz-Thread: der hätte in dieser Zeit keine
+            // KeepAlive-Pakete beantwortet – ausgerechnet die Aufgabe, für die es den ganzen
+            // Client gibt.
+            let mut tries = 0;
+            while owned
+                .extras
+                .antiafk_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                tries += 1;
+                if tries > 20 {
+                    return; // es läuft wirklich noch einer – der liest das neue Intervall selbst
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             run(&owned, generation);
             // Erst hier wieder freigeben – sonst könnten zwei Threads nebeneinander laufen.
             owned.extras.antiafk_running.store(false, Ordering::SeqCst);
         });
-    if started.is_err() {
-        shared.extras.antiafk_running.store(false, Ordering::SeqCst);
-    }
 }
 
 fn run(shared: &Arc<Shared>, generation: u32) {
@@ -161,6 +163,6 @@ mod tests {
     /// Der Schwenk muss klein bleiben: er soll als Bewegung zählen, nicht als Herumfahren.
     #[test]
     fn schwenk_bleibt_klein() {
-        assert!(TURN_DEGREES > 0.0 && TURN_DEGREES < 15.0);
+        const _: () = assert!(TURN_DEGREES > 0.0 && TURN_DEGREES < 15.0);
     }
 }

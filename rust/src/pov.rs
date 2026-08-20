@@ -35,6 +35,7 @@ use crate::proto::In;
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::fmt::Write as _;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -300,20 +301,28 @@ impl Chunk {
             .filter(|index| *index < self.sections.len())
     }
 
+    /// Der Abschnitt zu dieser Höhe – `None` heißt „außerhalb der Welt oder reine Luft".
+    fn section(&self, y: i32) -> Option<&Section> {
+        self.sections[self.section_index(y)?].as_deref()
+    }
+
+    /// Direkter Blockzugriff ohne jeden Merker. Im laufenden Betrieb geht alles über [`Cursor`];
+    /// diese beiden Wege bleiben als **Vergleichsmaßstab** für die Tests stehen – nur so lässt
+    /// sich zeigen, dass der Merker wirklich nichts am Ergebnis ändert.
+    #[cfg(test)]
     fn block(&self, x: i32, y: i32, z: i32) -> u32 {
-        let Some(Some(section)) = self.section_index(y).map(|index| &self.sections[index]) else {
-            return 0;
-        };
-        section.state(local_index(x, y, z))
+        match self.section(y) {
+            Some(section) => section.state(local_index(x, y, z)),
+            None => 0,
+        }
     }
 
     /// `true`, wenn an der Stelle etwas Sichtbares steht. Billiger als [`Chunk::block`], weil die
     /// Palette dafür gar nicht angefasst werden muss.
+    #[cfg(test)]
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
-        let Some(Some(section)) = self.section_index(y).map(|index| &self.sections[index]) else {
-            return false;
-        };
-        !section.is_air(local_index(x, y, z))
+        self.section(y)
+            .is_some_and(|section| !section.is_air(local_index(x, y, z)))
     }
 
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
@@ -414,13 +423,26 @@ impl World {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Scene {
     chunks: HashMap<(i32, i32), Arc<Chunk>>,
     entities: Vec<Entity>,
 }
 
-/// Zugriff auf die Szene, der sich den zuletzt benutzten Chunk merkt.
+/// Wiederverwendete Puffer des Zeichners.
+///
+/// Ohne sie legt **jedes** Bild die Szene, den Bildpunktpuffer und die Ausgabezeichenkette neu
+/// an: bei 160x80 und acht Bildern je Sekunde sind das mehrere Megabyte Allokation je Sekunde,
+/// die sofort wieder weggeworfen werden. Die Sperre ist praktisch immer frei – hier arbeitet nur
+/// der Zeichen-Thread, und `:pov frame` fällt einmal dazwischen.
+#[derive(Default)]
+struct Scratch {
+    scene: Scene,
+    pixels: Vec<Pixel>,
+    frame: String,
+}
+
+/// Zugriff auf die Szene, der sich den zuletzt benutzten Chunk **und Abschnitt** merkt.
 ///
 /// Ein Strahl läuft fast immer etliche Blöcke am Stück durch denselben Chunk (der ist 16 Blöcke
 /// breit), und der nächste Bildpunkt beginnt ohnehin im selben. Ohne dieses Merken kostet **jeder
@@ -428,10 +450,20 @@ struct Scene {
 /// hundert Schritten je Strahl und acht Bildern je Sekunde sind das rund zwei Millionen
 /// Nachschlagevorgänge in der Sekunde, und damit der mit Abstand größte Einzelposten der
 /// Live-Ansicht. Mit dem Merker bleibt davon der Bruchteil an echten Chunk-Wechseln übrig.
+///
+/// Gemerkt wird gleich der 16x16x16-Abschnitt, nicht nur der Chunk: Ein Strahl bleibt genauso
+/// lange in derselben Höhenscheibe, und damit fallen bei jedem Schritt innerhalb des Abschnitts
+/// auch noch die Höhenrechnung, die Bereichsprüfung und der Griff durch zwei Zeigerebenen weg.
+/// Übrig bleiben drei Ganzzahlvergleiche und der eigentliche Blockzugriff.
 struct Cursor<'a> {
     scene: &'a Scene,
+    /// Zuletzt benutzter Chunk (Chunk-X, Chunk-Z).
     at: Option<(i32, i32)>,
     chunk: Option<&'a Chunk>,
+    /// Zuletzt benutzter Abschnitt (Chunk-X, Abschnitt-Y, Chunk-Z).
+    section_at: Option<(i32, i32, i32)>,
+    /// `None` = reine Luft **oder** Chunk nicht geladen; durch beides läuft der Strahl weiter.
+    section: Option<&'a Section>,
 }
 
 impl<'a> Cursor<'a> {
@@ -440,6 +472,8 @@ impl<'a> Cursor<'a> {
             scene,
             at: None,
             chunk: None,
+            section_at: None,
+            section: None,
         }
     }
 
@@ -452,13 +486,27 @@ impl<'a> Cursor<'a> {
         self.chunk
     }
 
-    /// `false` heißt „Luft **oder** Chunk nicht geladen" – durch beides läuft der Strahl weiter.
-    fn solid(&mut self, x: i32, y: i32, z: i32) -> bool {
-        self.chunk(x, z).is_some_and(|chunk| chunk.solid(x, y, z))
+    #[inline]
+    fn section(&mut self, x: i32, y: i32, z: i32) -> Option<&'a Section> {
+        let key = (x.div_euclid(16), y.div_euclid(16), z.div_euclid(16));
+        if self.section_at != Some(key) {
+            self.section_at = Some(key);
+            self.section = self.chunk(x, z).and_then(|chunk| chunk.section(y));
+        }
+        self.section
     }
 
+    /// `false` heißt „Luft **oder** Chunk nicht geladen" – durch beides läuft der Strahl weiter.
+    #[inline]
+    fn solid(&mut self, x: i32, y: i32, z: i32) -> bool {
+        self.section(x, y, z)
+            .is_some_and(|section| !section.is_air(local_index(x, y, z)))
+    }
+
+    #[inline]
     fn block(&mut self, x: i32, y: i32, z: i32) -> u32 {
-        self.chunk(x, z).map_or(0, |chunk| chunk.block(x, y, z))
+        self.section(x, y, z)
+            .map_or(0, |section| section.state(local_index(x, y, z)))
     }
 }
 
@@ -479,6 +527,8 @@ pub struct Pov {
     /// Wann das letzte Bild geschrieben wurde (ms seit `started`).
     last_frame_ms: AtomicU64,
     started: Instant,
+    /// Puffer, die von Bild zu Bild weiterverwendet werden.
+    scratch: Mutex<Scratch>,
 }
 
 impl Pov {
@@ -497,6 +547,7 @@ impl Pov {
             last_frame: AtomicU64::new(0),
             last_frame_ms: AtomicU64::new(0),
             started: Instant::now(),
+            scratch: Mutex::new(Scratch::default()),
         }
     }
 
@@ -520,12 +571,17 @@ impl Pov {
         }
     }
 
-    fn scene(&self) -> Scene {
+    /// Den aktuellen Weltstand in eine bereits vorhandene Szene übertragen.
+    ///
+    /// Bewusst mit `clone_from` und `extend` statt mit frischen Behältern: die Tabelle und der
+    /// Vektor behalten so ihren Speicher über alle Bilder hinweg. Gezeichnet wird anschließend
+    /// **ohne** die Weltsperre – der Netz-Thread darf während der paar Millisekunden weiter
+    /// Chunks einlesen.
+    fn fill_scene(&self, scene: &mut Scene) {
         let world = self.world.lock().unwrap();
-        Scene {
-            chunks: world.chunks.clone(),
-            entities: world.entities.values().copied().collect(),
-        }
+        scene.chunks.clone_from(&world.chunks);
+        scene.entities.clear();
+        scene.entities.extend(world.entities.values().copied());
     }
 
     fn select_dimension(&self, id: i32, world_name: Option<&str>) {
@@ -1205,22 +1261,41 @@ fn start_renderer(shared: &Arc<Shared>) {
             if owned.console.is_color() {
                 owned.console.pov_frame("", "\x1b[2J\x1b[H");
             }
-            while owned.running.load(Ordering::Relaxed)
-                && owned.extras.pov.live.load(Ordering::Relaxed)
-            {
-                let started = Instant::now();
-                if owned.in_game.load(Ordering::Relaxed) {
-                    draw_once(&owned, true, false);
+            loop {
+                while owned.running.load(Ordering::Relaxed)
+                    && owned.extras.pov.live.load(Ordering::Relaxed)
+                {
+                    let started = Instant::now();
+                    if owned.in_game.load(Ordering::Relaxed) {
+                        draw_once(&owned, true, false);
+                    }
+                    let interval = Duration::from_millis(
+                        1000 / owned.extras.pov.fps.load(Ordering::Relaxed).max(1) as u64,
+                    );
+                    thread::sleep(interval.saturating_sub(started.elapsed()));
                 }
-                let interval =
-                    Duration::from_millis(1000 / owned.extras.pov.fps.load(Ordering::Relaxed).max(1) as u64);
-                thread::sleep(interval.saturating_sub(started.elapsed()));
+                owned
+                    .extras
+                    .pov
+                    .renderer_running
+                    .store(false, Ordering::SeqCst);
+                // Zwischen dem Verlassen der Schleife und dem Freigeben kann `:pov live` (oder
+                // ein Beitritt) die Ansicht längst wieder eingeschaltet haben. Ein neuer Start
+                // wäre in diesem Fenster abgewiesen worden, weil der Merker noch stand – die
+                // Ansicht galt dann als „live" und zeichnete trotzdem nie wieder. Deshalb hier
+                // noch einmal nachsehen und den Posten gegebenenfalls selbst wieder übernehmen.
+                if !owned.running.load(Ordering::Relaxed)
+                    || !owned.extras.pov.live.load(Ordering::Relaxed)
+                    || owned
+                        .extras
+                        .pov
+                        .renderer_running
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    return;
+                }
             }
-            owned
-                .extras
-                .pov
-                .renderer_running
-                .store(false, Ordering::SeqCst);
         })
         .is_err()
     {
@@ -1239,19 +1314,26 @@ fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
         return;
     };
     let pov = &shared.extras.pov;
-    let scene = pov.scene();
     let width = pov.width.load(Ordering::Relaxed);
     let height = pov.height.load(Ordering::Relaxed);
     let color = shared.console.is_color();
-    let frame = render(&scene, position, width, height, color);
 
-    if !force && !frame_changed(pov, &frame) {
+    let mut scratch = pov.scratch.lock().unwrap();
+    let Scratch {
+        scene,
+        pixels,
+        frame,
+    } = &mut *scratch;
+    pov.fill_scene(scene);
+    render_into(scene, position, width, height, color, pixels, frame);
+
+    if !force && !frame_changed(pov, frame) {
         return;
     }
     // Cursor-Steuerung und Bild in einem Zug – sonst rutscht eine Statuszeile dazwischen.
     shared
         .console
-        .pov_frame(if home && color { "\x1b[H" } else { "" }, &frame);
+        .pov_frame(if home && color { "\x1b[H" } else { "" }, frame);
 }
 
 /// Unveränderte Bilder auslassen – das spart bei einem stillstehenden Bot fast die ganze
@@ -1280,21 +1362,27 @@ struct Pixel {
     depth: f64,
 }
 
-fn render(
+/// Ein Bild in bereitgestellte Puffer zeichnen. `pixels` und `out` dürfen (und sollen) von einem
+/// Bild zum nächsten weiterverwendet werden; ihr Inhalt wird hier vollständig ersetzt.
+#[allow(clippy::too_many_arguments)]
+fn render_into(
     scene: &Scene,
     position: (f64, f64, f64, f32, f32),
     width: usize,
     height: usize,
     color: bool,
-) -> String {
+    pixels: &mut Vec<Pixel>,
+    out: &mut String,
+) {
     let origin = (position.0, position.1 + 1.62, position.2);
-    let mut pixels = vec![
+    pixels.clear();
+    pixels.resize(
+        width * height,
         Pixel {
             rgb: (0, 0, 0),
-            depth: MAX_DISTANCE
-        };
-        width * height
-    ];
+            depth: MAX_DISTANCE,
+        },
+    );
 
     // Echte Zentralprojektion statt gleichmäßig verteilter Winkel: sonst „biegt" sich der
     // Horizont bei 90° Blickfeld sichtbar nach außen.
@@ -1333,27 +1421,32 @@ fn render(
         width,
         height,
         &scene.entities,
-        &mut pixels,
+        pixels,
     );
 
-    let mut out = String::with_capacity(width * height * if color { 24 } else { 2 } + 128);
-    out.push_str(&format!(
-        "POV  x={:.1} y={:.1} z={:.1}  Blick {:.0}/{:.0}  Chunks {}  (:pov stop)\n",
+    out.clear();
+    out.reserve(width * height * if color { 24 } else { 2 } + 128);
+    // Direkt in den Puffer schreiben statt über eine Zwischenzeichenkette – die Kopfzeile
+    // entsteht bei jedem Bild neu.
+    let _ = write!(
+        out,
+        "POV  x={:.1} y={:.1} z={:.1}  Blick {:.0}/{:.0}  Chunks {}  (:pov stop)",
         position.0,
         position.1,
         position.2,
         position.3,
         position.4,
         scene.chunks.len()
-    ));
+    );
+    out.push('\n');
     if color {
         // Zwei Bildzeilen je Terminalzeile: Vordergrundfarbe oben, Hintergrundfarbe unten.
         for y in (0..height).step_by(2) {
             for x in 0..width {
                 let top = pixels[y * width + x].rgb;
                 let bottom = pixels[(y + 1).min(height - 1) * width + x].rgb;
-                push_color(&mut out, "\x1b[38;2;", top);
-                push_color(&mut out, "\x1b[48;2;", bottom);
+                push_color(out, "\x1b[38;2;", top);
+                push_color(out, "\x1b[48;2;", bottom);
                 out.push('▀');
             }
             out.push_str("\x1b[0m\n");
@@ -1369,6 +1462,22 @@ fn render(
             out.push('\n');
         }
     }
+}
+
+/// Bequeme Fassung für die Tests und den Messlauf: legt die Puffer selbst an.
+#[cfg(test)]
+fn render(
+    scene: &Scene,
+    position: (f64, f64, f64, f32, f32),
+    width: usize,
+    height: usize,
+    color: bool,
+) -> String {
+    let mut pixels = Vec::new();
+    let mut out = String::new();
+    render_into(
+        scene, position, width, height, color, &mut pixels, &mut out,
+    );
     out
 }
 
@@ -1449,27 +1558,47 @@ fn cast(
     let mut face = 1usize;
     while distance <= MAX_DISTANCE {
         // Erst die billige Sichtprüfung; die Zustands-ID kostet einen Palettenzugriff mehr.
+        //
+        // Einen ganzen leeren Abschnitt in einem Zug zu überspringen wäre verlockend, geht aber
+        // nicht sauber: Die Austrittsfläche müsste geteilt, die Blockgrenzen dagegen aufaddiert
+        // werden, und bei einer Kamera genau auf einer Blockecke fallen beide Rechnungen um eine
+        // Zelle auseinander. Das wäre ein sichtbar falscher Bildpunkt für kaum gesparte Arbeit –
+        // der Abschnittsmerker in [`Cursor`] holt den Löwenanteil ohnehin.
         if cursor.solid(cell.0, cell.1, cell.2) {
             return Some((cursor.block(cell.0, cell.1, cell.2), distance, face));
         }
-        if next.0 <= next.1 && next.0 <= next.2 {
-            cell.0 += step.0;
-            distance = next.0;
-            next.0 += delta.0;
-            face = 0;
-        } else if next.1 <= next.2 {
-            cell.1 += step.1;
-            distance = next.1;
-            next.1 += delta.1;
-            face = 1;
-        } else {
-            cell.2 += step.2;
-            distance = next.2;
-            next.2 += delta.2;
-            face = 2;
-        }
+        advance(&mut cell, &mut next, &mut distance, &mut face, step, delta);
     }
     None
+}
+
+/// Ein Schritt des Voxel-DDA: Es rückt die Achse weiter, deren nächste Blockgrenze am
+/// nächsten liegt.
+#[inline]
+fn advance(
+    cell: &mut (i32, i32, i32),
+    next: &mut (f64, f64, f64),
+    distance: &mut f64,
+    face: &mut usize,
+    step: (i32, i32, i32),
+    delta: (f64, f64, f64),
+) {
+    if next.0 <= next.1 && next.0 <= next.2 {
+        cell.0 += step.0;
+        *distance = next.0;
+        next.0 += delta.0;
+        *face = 0;
+    } else if next.1 <= next.2 {
+        cell.1 += step.1;
+        *distance = next.1;
+        next.1 += delta.1;
+        *face = 1;
+    } else {
+        cell.2 += step.2;
+        *distance = next.2;
+        next.2 += delta.2;
+        *face = 2;
+    }
 }
 
 fn sign(value: f64) -> i32 {
@@ -1566,7 +1695,7 @@ fn overlay_entities(
             entity.z - origin.2,
         );
         let distance = dot(to, to).sqrt();
-        if distance < 0.1 || distance > MAX_DISTANCE {
+        if !(0.1..=MAX_DISTANCE).contains(&distance) {
             continue;
         }
         // Tiefe entlang der Blickachse. Alles dahinter oder daneben ist nicht im Bild.
@@ -1887,13 +2016,13 @@ mod tests {
             let mut w = Writer::default();
             write_section(&mut w, format, &states, SECTION_BLOCKS);
             let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
-            for index in 0..SECTION_BLOCKS {
+            for (index, state) in states.iter().enumerate() {
                 let (x, y, z) = (
                     (index & 15) as i32,
                     (index >> 8) as i32,
                     ((index >> 4) & 15) as i32,
                 );
-                assert_eq!(chunk.block(x, y, z), states[index], "Block {}", index);
+                assert_eq!(chunk.block(x, y, z), *state, "Block {}", index);
             }
         }
     }
@@ -1938,6 +2067,146 @@ mod tests {
             min_section: -4,
             sections,
         })
+    }
+
+    /// Ein Chunk mit unruhigem Gelände: so trifft ein Strahl auch mitten in einem Abschnitt
+    /// auf einen Block, statt immer nur auf eine ebene Fläche.
+    fn hilly_chunk(seed: i32) -> Arc<Chunk> {
+        let mut sections: Vec<Option<Arc<Section>>> = vec![None; 24];
+        for (offset, index) in [4usize, 5].into_iter().enumerate() {
+            let mut section = Section::empty();
+            for x in 0..16i32 {
+                for z in 0..16i32 {
+                    // Deterministische, aber zerklüftete Höhe je Säule.
+                    let height = ((x * 7 + z * 13 + seed * 5).rem_euclid(9)) - offset as i32 * 4;
+                    for y in 0..height.clamp(0, 16) {
+                        section.set(local_index(x, y, z), (1 + (x + z + y) % 3) as u32);
+                    }
+                }
+            }
+            sections[index] = Some(Arc::new(section));
+        }
+        Arc::new(Chunk {
+            min_section: -4,
+            sections,
+        })
+    }
+
+    /// Der Voxel-Durchlauf **ohne** jede Abkürzung: Block für Block, genau nach Lehrbuch.
+    /// Maßstab für den optimierten [`cast`].
+    fn cast_naive(
+        scene: &Scene,
+        origin: (f64, f64, f64),
+        dir: (f64, f64, f64),
+    ) -> Option<(u32, f64, usize)> {
+        let mut cell = (
+            origin.0.floor() as i32,
+            origin.1.floor() as i32,
+            origin.2.floor() as i32,
+        );
+        let step = (sign(dir.0), sign(dir.1), sign(dir.2));
+        let delta = (inv_abs(dir.0), inv_abs(dir.1), inv_abs(dir.2));
+        let mut next = (
+            first_boundary(origin.0, dir.0, cell.0),
+            first_boundary(origin.1, dir.1, cell.1),
+            first_boundary(origin.2, dir.2, cell.2),
+        );
+        let mut distance = 0.0;
+        let mut face = 1usize;
+        while distance <= MAX_DISTANCE {
+            let block = scene
+                .chunks
+                .get(&(cell.0.div_euclid(16), cell.2.div_euclid(16)))
+                .filter(|chunk| chunk.solid(cell.0, cell.1, cell.2))
+                .map(|chunk| chunk.block(cell.0, cell.1, cell.2));
+            if let Some(state) = block {
+                return Some((state, distance, face));
+            }
+            advance(
+                &mut cell,
+                &mut next,
+                &mut distance,
+                &mut face,
+                step,
+                delta,
+            );
+        }
+        None
+    }
+
+    /// Das Überspringen leerer Abschnitte darf am Bild **nichts** ändern – es soll nur Arbeit
+    /// sparen. Genau hier lauert der Fehler: Die Austrittsfläche eines Abschnitts wird einmal
+    /// geteilt, die Blockgrenzen des Feindurchlaufs entstehen durch wiederholtes Addieren.
+    /// Nimmt die Rundung die Grenze nicht mit, bleibt der Strahl im selben Abschnitt stehen und
+    /// die Schleife läuft ewig – der ganze Client hängt dann still am Zeichnen.
+    ///
+    /// Deshalb hier zehntausend Strahlen in alle Richtungen gegen die Lehrbuchfassung, quer
+    /// durch geladene und ungeladene Chunks und aus Kamerapositionen genau auf Blockgrenzen.
+    #[test]
+    fn abkuerzung_liefert_dasselbe_wie_der_einzelschritt() {
+        let mut chunks = HashMap::new();
+        for x in -3..=3i32 {
+            for z in -3..=3i32 {
+                // Ein paar Löcher: dort ist gar kein Chunk geladen.
+                if (x + z).rem_euclid(5) == 0 {
+                    continue;
+                }
+                chunks.insert((x, z), hilly_chunk(x * 31 + z));
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+        };
+
+        // Auch genau auf Blockgrenzen und Abschnittsgrenzen: dort trifft die Rundung zu.
+        let origins = [
+            (8.0, 19.62, 8.0),
+            (0.0, 16.0, 0.0),
+            (16.0, 32.0, -16.0),
+            (-0.5, 5.5, 0.5),
+            (7.3, 70.0, -13.9),
+            (0.0, 0.0, 0.0),
+        ];
+        let mut checked = 0;
+        for origin in origins {
+            for yaw_step in 0..90 {
+                for pitch_step in 0..19 {
+                    let yaw = yaw_step as f64 * 4.0 - 180.0;
+                    let pitch = pitch_step as f64 * 10.0 - 90.0;
+                    let dir = view_direction(yaw, pitch);
+                    let mut cursor = Cursor::new(&scene);
+                    let quick = cast(&mut cursor, origin, dir);
+                    let naive = cast_naive(&scene, origin, dir);
+                    match (quick, naive) {
+                        (None, None) => {}
+                        (Some((a, da, fa)), Some((b, db, fb))) => {
+                            assert_eq!(a, b, "Block bei {:?} / {}/{}", origin, yaw, pitch);
+                            assert_eq!(fa, fb, "Seite bei {:?} / {}/{}", origin, yaw, pitch);
+                            assert!(
+                                (da - db).abs() < 1e-6,
+                                "Abstand bei {:?} / {}/{}: {} != {}",
+                                origin,
+                                yaw,
+                                pitch,
+                                da,
+                                db
+                            );
+                        }
+                        (a, b) => panic!(
+                            "unterschiedliches Ergebnis bei {:?} / {}/{}: {:?} vs {:?}",
+                            origin,
+                            yaw,
+                            pitch,
+                            a.map(|v| v.0),
+                            b.map(|v| v.0)
+                        ),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, origins.len() * 90 * 19);
     }
 
     /// Messlauf statt Behauptung: wie lange braucht ein Bild wirklich?
@@ -2046,3 +2315,4 @@ mod tests {
         }
     }
 }
+

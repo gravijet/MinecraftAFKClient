@@ -79,7 +79,7 @@ fn teleport_wird_bestaetigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
     let accepted = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Packet(id) if *id == common::MC_26_1.sb_accept_teleportation)
+        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation)
     });
     assert!(accepted, "Teleport wurde nicht bestätigt");
     let _ = child.kill();
@@ -101,6 +101,38 @@ fn eingabe_geht_in_den_chat() {
     });
     assert!(arrived, "die Chatzeile kam nicht beim Server an");
     let _ = child.kill();
+}
+
+/// Regressionstest: `:use` hat in 1.21.1 acht Byte zu viel geschickt.
+///
+/// Die Blickrichtung steht erst ab 1.21.2 mit im `ServerboundUseItemPacket`; in 1.21.1 besteht
+/// es nur aus Hand und Sequenznummer. Die zwei überzähligen Fließkommazahlen brachten dort den
+/// Paket-Decoder des Servers aus dem Tritt – und damit die ganze Verbindung. Geprüft wird
+/// deshalb am Socket, wie lang das Paket wirklich ankommt: zwei Byte gegen zehn.
+#[cfg(feature = "state")]
+#[test]
+fn use_item_paket_passt_zur_version() {
+    for (ids, expected) in [(&common::MC_1_21_1, 2usize), (&common::MC_26_1, 10usize)] {
+        let server = common::start(ids, plan_with_ground());
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let err = common::collect(child.stderr.take().unwrap());
+
+        let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
+        assert!(joined, "{}: kein Beitritt. Ausgabe:\n{}", ids.name, log);
+        let _ = writeln!(stdin, ":use");
+
+        let id = ids.sb_use_item;
+        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Packet(got, len) if *got == id && *len == expected)
+        });
+        assert!(
+            ok,
+            "{}: ServerboundUseItem kam nicht mit {} Byte Nutzdaten an",
+            ids.name, expected
+        );
+        let _ = child.kill();
+    }
 }
 
 // ===================== Live-POV =====================
@@ -193,7 +225,7 @@ fn chunk_stapel_wird_bestaetigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
     let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Packet(id) if *id == common::MC_26_1.sb_chunk_batch_received)
+        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_chunk_batch_received)
     });
     assert!(ok, "ServerboundChunkBatchReceived kam nie an");
     let _ = child.kill();
@@ -293,8 +325,7 @@ fn weit_entfernte_chunks_fallen_weg() {
     // Die *letzte* Auskunft zählt: durch das Nachfragen stehen frühere Zwischenstände mit im Log.
     let line = log
         .lines()
-        .filter(|line| line.contains("Chunks ·"))
-        .next_back()
+        .rfind(|line| line.contains("Chunks ·"))
         .expect("Auskunftszeile");
     let chunks: usize = line
         .split_whitespace()

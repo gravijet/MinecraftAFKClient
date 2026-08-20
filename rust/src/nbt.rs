@@ -79,18 +79,35 @@ impl Nbt {
     }
 }
 
+/// Obergrenze für die Zahl der Knoten einer Netzwerk-NBT-Struktur.
+///
+/// Ein Paket ist längenbegrenzt, beim Einlesen bläht es sich aber auf: aus einer Liste von
+/// Einzelbytes wird je Eintrag ein vollwertiger [`Nbt`]-Wert von gut dreißig Byte. Ein Server
+/// könnte damit aus 32 MB Paketdaten fast ein Gigabyte Speicher im Client machen, ohne dass
+/// irgendeine Längenprüfung anschlüge. Echte Chat-Komponenten und Registerdaten kommen mit ein
+/// paar tausend Knoten aus; die halbe Million hier ist bewusst großzügig und trotzdem eine
+/// harte Schranke (rund 16 MB).
+const MAX_NODES: u32 = 512 * 1024;
+
 /// Netzwerk-NBT: Typ-Byte, dann Nutzdaten (kein Wurzelname).
 pub fn read_network(r: &mut Reader) -> io::Result<Nbt> {
     let tag = r.u8()?;
     if tag == 0 {
         return Ok(Nbt::End);
     }
-    read_payload(r, tag, 0)
+    let mut budget = MAX_NODES;
+    read_payload(r, tag, 0, &mut budget)
 }
 
-fn read_payload(r: &mut Reader, tag: u8, depth: u32) -> io::Result<Nbt> {
+fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Result<Nbt> {
     if depth > 64 {
         return Err(crate::buf::err("NBT zu tief verschachtelt"));
+    }
+    // Jeder gelesene Wert kostet ein Guthaben; Listen und Compounds können damit nicht mehr
+    // beliebig viele kleine Knoten erzeugen.
+    match budget.checked_sub(1) {
+        Some(left) => *budget = left,
+        None => return Err(crate::buf::err("NBT zu gross")),
     }
     Ok(match tag {
         1 => Nbt::Byte(r.i8()?),
@@ -111,7 +128,7 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32) -> io::Result<Nbt> {
             if len > 0 && inner != 0 {
                 items.reserve(len.min(4096) as usize);
                 for _ in 0..len {
-                    items.push(read_payload(r, inner, depth + 1)?);
+                    items.push(read_payload(r, inner, depth + 1, budget)?);
                 }
             }
             Nbt::List(items)
@@ -124,7 +141,7 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32) -> io::Result<Nbt> {
                     break;
                 }
                 let name = read_nbt_string(r)?;
-                fields.push((name, read_payload(r, t, depth + 1)?));
+                fields.push((name, read_payload(r, t, depth + 1, budget)?));
             }
             Nbt::Compound(fields)
         }
@@ -252,19 +269,23 @@ fn merge(inherited: &Style, tag: &Nbt) -> Style {
 }
 
 /// Text ausgeben – inklusive Übersetzung alter §-Farbcodes, die viele Server noch senden.
+///
+/// Alles wird direkt in `out` geschrieben. Das ist kein Selbstzweck: Chat ist der Dauerbetrieb
+/// auch des schlanken Clients, und je Textbaustein wurden hier bisher zwei bis drei kurzlebige
+/// Zeichenketten für den Stil angelegt, die sofort wieder weggeworfen wurden.
 fn emit(text: &str, style: &Style, fmt: Fmt, out: &mut String) {
     if text.is_empty() {
         return;
     }
     match fmt {
-        Fmt::Plain => out.push_str(&strip_legacy(text)),
+        Fmt::Plain => push_stripped(out, text),
         // Der Text bringt seine eigenen §-Codes schon mit; davor kommt nur der geerbte Stil.
         Fmt::Legacy => {
-            out.push_str(&legacy_of(style));
+            push_legacy(out, style);
             out.push_str(text);
         }
         Fmt::Ansi => {
-            out.push_str(&ansi_of(style));
+            push_ansi(out, style);
             let mut chars = text.chars();
             while let Some(c) = chars.next() {
                 if c != '\u{00a7}' {
@@ -274,9 +295,8 @@ fn emit(text: &str, style: &Style, fmt: Fmt, out: &mut String) {
                 let Some(code) = chars.next() else { break };
                 // §x leitet eine echte Farbe ein: §x§r§r§g§g§b§b.
                 if code.eq_ignore_ascii_case(&'x') {
-                    match read_legacy_hex(&mut chars) {
-                        Some(rgb) => out.push_str(&rgb),
-                        None => break,
+                    if !push_legacy_hex(out, &mut chars) {
+                        break;
                     }
                     continue;
                 }
@@ -285,7 +305,7 @@ fn emit(text: &str, style: &Style, fmt: Fmt, out: &mut String) {
                     // Unbekannter Code: Grundstil wiederherstellen, damit nichts „ausblutet".
                     None => {
                         out.push_str("\x1b[0m");
-                        out.push_str(&ansi_of(style));
+                        push_ansi(out, style);
                     }
                 }
             }
@@ -297,7 +317,7 @@ fn emit(text: &str, style: &Style, fmt: Fmt, out: &mut String) {
 /// (Anzeigetafel, Gegenstandsnamen) und erst beim Anzeigen eingefärbt wird.
 #[allow(dead_code)] // nur Bauformen, die §-Text im Zustand halten
 pub fn legacy_to_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 16);
+    let mut out = String::with_capacity(text.len() + 32);
     emit(text, &Style::default(), Fmt::Ansi, &mut out);
     if !out.is_empty() {
         out.push_str("\x1b[0m");
@@ -305,26 +325,53 @@ pub fn legacy_to_ansi(text: &str) -> String {
     out
 }
 
-/// Sechs `§`-Ziffern nach `§x` einlesen und als ANSI-Echtfarbe zurückgeben.
-fn read_legacy_hex(chars: &mut std::str::Chars) -> Option<String> {
-    let mut hex = String::with_capacity(6);
+/// Sechs `§`-Ziffern nach `§x` einlesen und als ANSI-Echtfarbe anhängen.
+/// `false` = die Folge war unvollständig, der Rest des Textes ist damit unbrauchbar.
+fn push_legacy_hex(out: &mut String, chars: &mut std::str::Chars) -> bool {
+    let mut value: u32 = 0;
     for _ in 0..6 {
-        if chars.next()? != '\u{00a7}' {
-            return None;
+        if chars.next() != Some('\u{00a7}') {
+            return false;
         }
-        hex.push(chars.next()?);
+        let Some(digit) = chars.next().and_then(|c| c.to_digit(16)) else {
+            return false;
+        };
+        value = (value << 4) | digit;
     }
-    let value = u32::from_str_radix(&hex, 16).ok()?;
-    Some(format!(
-        "\x1b[38;2;{};{};{}m",
-        (value >> 16) & 0xFF,
-        (value >> 8) & 0xFF,
-        value & 0xFF
-    ))
+    push_true_color(out, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8);
+    true
 }
 
+fn push_true_color(out: &mut String, r: u8, g: u8, b: u8) {
+    out.push_str("\x1b[38;2;");
+    push_number(out, r);
+    out.push(';');
+    push_number(out, g);
+    out.push(';');
+    push_number(out, b);
+    out.push('m');
+}
+
+fn push_number(out: &mut String, value: u8) {
+    if value >= 100 {
+        out.push((b'0' + value / 100) as char);
+    }
+    if value >= 10 {
+        out.push((b'0' + (value / 10) % 10) as char);
+    }
+    out.push((b'0' + value % 10) as char);
+}
+
+/// `§`-Codes entfernen. Gegenstück zu [`legacy_to_ansi`] und aus demselben Grund nicht in jeder
+/// Bauform benutzt: nur wer §-Text im Zustand hält (Anzeigetafel, Gegenstände), entfärbt ihn auch.
+#[allow(dead_code)]
 pub fn strip_legacy(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
+    push_stripped(&mut out, text);
+    out
+}
+
+fn push_stripped(out: &mut String, text: &str) {
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
         if c != '\u{00a7}' {
@@ -341,11 +388,10 @@ pub fn strip_legacy(text: &str) -> String {
             }
         }
     }
-    out
 }
 
-fn ansi_of(style: &Style) -> String {
-    let mut s = String::from("\x1b[0m");
+fn push_ansi(out: &mut String, style: &Style) {
+    out.push_str("\x1b[0m");
     if let Some(c) = &style.color {
         if let Some(hex) = c.strip_prefix('#') {
             // Erst auf ASCII-Hexziffern prüfen: `&hex[0..2]` schnitte sonst mitten durch ein
@@ -357,46 +403,43 @@ fn ansi_of(style: &Style) -> String {
                     u8::from_str_radix(&hex[2..4], 16),
                     u8::from_str_radix(&hex[4..6], 16),
                 ) {
-                    s.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b));
+                    push_true_color(out, r, g, b);
                 }
             }
         } else if let Some(code) = named_ansi(c) {
-            s.push_str(code);
+            out.push_str(code);
         }
     }
-    if style.bold {
-        s.push_str("\x1b[1m");
+    for (on, code) in [
+        (style.bold, "\x1b[1m"),
+        (style.italic, "\x1b[3m"),
+        (style.underlined, "\x1b[4m"),
+        (style.strikethrough, "\x1b[9m"),
+    ] {
+        if on {
+            out.push_str(code);
+        }
     }
-    if style.italic {
-        s.push_str("\x1b[3m");
-    }
-    if style.underlined {
-        s.push_str("\x1b[4m");
-    }
-    if style.strikethrough {
-        s.push_str("\x1b[9m");
-    }
-    s
 }
 
-/// Stil als `§`-Codes – das Gegenstück zu [`ansi_of`] für die Weitergabe an ein Programm davor.
-fn legacy_of(style: &Style) -> String {
-    let mut s = String::from("\u{00a7}r");
+/// Stil als `§`-Codes – das Gegenstück zu [`push_ansi`] für die Weitergabe an ein Programm davor.
+fn push_legacy(out: &mut String, style: &Style) {
+    out.push_str("\u{00a7}r");
     if let Some(c) = &style.color {
         match c.strip_prefix('#') {
             // Echte Farbe: §x§r§r§g§g§b§b (Schreibweise von BungeeCord).
             Some(hex) if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
-                s.push_str("\u{00a7}x");
+                out.push_str("\u{00a7}x");
                 for digit in hex.chars() {
-                    s.push('\u{00a7}');
-                    s.push(digit.to_ascii_lowercase());
+                    out.push('\u{00a7}');
+                    out.push(digit.to_ascii_lowercase());
                 }
             }
             Some(_) => {}
             None => {
                 if let Some(code) = named_legacy(c) {
-                    s.push('\u{00a7}');
-                    s.push(code);
+                    out.push('\u{00a7}');
+                    out.push(code);
                 }
             }
         }
@@ -408,18 +451,19 @@ fn legacy_of(style: &Style) -> String {
         (style.strikethrough, 'm'),
     ] {
         if on {
-            s.push('\u{00a7}');
-            s.push(code);
+            out.push('\u{00a7}');
+            out.push(code);
         }
     }
-    s
 }
 
 /// Den NBT-Stil eines Minecraft-`StyledFormat` als `§`-Präfix ausgeben. Scoreboards verwenden
 /// dafür ein reines Style-Compound statt einer Text-Komponente.
 #[cfg(feature = "board")]
 pub(crate) fn style_legacy(tag: &Nbt) -> String {
-    legacy_of(&merge(&Style::default(), tag))
+    let mut out = String::new();
+    push_legacy(&mut out, &merge(&Style::default(), tag));
+    out
 }
 
 fn named_legacy(name: &str) -> Option<char> {
@@ -555,6 +599,31 @@ mod tests {
             assert!(render(&tag, Fmt::Ansi).contains("Hi"));
             assert!(render(&tag, Fmt::Legacy).contains("Hi"));
         }
+    }
+
+    /// Ein Paket ist zwar längenbegrenzt, eine Liste aus Einzelbytes bläht sich beim Einlesen
+    /// aber um das Dreißigfache auf. Aus wenigen Megabyte Paketdaten wurde so fast ein Gigabyte
+    /// Speicher – das muss der Decoder abweisen, statt ihn anzulegen.
+    #[test]
+    fn riesige_listen_werden_abgewiesen() {
+        // TAG_List mit MAX_NODES+1 Einträgen vom Typ Byte: die Nutzdaten sind ein Byte je
+        // Eintrag, der gelesene Baum wäre ein Vielfaches davon.
+        let count = MAX_NODES as usize + 1;
+        let mut data = Vec::with_capacity(count + 8);
+        data.push(9); // TAG_List
+        data.push(1); // Inhalt: TAG_Byte
+        data.extend_from_slice(&(count as i32).to_be_bytes());
+        data.resize(data.len() + count, 0);
+
+        let mut r = crate::buf::Reader::new(&data);
+        assert!(read_network(&mut r).is_err());
+
+        // Was ein Server wirklich schickt, bleibt selbstverständlich lesbar.
+        let mut small = vec![9u8, 1];
+        small.extend_from_slice(&1000i32.to_be_bytes());
+        small.resize(small.len() + 1000, 0);
+        let mut r = crate::buf::Reader::new(&small);
+        assert!(matches!(read_network(&mut r), Ok(Nbt::List(items)) if items.len() == 1000));
     }
 
     /// Verschachtelte Komponenten erben den Stil des Elternteils.

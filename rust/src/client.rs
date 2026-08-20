@@ -456,12 +456,19 @@ fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
 
 // ===================== Netz-Thread =====================
 
+/// Ab dieser Verbindungsdauer gilt ein Transfer nicht mehr als Teil einer Weiterreich-Schleife.
+/// Wer nach Minuten regulär auf einen anderen Unterserver geschickt wird, soll nicht wegen
+/// irgendwelcher Transfers von vorhin ausgebremst werden.
+const TRANSFER_CHAIN_RESET: Duration = Duration::from_secs(10);
+
 fn net_loop(shared: Arc<Shared>) {
     // Ein Server, der uns im Kreis weiterreicht, darf keine Endlosschleife auf voller Last
     // erzeugen: je Transfer in Folge wird ein Stück länger gewartet.
     let mut transfers: u32 = 0;
     while shared.running.load(Ordering::Relaxed) {
+        let started = Instant::now();
         let result = run_connection(&shared);
+        let lasted = started.elapsed();
 
         shared.in_game.store(false, Ordering::SeqCst);
         shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -486,7 +493,16 @@ fn net_loop(shared: Arc<Shared>) {
         if shared.intentional.swap(false, Ordering::SeqCst) {
             // Server-Transfer ist ein ausdrücklicher Protokollwechsel, kein Reconnect nach
             // einem Kick. Deshalb wird nur in diesem Fall weiterverbunden.
-            transfers = transfers.saturating_add(1);
+            //
+            // Gezählt werden nur *schnell* aufeinanderfolgende Transfers. Ohne diese Bedingung
+            // summierte der Zähler alle Transfers der ganzen Laufzeit auf: Wer über Stunden
+            // regulär zwischen Unterservern wechselt, bekam ab dem vierten Wechsel eine Warnung
+            // und eine immer längere Wartezeit vor einem völlig normalen Vorgang.
+            transfers = if lasted >= TRANSFER_CHAIN_RESET {
+                1
+            } else {
+                transfers.saturating_add(1)
+            };
             if transfers > 3 {
                 let wait = Duration::from_millis(250 * u64::from(transfers.min(20)));
                 shared.console.warn(&format!(
@@ -1187,10 +1203,25 @@ fn acknowledge_resource_pack(shared: &Arc<Shared>, packet_id: i32, pack: &[u8; 1
     }
 }
 
+/// So viele Cookies hebt der Client je Verbindung auf, und so groß darf eines höchstens sein.
+///
+/// Die Grenzen sind dieselben, die auch der Vanilla-Client zieht. Ohne sie könnte ein Server
+/// beliebig viele Cookies unter immer neuen Namen ablegen und den Speicher so still volllaufen
+/// lassen – geleert wird die Ablage nämlich erst beim nächsten Verbindungsaufbau.
+const MAX_COOKIES: usize = 64;
+const MAX_COOKIE_BYTES: usize = 5120;
+
 fn store_cookie(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     let key = r.string().map_err(|e| e.to_string())?;
     let payload = r.byte_array().map_err(|e| e.to_string())?;
-    shared.cookies.lock().unwrap().insert(key, payload);
+    if payload.len() > MAX_COOKIE_BYTES {
+        return Err(format!("Cookie '{}' ist zu groß ({} Byte)", key, payload.len()));
+    }
+    let mut cookies = shared.cookies.lock().unwrap();
+    // Ein bereits bekanntes Cookie darf immer aktualisiert werden; nur neue zählen gegen die Zahl.
+    if cookies.len() < MAX_COOKIES || cookies.contains_key(&key) {
+        cookies.insert(key, payload);
+    }
     Ok(())
 }
 

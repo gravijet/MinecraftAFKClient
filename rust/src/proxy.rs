@@ -289,7 +289,7 @@ fn socks5_error(code: u8) -> &'static str {
 }
 
 fn fail(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, message.to_string())
+    io::Error::other(message.to_string())
 }
 
 #[cfg(test)]

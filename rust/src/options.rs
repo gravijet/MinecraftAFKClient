@@ -313,9 +313,12 @@ fn check_server(server: &str) -> Result<(), String> {
         server.rsplit_once(':').map(|(_, port)| port)
     };
 
+    // Port 0 ist kein Port, sondern die Bitte an das Betriebssystem, sich einen auszusuchen –
+    // als Ziel einer Verbindung ergibt er keinen Sinn und führte nur zu einer kryptischen
+    // Meldung des Netzstapels statt zu einem klaren Hinweis auf den Tippfehler.
     match port {
-        Some(port) if port.trim().parse::<u16>().is_err() => Err(format!(
-            "Server-Port ist keine Zahl zwischen 0 und 65535: '{}'. Beispiel: mc.example.net:25565",
+        Some(port) if !matches!(port.trim().parse::<u16>(), Ok(1..=u16::MAX)) => Err(format!(
+            "Server-Port ist keine Zahl zwischen 1 und 65535: '{}'. Beispiel: mc.example.net:25565",
             port
         )),
         _ => Ok(()),
@@ -428,7 +431,11 @@ fn parse_rule(input: &str) -> Result<Spec, String> {
                 if text.is_empty() {
                     return Err("--on chat: braucht einen Text, auf den gewartet wird.".to_string());
                 }
-                Trigger::Chat(text.to_ascii_lowercase())
+                // `to_lowercase`, nicht `to_ascii_lowercase`: Die Chat-Zeile wird beim Vergleich
+                // vollständig kleingeschrieben (siehe [`crate::rules`]). Ein Auslöser mit einem
+                // großen Umlaut blieb mit der ASCII-Fassung stehen wie er war – `--on
+                // "chat:Du bist ÜBERFÄLLIG=/lobby"` konnte deshalb nie zutreffen.
+                Trigger::Chat(text.to_lowercase())
             }
             _ => {
                 return Err(format!(
@@ -513,6 +520,9 @@ mod tests {
         assert!(parse_args(&["mc.example.net:"]).is_err());
         assert!(parse_args(&["mc.example.net:99999"]).is_err());
         assert!(parse_args(&["[::1"]).is_err());
+        // Port 0 ist als Ziel keiner: der Netzstapel hätte darauf nur kryptisch geantwortet.
+        assert!(parse_args(&["mc.example.net:0"]).is_err());
+        assert!(parse_args(&["[::1]:0"]).is_err());
         // Gültige Schreibweisen bleiben gültig.
         assert!(parse_args(&["mc.example.net"]).is_ok());
         assert!(parse_args(&["mc.example.net:25566"]).is_ok());
@@ -608,6 +618,24 @@ mod tests {
             Trigger::Chat(text) => assert_eq!(text, "du bist afk"),
             _ => panic!("kein Chat-Auslöser"),
         }
+    }
+
+    /// Der Auslöser wird genauso kleingeschrieben wie die Chat-Zeile, mit der er verglichen
+    /// wird. Mit der reinen ASCII-Kleinschreibung blieb ein großer Umlaut im Auslöser stehen,
+    /// während er in der Chat-Zeile klein wurde – die Regel konnte dann nie zutreffen.
+    #[test]
+    fn umlaute_im_ausloeser_werden_richtig_kleingeschrieben() {
+        let o = options(&["x", "--on", "chat:Du bist ÜBERFÄLLIG=/lobby"]);
+        match &o.rules[0].trigger {
+            Trigger::Chat(text) => assert_eq!(text, "du bist überfällig"),
+            _ => panic!("kein Chat-Auslöser"),
+        }
+        // Und die Regel greift dann auch wirklich.
+        let rules = crate::rules::Rules::new(o.rules.clone(), 0);
+        assert_eq!(
+            rules.fire(&crate::rules::Event::Chat("Hey, Du bist ÜBERFÄLLIG!")),
+            vec!["/lobby".to_string()]
+        );
     }
 
     /// Ein '=' in der Aktion darf nicht stören – geteilt wird beim ersten.

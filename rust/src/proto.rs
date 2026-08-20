@@ -278,6 +278,13 @@ impl Protocol {
     /// Paket-ID einordnen. Reihenfolge nach Häufigkeit: KeepAlive und Chat kommen ständig,
     /// ein Beitritt genau einmal. Alles Unbekannte ist [`In::Ignored`] und wird nie gelesen.
     pub fn incoming(&self, id: i32) -> In {
+        // Paket-IDs kommen als VarInt und können damit auch negativ dekodieren. Fehlende Pakete
+        // stehen in den Tabellen als -1 („gibt es in dieser Version nicht"); ohne diese Schranke
+        // würde eine Verbindung mit der ID -1 genau darauf treffen und ein Paket verarbeiten,
+        // das der Server gar nicht gesendet hat.
+        if id < 0 {
+            return In::Ignored;
+        }
         let g = &self.game;
         if id == g.cb_keep_alive {
             In::KeepAlive

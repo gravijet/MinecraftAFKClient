@@ -181,8 +181,7 @@ fn sign_in(console: &Console, base: &Path, preferred: Option<&str>) -> auth::Res
                 } else {
                     accounts.join(", ")
                 }
-            )
-            .into())
+            ))
         }
         None => accounts.first().cloned(),
     };

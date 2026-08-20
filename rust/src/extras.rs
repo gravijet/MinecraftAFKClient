@@ -92,14 +92,11 @@ impl Extras {
 /// die eine aktive Bauform wirklich benötigt; ein Paket ist bereits längenbegrenzt, deshalb darf
 /// der Rest aller anderen Register ungelesen verworfen werden.
 pub fn registry(shared: &Arc<Shared>, r: &mut Reader) {
-    #[cfg(not(any(feature = "items", feature = "pov")))]
-    {
-        let _ = (shared, r);
-        return;
-    }
-
     #[cfg(any(feature = "items", feature = "pov"))]
     registry_used(shared, r);
+    // Bauformen ohne Gegenstände und ohne Live-Ansicht brauchen aus der Registry nichts.
+    #[cfg(not(any(feature = "items", feature = "pov")))]
+    let _ = (shared, r);
 }
 
 #[cfg(any(feature = "items", feature = "pov"))]
@@ -116,10 +113,19 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         return;
     }
 
+    // Nur der wirklich gesuchte Vektor bekommt Platz. `minecraft:item` hat gut anderthalbtausend
+    // Einträge – dafür in einer POV-Bauform, die die Liste gar nicht will, Speicher anzufordern,
+    // wäre reine Verschwendung.
     #[cfg(feature = "items")]
-    let mut item_names = Vec::with_capacity(count as usize);
+    let mut item_names = match wants_items {
+        true => Vec::with_capacity(count as usize),
+        false => Vec::new(),
+    };
     #[cfg(feature = "pov")]
-    let mut dimensions = Vec::with_capacity(count as usize);
+    let mut dimensions = match wants_dimensions {
+        true => Vec::with_capacity(count as usize),
+        false => Vec::new(),
+    };
 
     for _ in 0..count {
         let Ok(name) = r.string() else { return };
@@ -379,17 +385,23 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
 }
 
 /// Rechtsklick mit dem Gegenstand in der Hand („Gegenstand benutzen").
+///
+/// Die Blickrichtung steht erst ab 1.21.2 mit im Paket. In 1.21.1 besteht
+/// `ServerboundUseItemPacket` nur aus Hand und Sequenznummer – die acht zusätzlichen Bytes
+/// haben dort den Paket-Decoder des Servers aus dem Tritt gebracht und die Verbindung gekostet.
 #[cfg(feature = "state")]
 fn use_item(shared: &Arc<Shared>) {
-    let (yaw, pitch) = shared
-        .position()
-        .map(|(_, _, _, yaw, pitch)| (yaw, pitch))
-        .unwrap_or((0.0, 0.0));
     let mut w = Writer::packet(shared.proto.extra.sb_use_item);
     w.var_int(0); // Haupthand
     w.var_int(0); // Sequenznummer – der Server nutzt sie nur zum Zurückrollen von Blockänderungen
-    w.f32(yaw);
-    w.f32(pitch);
+    if shared.proto.modern {
+        let (yaw, pitch) = shared
+            .position()
+            .map(|(_, _, _, yaw, pitch)| (yaw, pitch))
+            .unwrap_or((0.0, 0.0));
+        w.f32(yaw);
+        w.f32(pitch);
+    }
     shared.send(w);
     shared.console.info("Gegenstand benutzt (Rechtsklick).");
 }

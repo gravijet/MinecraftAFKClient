@@ -139,7 +139,7 @@ impl Console {
         let _ = if detail.is_empty() {
             writeln!(err, "@event {}", name)
         } else {
-            writeln!(err, "@event {} {}", name, detail)
+            writeln!(err, "@event {} {}", name, one_line(detail))
         };
         let _ = err.flush();
     }
@@ -161,13 +161,46 @@ impl Console {
 
     /// Eingabezeilen, bis die Standardeingabe endet. `None` = Ende (z. B. Strg-D oder eine
     /// Eingabe, die es gar nicht gibt – dann läuft der Client einfach ohne Eingabe weiter).
+    ///
+    /// Eine einzelne unbrauchbare Zeile beendet die Eingabe **nicht**: Bisher schloss jeder
+    /// Fehler die Schleife für immer. Ein Signal (`EINTR`) oder ein einziges Byte, das kein
+    /// UTF-8 ist – etwa eine mit falscher Codepage geschriebene Zeile aus einem Panel –, machte
+    /// den Client damit dauerhaft taub, obwohl die Standardeingabe noch offen war. Beide Fälle
+    /// haben die betroffene Zeile bereits verbraucht, ein erneuter Versuch kommt also voran.
     pub fn read_line(&self) -> Option<String> {
         let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        loop {
+            line.clear();
+            match std::io::stdin().lock().read_line(&mut line) {
+                Ok(0) => return None,
+                Ok(_) => return Some(line.trim_end_matches(['\r', '\n']).to_string()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::InvalidData
+                    ) => {}
+                Err(_) => return None,
+            }
         }
     }
+}
+
+/// Zeilenumbrüche und andere Steuerzeichen in Leerzeichen wandeln.
+///
+/// `@event` ist eine zugesagte Schnittstelle mit **genau einer Zeile je Ereignis**. Fast alles,
+/// was dort als Angabe landet, kommt aber vom Server und darf Umbrüche enthalten: Kick-Gründe
+/// sind regelmäßig mehrzeilig, Scoreboard-Zeilen und Gegenstands-Lore ebenfalls. Ohne diese
+/// Wandlung riss eine einzige solche Meldung die Zeile auseinander, und alles hinter dem
+/// Umbruch sah für ein Programm davor aus wie eine gewöhnliche Statuszeile.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control()) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect(),
+    )
 }
 
 /// Ohne das zerlegt die Windows-Konsole jeden Umlaut.
@@ -178,5 +211,25 @@ fn enable_windows_utf8() {
     unsafe {
         SetConsoleOutputCP(UTF8);
         SetConsoleCP(UTF8);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ein mehrzeiliger Kick-Grund darf die `@event`-Zeile nicht auseinanderreißen – sonst
+    /// stünde die zweite Hälfte für ein Programm davor da wie eine gewöhnliche Statuszeile.
+    #[test]
+    fn ereigniszeile_bleibt_eine_zeile() {
+        assert_eq!(one_line("Du wurdest\ngekickt:\r\nSpam"), "Du wurdest gekickt:  Spam");
+        assert_eq!(one_line("mit\tTabulator"), "mit Tabulator");
+        // Ohne Steuerzeichen wird nichts kopiert.
+        assert!(matches!(
+            one_line("ganz normal"),
+            std::borrow::Cow::Borrowed("ganz normal")
+        ));
+        // Umlaute und §-Codes bleiben unangetastet.
+        assert_eq!(one_line("§cÜberfällig"), "§cÜberfällig");
     }
 }
