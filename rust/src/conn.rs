@@ -42,6 +42,17 @@ fn trim(buffer: &mut Vec<u8>) {
     }
 }
 
+/// Wie [`trim`], aber für einen Puffer, dessen Länge absichtlich auf dem größten je gesehenen
+/// Paket stehen bleibt (siehe [`PacketReader::read_packet`]). Gemessen wird deshalb nicht die
+/// Länge des Puffers, sondern die des zuletzt wirklich benutzten Stücks.
+#[inline]
+fn trim_used(buffer: &mut Vec<u8>, used: usize) {
+    if buffer.len() > BUFFER_HIGH_WATER && used <= BUFFER_KEEP {
+        buffer.truncate(BUFFER_KEEP);
+        buffer.shrink_to(BUFFER_KEEP);
+    }
+}
+
 // ===================== AES-128-CFB8 =====================
 
 /// CFB8 mit einem Schieberegister doppelter Länge: statt je Byte 15 Bytes umzukopieren, wandert
@@ -69,9 +80,13 @@ impl Cfb8 {
     /// einmal an den Anfang zurückgefaltet – statt bei jedem Byte 15 Bytes umzukopieren.
     ///
     /// Verschlüsselt wird von Quelle nach Ziel (`encrypt_block_b2b`): der Block muss dadurch
-    /// nicht erst in eine eigene Variable kopiert werden. Bei Chunkverkehr läuft jedes einzelne
-    /// empfangene Byte hier durch, da zählt jede eingesparte 16-Byte-Kopie.
-    #[inline]
+    /// nicht erst in eine eigene Variable kopiert werden.
+    ///
+    /// Schneller geht es hier nicht: CFB8 ist der Bauart nach seriell – das Schlüsselbyte für
+    /// Byte n+1 steht erst fest, wenn Byte n verschlüsselt ist. Der Durchsatz ist damit genau
+    /// die Latenz einer AES-Blockverschlüsselung je Byte (siehe den Messlauf `cfb8_durchsatz`);
+    /// gespart werden kann nur an der Datenmenge, und dafür gibt es `--view-distance`.
+    #[inline(always)]
     fn step(&mut self, cipher_byte: impl FnOnce(u8) -> (u8, u8)) -> u8 {
         if self.at == 16 {
             self.register.copy_within(16..32, 0);
@@ -169,10 +184,16 @@ impl PacketReader {
             return Err(err("Unplausible Paketlaenge"));
         }
 
-        self.frame.resize(len, 0);
-        self.stream.read_exact(&mut self.frame)?;
+        // Der Rahmenpuffer wächst nur, er schrumpft nie von selbst. `resize(len, 0)` je Paket
+        // hieß, den ganzen Puffer erst mit Nullen zu füllen, die `read_exact` unmittelbar danach
+        // überschreibt – bei einem Megabyte Chunkdaten also ein Megabyte reines Nullenschreiben
+        // pro Paket. Eingezogen wird er weiterhin, aber gezielt über [`trim_used`].
+        if self.frame.len() < len {
+            self.frame.resize(len, 0);
+        }
+        self.stream.read_exact(&mut self.frame[..len])?;
         if let Some(dec) = &mut self.dec {
-            dec.decrypt(&mut self.frame);
+            dec.decrypt(&mut self.frame[..len]);
         }
 
         // Vor dem Leeren: So entscheidet die Größe des **vorigen** Pakets, ob der Puffer
@@ -182,18 +203,18 @@ impl PacketReader {
         trim(out);
         out.clear();
         if self.threshold < 0 {
-            out.extend_from_slice(&self.frame);
-            trim(&mut self.frame);
+            out.extend_from_slice(&self.frame[..len]);
+            trim_used(&mut self.frame, len);
             return Ok(());
         }
 
         // Mit Kompression: VarInt „Länge im entpackten Zustand"; 0 = unkomprimiert übertragen.
-        let mut r = Reader::new(&self.frame);
+        let mut r = Reader::new(&self.frame[..len]);
         let uncompressed_len = r.var_int()?;
-        let start = self.frame.len() - r.remaining();
+        let start = len - r.remaining();
         if uncompressed_len == 0 {
-            out.extend_from_slice(&self.frame[start..]);
-            trim(&mut self.frame);
+            out.extend_from_slice(&self.frame[start..len]);
+            trim_used(&mut self.frame, len);
             return Ok(());
         }
         if !(0..=32 * 1024 * 1024).contains(&uncompressed_len) {
@@ -202,13 +223,15 @@ impl PacketReader {
         let expected = uncompressed_len as usize;
         out.reserve(expected);
         self.inflate.reset(true);
-        self.inflate
-            .decompress_vec(&self.frame[start..], out, FlushDecompress::Finish)
-            .map_err(|e| err(&format!("zlib: {}", e)))?;
+        let result = self
+            .inflate
+            .decompress_vec(&self.frame[start..len], out, FlushDecompress::Finish)
+            .map_err(|e| err(&format!("zlib: {}", e)));
+        trim_used(&mut self.frame, len);
+        result?;
         if out.len() != expected {
             return Err(err("Entpackte Laenge weicht ab"));
         }
-        trim(&mut self.frame);
         Ok(())
     }
 }
@@ -254,7 +277,12 @@ impl PacketWriter {
             // Mit Kompression: VarInt „Länge im entpackten Zustand", dahinter der zlib-Strom.
             push_var_int(&mut self.body, payload.len() as i32);
             let mut z = ZlibEncoder::new(std::mem::take(&mut self.body), Compression::fast());
-            z.write_all(payload)?;
+            // Auch im Fehlerfall den Puffer zurückholen: sonst stünde `body` danach ohne
+            // reservierten Platz da und jedes weitere Paket müsste ihn neu aufbauen.
+            if let Err(e) = z.write_all(payload) {
+                self.body = z.finish().unwrap_or_default();
+                return Err(e);
+            }
             self.body = z.finish()?;
         } else {
             push_var_int(&mut self.body, 0); // 0 = unkomprimiert übertragen
@@ -347,6 +375,30 @@ mod tests {
         assert_eq!(busy.capacity(), before);
     }
 
+    /// Der Rahmenpuffer behält seine Länge absichtlich (sonst müsste jedes Paket erst genullt
+    /// werden). Eingezogen wird er trotzdem – nur nach dem zuletzt benutzten Stück, nicht nach
+    /// seiner eigenen Länge.
+    #[test]
+    fn rahmenpuffer_wird_nach_gebrauch_eingezogen() {
+        // Ein kleines Paket nach einem Ausreißer: der Platz darf wieder weg.
+        let mut frame: Vec<u8> = vec![7; 8 * 1024 * 1024];
+        trim_used(&mut frame, 64);
+        assert!(frame.len() <= BUFFER_KEEP && frame.capacity() <= BUFFER_KEEP);
+
+        // Solange große Pakete kommen, bleibt er stehen – sonst wüchse er bei jedem einzelnen neu.
+        let mut busy: Vec<u8> = vec![0; 4 * 1024 * 1024];
+        let before = busy.capacity();
+        trim_used(&mut busy, 4 * 1024 * 1024);
+        assert_eq!(busy.capacity(), before);
+
+        // Und ein Puffer unterhalb der Ausreißergrenze wird gar nicht erst angefasst: Sonst
+        // pendelte er bei abwechselnd großen und kleinen Paketen zwischen zwei Größen hin und
+        // her – und jedes Pendeln ist eine Umlagerung.
+        let mut mittel: Vec<u8> = vec![0; 128 * 1024];
+        trim_used(&mut mittel, 100);
+        assert_eq!(mittel.len(), 128 * 1024);
+    }
+
     /// Vergleichsimplementierung: CFB8 direkt aus der Definition, ohne Ringspeicher.
     fn reference(key: &[u8; 16], data: &[u8], encrypt: bool) -> Vec<u8> {
         let aes = Aes128::new(key.into());
@@ -384,6 +436,32 @@ mod tests {
         let mut back = mine.clone();
         Cfb8::new(&key).decrypt(&mut back);
         assert_eq!(back, plain);
+    }
+
+    /// Messlauf statt Behauptung: Wie schnell läuft der Datenstrom durch die Chiffre?
+    ///
+    /// Jedes einzelne empfangene Byte geht hier durch – bei einem Chunk-Stapel beim Beitritt
+    /// sind das schnell ein paar Megabyte. Läuft nicht im normalen Testlauf mit:
+    /// `cargo test --release -- --ignored --nocapture cfb8_durchsatz`
+    #[test]
+    #[ignore]
+    fn cfb8_durchsatz() {
+        let key = [42u8; 16];
+        let mut data = vec![0u8; 4 * 1024 * 1024];
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut cipher = Cfb8::new(&key);
+        let started = std::time::Instant::now();
+        cipher.encrypt(&mut data);
+        let elapsed = started.elapsed();
+        std::hint::black_box(&data);
+        println!(
+            "\nCFB8: {:?} für {} MB  ->  {:.1} MB/s\n",
+            elapsed,
+            data.len() / (1024 * 1024),
+            data.len() as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64()
+        );
     }
 
     /// Der Zustand darf sich nicht daran stören, wie die Bytes auf Aufrufe verteilt sind –

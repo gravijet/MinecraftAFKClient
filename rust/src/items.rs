@@ -26,6 +26,10 @@ use std::io;
 const MAX_LIST: i32 = 1024;
 
 /// Ein Gegenstand in einem Feld.
+///
+/// `Clone`, weil `:menu`, `:slot` und `:inv` einen Abzug ziehen und die Menü-Sperre danach
+/// sofort wieder loslassen – ausgegeben wird ohne sie (siehe [`crate::menu`]).
+#[derive(Clone)]
 pub struct Item {
     /// Registrierungsnummer des Gegenstands. Ohne Registerdaten des Servers lässt sich daraus
     /// kein Name ableiten – angezeigt wird sie deshalb als `#nummer`.

@@ -38,7 +38,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Ab so vielen unquittierten **signierten** Nachrichten wird ungefragt quittiert – derselbe
 /// Schwellwert wie im Vanilla-Client (der Server trennt erst bei 4096).
 const ACK_THRESHOLD: u32 = 64;
-/// Längengrenzen des Servers: Chat-Nachricht 256 Zeichen, Befehl 32500.
+/// Längengrenzen des Servers, gezählt wie dort: in UTF-16-Einheiten (siehe [`sanitize`]).
+/// Chat-Nachricht 256, Befehl 32500.
 const MAX_MESSAGE_CHARS: usize = 256;
 const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
@@ -160,17 +161,23 @@ impl Client {
         });
 
         for (name, task) in [("afk-net", true), ("afk-sender", false)] {
-            let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name(name.into())
-                .spawn(move || {
-                    if task {
-                        net_loop(shared)
-                    } else {
-                        sender_loop(shared)
-                    }
-                })
-                .expect("Thread");
+            let owned = Arc::clone(&shared);
+            let started = thread::Builder::new().name(name.into()).spawn(move || {
+                if task {
+                    net_loop(owned)
+                } else {
+                    sender_loop(owned)
+                }
+            });
+            // Ohne diese beiden Threads gibt es keinen Client. Ein `expect` hätte hier mit
+            // `panic = "abort"` nur einen Abbruch ohne lesbare Ursache hinterlassen.
+            if let Err(e) = started {
+                shared
+                    .console
+                    .error(&format!("Thread '{}' liess sich nicht starten: {}", name, e));
+                shared.console.flush(Duration::from_secs(1));
+                std::process::exit(1);
+            }
         }
 
         Client { shared }
@@ -292,6 +299,24 @@ impl Shared {
         }
     }
 
+    /// Letztes Klartextpaket senden und im selben Zug auf Verschlüsselung umschalten.
+    ///
+    /// Beides muss unter **einer** Sperre passieren. Zwischen zwei getrennten Aufrufen könnte ein
+    /// anderer Thread ein Paket dazwischenschieben; das ginge dann unverschlüsselt hinaus,
+    /// während der Server bereits entschlüsselt – und die Verbindung wäre ohne erkennbaren Grund
+    /// weg.
+    fn send_and_encrypt(&self, packet: Writer, key: &[u8; 16]) {
+        let mut guard = self.writer.lock().unwrap();
+        if let Some(writer) = guard.as_mut() {
+            if writer.send(packet).is_err() {
+                writer.shutdown();
+                *guard = None;
+                return;
+            }
+            writer.enable_encryption(key);
+        }
+    }
+
     /// Startargumente – die Zusatzteile lesen daraus ihre eigenen Einstellungen.
     #[cfg(feature = "pov")]
     pub(crate) fn options(&self) -> &Options {
@@ -386,7 +411,14 @@ impl Shared {
 // ===================== Sender-Thread =====================
 
 /// Sendet Nachrichten mit Mindestabstand (gegen Spam-Kick) – schläft ansonsten blockierend.
+///
+/// Der Mindestabstand wird **vor** dem Senden abgewartet, nicht blind danach. Das ist derselbe
+/// Abstand, macht aber zwei Dinge besser: Wer eine Minute lang nichts schickt, ist seine nächste
+/// Zeile ohne Wartezeit los, und beim Beenden hängt der Thread nicht in einem Schlaf fest, den
+/// niemand mehr braucht (mit `--chat-delay` sind das im Extremfall Tage).
 fn sender_loop(shared: Arc<Shared>) {
+    let delay = Duration::from_millis(shared.options.chat_min_delay_ms);
+    let mut next_allowed = Instant::now();
     while shared.running.load(Ordering::Relaxed) {
         let input = {
             let mut items = shared.queue.items.lock().unwrap();
@@ -410,6 +442,9 @@ fn sender_loop(shared: Arc<Shared>) {
         let Some(outgoing) = prepare(&input) else {
             continue;
         };
+        if !sleep_until(&shared, next_allowed) || !shared.in_game.load(Ordering::Relaxed) {
+            continue;
+        }
         match outgoing {
             // Befehle tragen KEINE Quittung (das Paket hat kein lastSeenMessages-Feld),
             // der Offset darf hier also nicht verbraucht werden.
@@ -423,8 +458,21 @@ fn sender_loop(shared: Arc<Shared>) {
                 shared.send(chat_packet(&shared, &message, offset));
             }
         }
+        next_allowed = Instant::now() + delay;
+    }
+}
 
-        thread::sleep(Duration::from_millis(shared.options.chat_min_delay_ms));
+/// Bis `until` schlafen, in kurzen Scheiben. `false` = das Programm endet gerade.
+fn sleep_until(shared: &Shared, until: Instant) -> bool {
+    loop {
+        if !shared.running.load(Ordering::Relaxed) {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        thread::sleep(left.min(Duration::from_millis(200)));
     }
 }
 
@@ -446,14 +494,41 @@ fn prepare(input: &str) -> Option<Outgoing> {
 /// Zeichen entfernen, die der Server verbietet (§, Steuerzeichen, DEL), und auf die
 /// erlaubte Länge kürzen. Ohne das trennt er mit `illegal_chat_characters` bzw. der
 /// Paket-Decoder bricht ab.
+///
+/// Gezählt wird in **UTF-16-Einheiten**, nicht in Zeichen. Das ist kein Detail:
+///
+/// * Der Server prüft die Länge mit Javas `String.length()`, und dort zählt jedes Zeichen über
+///   U+FFFF – also jedes Emoji – als **zwei**.
+/// * Sein Paketleser deckelt zusätzlich die Bytezahl auf das Dreifache der erlaubten Länge.
+///
+/// Mit Zeichen gezählt ging eine Zeile aus 200 Emoji glatt durch: 200 ≤ 256. Auf dem Kabel waren
+/// das aber 400 Java-Zeichen und 800 Byte – über beiden Grenzen. Der Server brach schon beim
+/// Dekodieren ab, und die Verbindung war weg, weil jemand Emoji geschrieben hat.
+///
+/// In UTF-16-Einheiten gezählt sind beide Grenzen zugleich eingehalten: Ein Zeichen der
+/// Grundebene ist eine Einheit und höchstens drei Byte, jedes darüber zwei Einheiten und vier
+/// Byte. Die Bytezahl bleibt damit immer unter dem Dreifachen der Einheitenzahl.
 fn sanitize(input: &str, limit: usize) -> String {
-    input
+    let mut out = String::with_capacity(input.len().min(limit * 3));
+    let mut units = 0usize;
+    for c in input
         .chars()
         .filter(|c| *c != '\u{a7}' && *c >= ' ' && *c != '\u{7f}')
-        .take(limit)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    {
+        let width = c.len_utf16();
+        if units + width > limit {
+            break;
+        }
+        units += width;
+        out.push(c);
+    }
+    // `trim` kann nur kürzen – an den Grenzen ändert sich dadurch nichts.
+    let trimmed = out.trim();
+    if trimmed.len() == out.len() {
+        out
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
@@ -541,10 +616,10 @@ fn net_loop(shared: Arc<Shared>) {
         // Verbindungsabbruch ist für einen einzelnen AFK-Prozess ein Fehlerstatus; ein
         // Dienst/Panel kann ihn dadurch ebenfalls zuverlässig erkennen.
         //
-        // Vorher aber die noch wartenden Chatzeilen hinausschreiben: Der Chat geht über einen
-        // eigenen Thread (siehe [`Console::chat`]), und `exit` wartet auf keinen Thread. Gerade
-        // die letzten Zeilen vor einem Kick sind die interessanten.
-        shared.console.flush_chat(Duration::from_secs(2));
+        // Vorher aber die noch wartenden Zeilen beider Ströme hinausschreiben: Die Ausgabe geht
+        // über eigene Threads (siehe [`Console::chat`]), und `exit` wartet auf keinen Thread.
+        // Gerade die letzten Zeilen vor einem Kick sind die interessanten.
+        shared.console.flush(Duration::from_secs(2));
         std::process::exit(1);
     }
 }
@@ -582,7 +657,14 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     let (mut reader, writer) =
         conn::connect(&real_host, real_port, proxy).map_err(|e| e.to_string())?;
     *shared.writer.lock().unwrap() = Some(writer);
-    shared.cookies.lock().unwrap().clear();
+    // Cookies werden hier bewusst **nicht** geleert.
+    //
+    // Genau dafür gibt es sie: Server A legt eines ab, schickt einen Transfer, und Server B
+    // fragt es beim Login ab (so laufen Anmeldung und Warteschlange auf großen Netzwerken).
+    // Der Vanilla-Client reicht sie aus demselben Grund an die neue Verbindung weiter. Sie
+    // vorher zu löschen hieß: Server B bekam auf jede Abfrage „habe ich nicht" – und schickte
+    // uns zurück oder gleich hinaus. Die einzige Verbindung, die dieser Client von sich aus neu
+    // aufbaut, ist ohnehin die nach einem Transfer.
 
     // Handshake + Login-Start
     let (username, profile_id) = {
@@ -697,12 +779,8 @@ fn handle_login(
             let mut w = Writer::packet(login::SB_KEY);
             w.byte_array(&encrypted_secret);
             w.byte_array(&encrypted_challenge);
-            shared.send(w);
-
-            // Ab jetzt ist alles verschlüsselt – erst senden, dann umschalten.
-            if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
-                writer.enable_encryption(&secret);
-            }
+            // Ab jetzt ist alles verschlüsselt – Senden und Umschalten unter derselben Sperre.
+            shared.send_and_encrypt(w, &secret);
             reader.enable_encryption(&secret);
         }
         login::CB_COMPRESSION => {
@@ -719,7 +797,10 @@ fn handle_login(
         }
         login::CB_DISCONNECT => {
             // In der Login-Phase kommt der Grund noch als JSON-Text, nicht als NBT.
-            let reason = r.string().unwrap_or_else(|_| "unbekannt".to_string());
+            let reason = match r.string() {
+                Ok(json) => nbt::render_json(&json, shared.console.fmt()),
+                Err(_) => "unbekannt".to_string(),
+            };
             return Err(reason);
         }
         login::CB_CUSTOM_QUERY => {
@@ -850,14 +931,18 @@ fn handle_game(
             }
         }
         In::SystemChat => {
-            let component = nbt::read_network(r).map_err(|e| e.to_string())?;
-            let line = nbt::render(&component, shared.console.fmt());
-            if !line.trim().is_empty() {
-                shared.display(&line);
+            // Eine unlesbare Chat-Komponente ist kein Grund, die Verbindung zu beenden: Pakete
+            // sind einzeln gerahmt, das nächste beginnt ohnehin an einer bekannten Stelle.
+            // Vorher hat eine einzige seltsame Zeile eines Plugins den ganzen Client abgemeldet.
+            if let Ok(component) = nbt::read_network(r) {
+                let line = nbt::render(&component, shared.console.fmt());
+                if !line.trim().is_empty() {
+                    shared.display(&line);
+                }
             }
         }
         In::PlayerChat => {
-            let chat = parse_player_chat(shared, r);
+            let chat = parse_player_chat(shared.proto.modern, shared.console.fmt(), r);
             // Nur SIGNIERTE Nachrichten führt der Server in seiner Quittungsliste. Zählte man
             // unsignierte mit (Plugin-/Proxy-Chat!), wäre unser Offset größer als das, was der
             // Server erwartet – und er trennt mit „chat_validation_failed".
@@ -1101,7 +1186,7 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
 
 /// Die Weltgrenze von Minecraft. Alles darüber hinaus ist keine Position mehr, sondern ein
 /// Rechenfehler auf der Gegenseite.
-const WORLD_LIMIT: f64 = 3.2e7;
+pub(crate) const WORLD_LIMIT: f64 = 3.2e7;
 
 /// Eine vom Server gemeldete Position brauchbar machen.
 ///
@@ -1141,13 +1226,13 @@ struct PlayerChat {
 ///
 /// Der Kopf (bis einschließlich Signatur) wird getrennt gelesen: Selbst wenn der Rest des
 /// Pakets nicht verstanden wird, bleibt die Quittungszählung dadurch korrekt.
-fn parse_player_chat(shared: &Arc<Shared>, r: &mut Reader) -> PlayerChat {
+fn parse_player_chat(modern: bool, format: nbt::Fmt, r: &mut Reader) -> PlayerChat {
     let mut chat = PlayerChat {
         signature: None,
         line: None,
     };
     // globalIndex gibt es erst ab 1.21.11; davor beginnt das Paket direkt mit dem Absender.
-    if shared.proto.modern && r.var_int().is_err() {
+    if modern && r.var_int().is_err() {
         return chat;
     }
     if r.uuid().is_err() || r.var_int().is_err() {
@@ -1165,11 +1250,11 @@ fn parse_player_chat(shared: &Arc<Shared>, r: &mut Reader) -> PlayerChat {
         Ok(false) => {}
         Err(_) => return chat,
     }
-    chat.line = parse_chat_body(shared, r);
+    chat.line = parse_chat_body(format, r);
     chat
 }
 
-fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
+fn parse_chat_body(format: nbt::Fmt, r: &mut Reader) -> Option<String> {
     let content = r.string().ok()?;
     r.i64().ok()?; // timestamp
     r.i64().ok()?; // salt
@@ -1194,13 +1279,34 @@ fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
     } else {
         None
     };
-    r.var_int().ok()?; // filterMask
+
+    // filterMask: 0 = ungefiltert, 1 = ganz gefiltert, 2 = teilweise. Nur im dritten Fall folgt
+    // ein Bitfeld (Long-Array) – und genau das fehlte hier. Auf einem Server mit eingeschaltetem
+    // Chatfilter stand der Lesezeiger danach mitten im Paket, und die Zeile fiel wortlos weg.
+    match r.var_int().ok()? {
+        0 | 1 => {}
+        2 => {
+            // Ein Bitfeld über höchstens 256 Zeichen braucht vier Longs; mehr ist keine Filterung.
+            let longs = r.var_int().ok()?;
+            if !(0..=64).contains(&longs) {
+                return None;
+            }
+            r.bytes(longs as usize * 8).ok()?;
+        }
+        _ => return None,
+    }
 
     // chatType: 0 = eingebettete Definition, sonst Registry-ID + 1.
     if r.var_int().ok()? == 0 {
         for _ in 0..2 {
             r.string().ok()?; // translationKey
-            let params = r.var_int().ok()?.clamp(0, 16);
+            // Eine Chat-Verzierung kennt drei mögliche Parameter. Eine andere Zahl heißt, dass
+            // der Lesezeiger schon falsch steht – dann lieber keine Zeile als eine erfundene.
+            // (Vorher wurde die Zahl auf 16 gestaucht und einfach weitergelesen.)
+            let params = r.var_int().ok()?;
+            if !(0..=16).contains(&params) {
+                return None;
+            }
             for _ in 0..params {
                 r.var_int().ok()?;
             }
@@ -1209,7 +1315,6 @@ fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
     }
 
     let name = nbt::read_network(r).ok()?;
-    let format = shared.console.fmt();
     let body = match unsigned {
         Some(component) => nbt::render(&component, format),
         None => nbt::render(&nbt::Nbt::Str(content), format),
@@ -1379,6 +1484,35 @@ mod tests {
         );
     }
 
+    /// Der Server zählt mit Javas `String.length()` (Emoji = zwei) und deckelt die Bytezahl auf
+    /// das Dreifache. Nach Zeichen gezählt ging eine Zeile aus 200 Emoji durch – auf dem Kabel
+    /// waren das 400 Java-Zeichen und 800 Byte, und der Server brach beim Dekodieren ab.
+    #[test]
+    fn emoji_sprengen_die_laengengrenze_nicht_mehr() {
+        for (text, name) in [
+            ("\u{1F389}".repeat(400), "nur Emoji"),
+            ("ä".repeat(400), "Umlaute"),
+            ("a".repeat(400), "ASCII"),
+            (format!("{}{}", "\u{1F389}".repeat(200), "a".repeat(200)), "gemischt"),
+        ] {
+            let out = sanitize(&text, MAX_MESSAGE_CHARS);
+            let units: usize = out.chars().map(char::len_utf16).sum();
+            assert!(units <= MAX_MESSAGE_CHARS, "{}: {} Einheiten", name, units);
+            // Und damit automatisch auch unter der Bytegrenze des Paketlesers.
+            assert!(
+                out.len() <= MAX_MESSAGE_CHARS * 3,
+                "{}: {} Byte",
+                name,
+                out.len()
+            );
+            // Ein Emoji darf dabei nicht in der Mitte zerschnitten werden.
+            assert!(out.chars().all(|c| c != char::REPLACEMENT_CHARACTER), "{}", name);
+        }
+        // Die Grenze wird auch wirklich ausgeschöpft, nicht vorsichtshalber unterboten.
+        let voll = sanitize(&"\u{1F389}".repeat(400), MAX_MESSAGE_CHARS);
+        assert_eq!(voll.chars().count(), MAX_MESSAGE_CHARS / 2);
+    }
+
     #[test]
     fn befehle_und_nachrichten_werden_unterschieden() {
         assert!(matches!(prepare("/afk"), Some(Outgoing::Command(c)) if c == "afk"));
@@ -1415,6 +1549,117 @@ mod tests {
         assert_eq!(sane((1.0, 2.0, 3.0, 4.0, f32::NAN), alt).4, alt.4);
         // Genau auf der Weltgrenze bleibt gültig.
         assert_eq!(sane((WORLD_LIMIT, 2.0, 3.0, 4.0, 5.0), alt).0, WORLD_LIMIT);
+    }
+
+    /// Netzwerk-NBT einer einfachen Textkomponente – so schickt der Server Namen und Inhalte.
+    fn nbt_text(w: &mut Writer, text: &str) {
+        w.u8(10); // TAG_Compound ohne Wurzelnamen
+        w.u8(8); // TAG_String
+        w.u16(4);
+        w.raw(b"text");
+        w.u16(text.len() as u16);
+        w.raw(text.as_bytes());
+        w.u8(0); // Ende des Compounds
+    }
+
+    /// Ein `ClientboundPlayerChatPacket`, wie es wirklich vom Netz kommt.
+    ///
+    /// `filter` ist die Filterangabe des Servers: 0 = ungefiltert, 1 = ganz gefiltert,
+    /// 2 = teilweise – und nur bei 2 folgt ein Bitfeld.
+    fn player_chat(modern: bool, content: &str, sender: &str, filter: i32, signed: bool) -> Vec<u8> {
+        let mut w = Writer::default();
+        if modern {
+            w.var_int(7); // globalIndex (erst ab 1.21.11)
+        }
+        w.uuid(&[1u8; 16]); // Absender
+        w.var_int(0); // index
+        w.bool(signed);
+        if signed {
+            w.raw(&[0xAB; 256]);
+        }
+        w.string(content);
+        w.i64(1); // timestamp
+        w.i64(2); // salt
+        w.var_int(0); // keine zuletzt gesehenen Nachrichten
+        w.bool(false); // kein abweichender unsignierter Inhalt
+        w.var_int(filter);
+        if filter == 2 {
+            w.var_int(1); // Bitfeld: ein Long
+            w.i64(0);
+        }
+        w.var_int(1); // chatType: Registry-Nummer 0 (+1)
+        nbt_text(&mut w, sender);
+        w.bool(false); // kein targetName
+        w.data
+    }
+
+    #[test]
+    fn spieler_chat_wird_gelesen() {
+        for modern in [false, true] {
+            let data = player_chat(modern, "Hallo Welt", "Hugo", 0, false);
+            let mut r = Reader::new(&data);
+            let chat = parse_player_chat(modern, nbt::Fmt::Plain, &mut r);
+            assert!(chat.signature.is_none(), "unsigniert, modern={}", modern);
+            assert_eq!(chat.line.as_deref(), Some("<Hugo> Hallo Welt"), "modern={}", modern);
+        }
+    }
+
+    /// Schickt der Server ein teilweise gefiltertes Paket, folgt hinter der Filterangabe ein
+    /// Bitfeld. Es fehlte – der Lesezeiger stand danach mitten im Paket, und die Zeile fiel
+    /// wortlos weg. Auf einem Server mit eingeschaltetem Chatfilter also jede Zeile.
+    #[test]
+    fn teilweise_gefilterter_chat_bleibt_lesbar() {
+        for filter in [0, 1, 2] {
+            let data = player_chat(true, "Hallo", "Hugo", filter, false);
+            let mut r = Reader::new(&data);
+            assert_eq!(
+                parse_player_chat(true, nbt::Fmt::Plain, &mut r).line.as_deref(),
+                Some("<Hugo> Hallo"),
+                "Filter {}",
+                filter
+            );
+        }
+    }
+
+    /// Nur SIGNIERTE Nachrichten führt der Server in seiner Quittungsliste – zählt der Client
+    /// unsignierte mit, trennt der Server mit `chat_validation_failed`.
+    #[test]
+    fn nur_signierte_nachrichten_tragen_eine_signatur() {
+        let data = player_chat(true, "Hallo", "Hugo", 0, true);
+        let mut r = Reader::new(&data);
+        let chat = parse_player_chat(true, nbt::Fmt::Plain, &mut r);
+        assert!(chat.signature.is_some());
+        assert_eq!(chat.line.as_deref(), Some("<Hugo> Hallo"));
+    }
+
+    /// Ein abgeschnittenes oder unsinniges Paket darf keine erfundene Zeile ergeben – und
+    /// erst recht nicht abstürzen (der Netz-Thread läuft mit `panic = "abort"`).
+    #[test]
+    fn kaputter_spieler_chat_ergibt_keine_zeile() {
+        // Das letzte Feld (`targetName`) liest der Client gar nicht mehr – bis dahin muss aber
+        // jede Verkürzung ohne Zeile ausgehen statt mit einer aus zufälligen Bytes.
+        let voll = player_chat(true, "Hallo", "Hugo", 0, false);
+        for kurz in 0..voll.len() - 1 {
+            let mut r = Reader::new(&voll[..kurz]);
+            let chat = parse_player_chat(true, nbt::Fmt::Plain, &mut r);
+            assert!(chat.line.is_none(), "abgeschnitten bei {} ergab eine Zeile", kurz);
+        }
+
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (random() % 512) as usize;
+            let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            for modern in [false, true] {
+                let mut r = Reader::new(&data);
+                let _ = parse_player_chat(modern, nbt::Fmt::Plain, &mut r);
+            }
+        }
     }
 
     /// Die Paket-IDs jeder Version müssen sich eindeutig zuordnen lassen – ein Tippfehler in der

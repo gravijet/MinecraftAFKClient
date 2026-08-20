@@ -6,9 +6,17 @@
 //! prüfen – einschließlich der Live-POV, die sonst nur an einem echten Server sichtbar wäre.
 #![allow(dead_code)]
 
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::{Aes128, Block};
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use rsa::pkcs8::EncodePublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -168,22 +176,117 @@ impl<'a> Cursor<'a> {
         self.pos += len;
         out
     }
+    pub fn bool(&mut self) -> bool {
+        self.u8() != 0
+    }
+    pub fn byte_array(&mut self) -> Vec<u8> {
+        let len = self.var_int() as usize;
+        let out = self.data[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        out
+    }
+}
+
+// ===================== AES-128-CFB8 =====================
+
+/// CFB8 nach Lehrbuch: ein Schieberegister, ein AES-Block je Byte.
+///
+/// Bewusst die einfache Fassung – der Client benutzt einen Ringspeicher, und genau dessen
+/// Ergebnis soll hier geprüft werden, nicht dieselbe Abkürzung noch einmal.
+pub struct Cfb8 {
+    aes: Aes128,
+    iv: [u8; 16],
+}
+
+impl Cfb8 {
+    fn new(key: &[u8; 16]) -> Cfb8 {
+        Cfb8 {
+            aes: Aes128::new(key.into()),
+            iv: *key, // Minecraft nutzt den Schlüssel zugleich als IV
+        }
+    }
+
+    fn apply(&mut self, data: &mut [u8], encrypt: bool) {
+        for byte in data.iter_mut() {
+            let mut block: Block = self.iv.into();
+            self.aes.encrypt_block(&mut block);
+            let (out, feedback) = if encrypt {
+                let cipher = *byte ^ block[0];
+                (cipher, cipher)
+            } else {
+                (*byte ^ block[0], *byte)
+            };
+            self.iv.copy_within(1.., 0);
+            self.iv[15] = feedback;
+            *byte = out;
+        }
+    }
 }
 
 // ===================== Verbindung =====================
 
+/// Kanal für die Rückmeldungen an den Testfall.
+type Notes = std::sync::mpsc::Sender<Note>;
+
+/// Die Schreibseite des Testservers – von der Hauptschleife **und** vom KeepAlive-Thread benutzt.
+///
+/// Zusammen und unter einer Sperre, nicht zwei getrennte Sockets: CFB8 ist ein Strom. Zwei
+/// unabhängige Chiffre-Zustände auf derselben Verbindung ergäben ab dem ersten Nebeneinander
+/// Müll – und der Fehler sähe aus wie ein Fehler im Client.
+pub struct Wire {
+    stream: TcpStream,
+    threshold: i32,
+    enc: Option<Cfb8>,
+}
+
+impl Wire {
+    fn send(&mut self, packet: &Buf) {
+        let mut framed = frame(self.threshold, packet);
+        if let Some(enc) = &mut self.enc {
+            enc.apply(&mut framed, true);
+        }
+        let _ = self.stream.write_all(&framed);
+        let _ = self.stream.flush();
+    }
+}
+
 pub struct Conn {
     stream: TcpStream,
     buffer: Vec<u8>,
+    /// Kompressionsschwelle wie nach `login::CB_COMPRESSION`; negativ = aus.
+    threshold: i32,
+    /// Entschlüsselung der Leserichtung, sobald das Handshake durch ist.
+    dec: Option<Cfb8>,
+    out: Arc<Mutex<Wire>>,
+}
+
+/// Einen Paketrahmen bauen – mit oder ohne zlib, je nach Schwelle.
+///
+/// Fast jeder echte Server schaltet die Kompression ein (Vanilla ab 256 Byte). Ohne diesen Weg
+/// im Testserver liefe im Ablauftest immer nur der unkomprimierte Zweig – also genau der, den
+/// draußen kaum jemand benutzt.
+pub fn frame(threshold: i32, packet: &Buf) -> Vec<u8> {
+    let mut body = Buf::default();
+    if threshold < 0 {
+        body.raw(&packet.data);
+    } else if packet.data.len() >= threshold as usize {
+        body.var_int(packet.data.len() as i32);
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::fast());
+        z.write_all(&packet.data).expect("zlib");
+        body.raw(&z.finish().expect("zlib"));
+    } else {
+        body.var_int(0); // unter der Schwelle: unkomprimiert übertragen
+        body.raw(&packet.data);
+    }
+    let mut framed = Buf::default();
+    framed.var_int(body.data.len() as i32);
+    framed.raw(&body.data);
+    framed.data
 }
 
 impl Conn {
     pub fn send(&mut self, packet: &Buf) {
-        let mut framed = Buf::default();
-        framed.var_int(packet.data.len() as i32);
-        framed.raw(&packet.data);
-        let _ = self.stream.write_all(&framed.data);
-        let _ = self.stream.flush();
+        self.out.lock().unwrap().send(packet);
     }
 
     /// Nächstes Paket (id, Nutzdaten). `None` = Verbindung zu.
@@ -194,17 +297,43 @@ impl Conn {
         }
         self.buffer.resize(len as usize, 0);
         self.stream.read_exact(&mut self.buffer).ok()?;
-        let mut c = Cursor::new(&self.buffer);
+        if let Some(dec) = &mut self.dec {
+            let mut buffer = std::mem::take(&mut self.buffer);
+            dec.apply(&mut buffer, false);
+            self.buffer = buffer;
+        }
+
+        let payload = if self.threshold < 0 {
+            self.buffer.clone()
+        } else {
+            let mut c = Cursor::new(&self.buffer);
+            let uncompressed = c.var_int();
+            if uncompressed == 0 {
+                self.buffer[c.pos..].to_vec()
+            } else {
+                let mut out = Vec::with_capacity(uncompressed as usize);
+                ZlibDecoder::new(&self.buffer[c.pos..])
+                    .read_to_end(&mut out)
+                    .ok()?;
+                assert_eq!(out.len(), uncompressed as i32 as usize, "entpackte Laenge");
+                out
+            }
+        };
+        let mut c = Cursor::new(&payload);
         let id = c.var_int();
-        Some((id, self.buffer[c.pos..].to_vec()))
+        Some((id, payload[c.pos..].to_vec()))
     }
 
+    /// Die Rahmenlänge steht als VarInt vor jedem Paket und muss byteweise entschlüsselt werden.
     fn read_var_int(&mut self) -> Option<i32> {
         let mut value = 0i32;
         let mut shift = 0;
         loop {
             let mut b = [0u8; 1];
             self.stream.read_exact(&mut b).ok()?;
+            if let Some(dec) = &mut self.dec {
+                dec.apply(&mut b, false);
+            }
             value |= ((b[0] & 0x7F) as i32) << shift;
             shift += 7;
             if b[0] & 0x80 == 0 {
@@ -249,6 +378,7 @@ pub struct Ids {
     pub cb_login: i32,
     pub cb_position: i32,
     pub cb_system_chat: i32,
+    pub cb_player_chat: i32,
     pub cb_keep_alive: i32,
     pub cb_level_chunk: i32,
     pub cb_chunk_batch_finished: i32,
@@ -262,6 +392,7 @@ pub struct Ids {
     pub sb_use_item: i32,
     pub cb_set_health: i32,
     pub cb_transfer: i32,
+    pub cb_store_cookie: i32,
     pub sb_client_command: i32,
 }
 
@@ -281,6 +412,7 @@ pub static MC_26_1: Ids = Ids {
     cb_login: 49,
     cb_position: 72,
     cb_system_chat: 121,
+    cb_player_chat: 65,
     cb_keep_alive: 44,
     cb_level_chunk: 45,
     cb_chunk_batch_finished: 11,
@@ -294,6 +426,7 @@ pub static MC_26_1: Ids = Ids {
     sb_use_item: 67,
     cb_set_health: 104,
     cb_transfer: 129,
+    cb_store_cookie: 120,
     sb_client_command: 12,
 };
 
@@ -313,6 +446,7 @@ pub static MC_1_21_1: Ids = Ids {
     cb_login: 43,
     cb_position: 64,
     cb_system_chat: 108,
+    cb_player_chat: 57,
     cb_keep_alive: 38,
     cb_level_chunk: 39,
     cb_chunk_batch_finished: 12,
@@ -326,6 +460,7 @@ pub static MC_1_21_1: Ids = Ids {
     sb_use_item: 57,
     cb_set_health: 93,
     cb_transfer: 115,
+    cb_store_cookie: 107,
     sb_client_command: 9,
 };
 
@@ -349,6 +484,8 @@ pub enum Note {
     Chat(String),
     /// Sichtweite aus `ClientInformation` – daran hängt, wie viele Chunkdaten der Server schickt.
     ViewDistance(u8),
+    /// Antwort auf eine Cookie-Abfrage: Name und Inhalt (`None` = „habe ich nicht").
+    Cookie(String, Option<Vec<u8>>),
     Joined,
     Closed,
 }
@@ -374,6 +511,17 @@ pub struct Plan {
     pub position: (f64, f64, f64),
     /// Diese Chatzeilen werden nach dem Beitritt geschickt.
     pub chat: Vec<String>,
+    /// Zeilen als **Spieler**-Chat (`ClientboundPlayerChatPacket`), Absender „Hugo".
+    ///
+    /// Ein ganz anderes Paket als der Systemchat: signierbar, mit Quittungsliste und
+    /// Filterangabe. Genau in dieser Filterangabe steckte ein Feld, das der Client nicht gelesen
+    /// hat – der Lesezeiger stand danach falsch und die Zeile fiel wortlos weg.
+    pub player_chat: Vec<String>,
+    /// Filterangabe des Servers: 0 = ungefiltert, 1 = ganz gefiltert, 2 = teilweise (dann folgt
+    /// ein Bitfeld).
+    pub player_chat_filter: i32,
+    /// Sofort nach dem Chat auflegen – prüft, ob die letzten Zeilen es noch hinausschaffen.
+    pub close_after_chat: bool,
     /// So viele zusätzliche Chatzeilen hinterher – genug, um eine ungelesene Pipe zu füllen.
     pub chat_flood: usize,
     /// Den Spieler nach dem Beitritt sterben lassen (Lebenspunkte 0).
@@ -382,34 +530,50 @@ pub struct Plan {
     pub scoreboard: bool,
     /// Ein Menü öffnen und seinen Inhalt schicken (ein benannter Gegenstand mit Lore).
     pub menu: bool,
+    /// Vor dem Transfer dieses Cookie beim Client ablegen.
+    pub store_cookie: Option<(String, Vec<u8>)>,
+    /// Beim Login dieses Cookie abfragen und die Antwort als [`Note::Cookie`] melden.
+    pub request_cookie: Option<String>,
     /// Nach dem Beitritt einen Server-Transfer auf diese Adresse anordnen.
     pub transfer_to: Option<(String, u16)>,
     /// Sekunden, die der Server danach noch offen bleibt.
     pub hold_secs: u64,
+    /// Kompression mit dieser Schwelle einschalten (wie fast jeder echte Server).
+    pub compression: Option<i32>,
+    /// Verschlüsseltes Login wie ein Online-Mode-Server – nur ohne Sitzungsprüfung bei Mojang
+    /// (`shouldAuthenticate = false`, dieselbe Angabe, mit der ein Proxy sie übernimmt).
+    pub encrypt: bool,
 }
 
 /// Startet den Testserver auf einem freien Port.
 pub fn start(ids: &'static Ids, plan: Plan) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let (tx, rx) = channel();
+    let (tx, rx): (Notes, Receiver<Note>) = channel();
     thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
-            let write = stream.try_clone().unwrap();
+            let out = Arc::new(Mutex::new(Wire {
+                stream: stream.try_clone().unwrap(),
+                threshold: -1,
+                enc: None,
+            }));
             let mut conn = Conn {
                 stream,
                 buffer: Vec::new(),
+                threshold: -1,
+                dec: None,
+                out: Arc::clone(&out),
             };
-            serve(&mut conn, write, ids, &plan, &tx);
+            serve(&mut conn, out, ids, &plan, &tx);
             let _ = tx.send(Note::Closed);
         }
     });
     Server { port, notes: rx }
 }
 
-fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<Note>) {
+fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &Notes) {
     // --- Handshake + Login (ohne Verschlüsselung, ohne Kompression) ---
     let Some((_, handshake)) = conn.recv() else {
         return;
@@ -423,6 +587,37 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
     };
     let mut c = Cursor::new(&hello);
     let name = c.string();
+
+    // Verschlüsselung wie auf einem Online-Mode-Server. Reihenfolge wie in Vanilla:
+    // EncryptionRequest, danach SetCompression, zuletzt LoginSuccess.
+    if plan.encrypt && !encrypt(conn, &out) {
+        return;
+    }
+
+    // Kompression einschalten, bevor irgendetwas anderes hinausgeht: Das Paket selbst geht noch
+    // unkomprimiert, alles danach in beiden Richtungen im komprimierten Rahmen.
+    if let Some(threshold) = plan.compression {
+        let mut set = Buf::packet(3); // Login CB_COMPRESSION
+        set.var_int(threshold);
+        conn.send(&set);
+        conn.threshold = threshold;
+        out.lock().unwrap().threshold = threshold;
+    }
+
+    // Cookie-Abfrage noch in der Login-Phase – genau dort holt ein Transferziel das ab, was der
+    // vorige Server hinterlegt hat.
+    if let Some(key) = &plan.request_cookie {
+        let mut ask = Buf::packet(5); // Login CB_COOKIE_REQUEST
+        ask.string(key);
+        conn.send(&ask);
+        let Some((_, answer)) = conn.recv() else {
+            return;
+        };
+        let mut c = Cursor::new(&answer);
+        let key = c.string();
+        let value = if c.bool() { Some(c.byte_array()) } else { None };
+        let _ = tx.send(Note::Cookie(key, value));
+    }
 
     let mut ok = Buf::packet(2); // CB_FINISHED
     ok.uuid(&[7u8; 16]).string(&name).var_int(0).bool(true);
@@ -522,6 +717,15 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
         chat.nbt_text(line).bool(false);
         conn.send(&chat);
     }
+    for line in &plan.player_chat {
+        conn.send(&player_chat_packet(ids, "Hugo", line, plan.player_chat_filter));
+    }
+
+    // Auflegen, sobald der Chat draußen ist: Der Client muss die Zeilen dann trotzdem noch
+    // vollständig ausgeben, bevor er sich beendet.
+    if plan.close_after_chat {
+        return;
+    }
 
     // Eine Flut, die keiner abholt: So läuft die Standardausgabe des Clients voll. Schreibt er
     // sie im Netz-Thread, bleibt er darin stecken und beantwortet kein KeepAlive mehr.
@@ -549,6 +753,12 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
         conn.send(&health);
     }
 
+    if let Some((key, value)) = &plan.store_cookie {
+        let mut cookie = Buf::packet(ids.cb_store_cookie);
+        cookie.string(key).byte_array(value);
+        conn.send(&cookie);
+    }
+
     if let Some((host, port)) = &plan.transfer_to {
         let mut transfer = Buf::packet(ids.cb_transfer);
         transfer.string(host).var_int(*port as i32);
@@ -558,20 +768,19 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
     // Ab hier nur noch mitlesen und am Leben halten.
     let deadline = Instant::now() + Duration::from_secs(plan.hold_secs.max(1));
     let keep_alive_id = ids.cb_keep_alive;
+    let wire = Arc::clone(&out);
     thread::spawn(move || {
-        let mut write = write;
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(500));
             let mut ka = Buf::packet(keep_alive_id);
             ka.i64(1234);
-            let mut framed = Buf::default();
-            framed.var_int(ka.data.len() as i32);
-            framed.raw(&ka.data);
-            if write.write_all(&framed.data).is_err() {
+            let mut guard = wire.lock().unwrap();
+            guard.send(&ka);
+            if guard.stream.flush().is_err() {
                 break;
             }
         }
-        let _ = write.shutdown(std::net::Shutdown::Both);
+        let _ = out.lock().unwrap().stream.shutdown(std::net::Shutdown::Both);
     });
 
     // Der Transfer beendet die Verbindung von unserer Seite – der Client baut dann eine neue auf.
@@ -593,6 +802,78 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
             let _ = tx.send(Note::Packet(id, payload.len()));
         }
     }
+}
+
+/// Das Verschlüsselungs-Handshake eines Online-Mode-Servers.
+///
+/// Der Server schickt seinen öffentlichen Schlüssel und eine Prüffolge; der Client verschlüsselt
+/// beides mit RSA und antwortet. Danach läuft die ganze Verbindung durch AES-128-CFB8. Ohne
+/// `shouldAuthenticate` bleibt die Sitzungsprüfung bei Mojang außen vor – genau so, wie es auch
+/// ein Proxy macht, der sie selbst übernommen hat.
+///
+/// `false` = das Handshake ist gescheitert.
+fn encrypt(conn: &mut Conn, out: &Arc<Mutex<Wire>>) -> bool {
+    // 1024 Bit wie Minecraft selbst.
+    let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).expect("RSA-Schlüssel");
+    let der = RsaPublicKey::from(&private)
+        .to_public_key_der()
+        .expect("DER");
+    let challenge = [0x11u8, 0x22, 0x33, 0x44];
+
+    let mut request = Buf::packet(1); // Login CB_HELLO
+    request
+        .string("")
+        .byte_array(der.as_bytes())
+        .byte_array(&challenge)
+        .bool(false); // shouldAuthenticate
+    conn.send(&request);
+
+    let Some((id, answer)) = conn.recv() else {
+        return false;
+    };
+    assert_eq!(id, 1, "der Client antwortet nicht mit SB_KEY");
+    let mut c = Cursor::new(&answer);
+    let secret = private
+        .decrypt(Pkcs1v15Encrypt, &c.byte_array())
+        .expect("Geheimnis entschlüsselbar");
+    let echo = private
+        .decrypt(Pkcs1v15Encrypt, &c.byte_array())
+        .expect("Prüffolge entschlüsselbar");
+    assert_eq!(echo, challenge, "der Client hat die Prüffolge verändert");
+    let secret: [u8; 16] = secret.try_into().expect("16 Byte Schlüssel");
+
+    // Ab jetzt beide Richtungen verschlüsselt – der Client hat unmittelbar nach SB_KEY
+    // umgeschaltet.
+    conn.dec = Some(Cfb8::new(&secret));
+    out.lock().unwrap().enc = Some(Cfb8::new(&secret));
+    true
+}
+
+/// Ein `ClientboundPlayerChatPacket` – der Weg, auf dem echter Spielerchat kommt.
+///
+/// `filter` ist die Filterangabe: 0 = ungefiltert, 1 = ganz gefiltert, 2 = teilweise. Nur bei 2
+/// folgt ein Bitfeld, und genau das hat der Client übersehen.
+fn player_chat_packet(ids: &Ids, sender: &str, content: &str, filter: i32) -> Buf {
+    let mut p = Buf::packet(ids.cb_player_chat);
+    if ids.modern {
+        p.var_int(1); // globalIndex (erst ab 1.21.11)
+    }
+    p.uuid(&[3u8; 16]) // Absender
+        .var_int(0) // index
+        .bool(false) // keine Signatur
+        .string(content)
+        .i64(1) // timestamp
+        .i64(2) // salt
+        .var_int(0) // keine zuletzt gesehenen Nachrichten
+        .bool(false) // kein abweichender unsignierter Inhalt
+        .var_int(filter);
+    if filter == 2 {
+        p.var_int(1).i64(0); // Bitfeld: ein Long
+    }
+    p.var_int(1); // chatType: Registry-Nummer 0 (+1)
+    p.nbt_text(sender); // Anzeigename
+    p.bool(false); // kein targetName
+    p
 }
 
 /// Eine Seitenleiste, wie sie ein gewöhnlicher Server aufbaut: Der Eintrag selbst ist ein
@@ -787,7 +1068,10 @@ fn write_mixed_section(data: &mut Buf, ids: &Ids) {
 
 /// Der gestartete Client. Bricht ein Test ab, muss der Prozess trotzdem weg – sonst hält er
 /// die geerbten Ausgabekanäle offen und die ganze Testsitzung hängt.
-pub struct Client(std::process::Child);
+///
+/// Dazu gehört auch sein Konfigurationsverzeichnis: Es liegt je Client im Temp-Verzeichnis und
+/// wird hier wieder abgeräumt.
+pub struct Client(std::process::Child, std::path::PathBuf);
 
 impl std::ops::Deref for Client {
     type Target = std::process::Child;
@@ -806,6 +1090,7 @@ impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
@@ -814,6 +1099,21 @@ impl Drop for Client {
 pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
     let binary =
         std::env::var("AFK_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_afk").to_string());
+
+    // Eigenes Konfigurationsverzeichnis je Client.
+    //
+    // Ohne das schriebe ein Test mit `:home set` in die echte `movement.json` des Entwicklers
+    // (und läse beim nächsten Lauf, was dort steht). Ein Test darf weder etwas hinterlassen noch
+    // davon abhängen, was er vorfindet. `XDG_CONFIG_HOME` ist genau der Schalter, den auch der
+    // Client zuerst befragt.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let config = std::env::temp_dir().join(format!(
+        "afk-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::create_dir_all(&config);
+
     let mut command = std::process::Command::new(binary);
     command
         .arg(format!("127.0.0.1:{}", port))
@@ -822,10 +1122,11 @@ pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
         .arg("--offline")
         .arg("Testkonto")
         .args(extra)
+        .env("XDG_CONFIG_HOME", &config)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    Client(command.spawn().expect("Client startet"))
+    Client(command.spawn().expect("Client startet"), config)
 }
 
 /// Liest einen Ausgabestrom stückweise in einen Kanal – in einem eigenen Thread.

@@ -27,12 +27,19 @@ fn plan_with_ground() -> Plan {
         filled_sections: 1,
         position: (8.0, 16.0, 8.0),
         chat: vec!["Willkommen auf dem Testserver".to_string()],
+        player_chat: Vec::new(),
+        player_chat_filter: 0,
+        close_after_chat: false,
         chat_flood: 0,
         kill: false,
         scoreboard: false,
         menu: false,
+        store_cookie: None,
+        request_cookie: None,
         transfer_to: None,
         hold_secs: 20,
+        compression: None,
+        encrypt: false,
     }
 }
 
@@ -60,6 +67,81 @@ fn beitritt_chat_und_befehl() {
     assert!(got_command, "--cmd hat den Befehl nicht geschickt");
 
     let _ = child.kill();
+}
+
+/// Derselbe Ablauf mit dem Verschlüsselungs-Handshake eines Online-Mode-Servers.
+///
+/// Jeder Server mit Kontoprüfung verlangt es, und danach läuft **jedes** Byte in beiden
+/// Richtungen durch AES-128-CFB8 – auch die Rahmenlänge vor jedem Paket, die deshalb byteweise
+/// entschlüsselt werden muss. Bisher lief im Ablauftest ausschließlich der unverschlüsselte
+/// Zweig; geprüft war die Chiffre nur gegen sich selbst, nicht über einen echten Socket.
+///
+/// Mit Kompression zusammen, weil ein echter Server beides gleichzeitig macht: erst
+/// verschlüsseln, dann komprimieren.
+#[test]
+fn beitritt_und_chat_mit_verschluesselung() {
+    for compression in [None, Some(256)] {
+        let mut plan = plan_with_ground();
+        plan.encrypt = true;
+        plan.compression = compression;
+        plan.chat = vec!["Willkommen auf dem Testserver".to_string()];
+        plan.chat.push("V".repeat(600));
+        let server = common::start(&common::MC_26_1, plan);
+        let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let out = common::collect(child.stdout.take().unwrap());
+
+        let (kurz, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
+        assert!(kurz, "{:?}: kein Chat. Ausgabe:\n{}", compression, log);
+        let (lang, log) = common::wait_for(&out, TIMEOUT, &"V".repeat(600));
+        assert!(lang, "{:?}: die lange Zeile fehlt. Ausgabe:\n{}", compression, log);
+
+        // Und in die Gegenrichtung – dort verschlüsselt der Client selbst.
+        let _ = writeln!(stdin, "/{}", "y".repeat(600));
+        let _ = stdin.flush();
+        let angekommen = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Command(text) if text.len() == 600)
+        });
+        assert!(angekommen, "{:?}: der Befehl kam nicht an", compression);
+        let _ = child.kill();
+    }
+}
+
+/// Derselbe Ablauf mit eingeschalteter Paket-Kompression.
+///
+/// Fast jeder echte Server schaltet sie ein (Vanilla ab 256 Byte), und ab dann sieht **jedes**
+/// Paket in beiden Richtungen anders aus: erst die entpackte Länge als VarInt, dann ein
+/// zlib-Strom – oder eine 0 und die Nutzdaten roh, wenn das Paket unter der Schwelle bleibt.
+/// Bisher lief im Ablauftest ausschließlich der unkomprimierte Zweig, also genau der, den
+/// draußen kaum jemand benutzt.
+#[test]
+fn beitritt_und_chat_mit_kompression() {
+    for threshold in [0, 8, 256] {
+        let mut plan = plan_with_ground();
+        plan.compression = Some(threshold);
+        plan.chat = vec!["Willkommen auf dem Testserver".to_string()];
+        // Eine Zeile deutlich über jeder Schwelle, damit der zlib-Zweig sicher drankommt.
+        plan.chat.push("L".repeat(600));
+        let server = common::start(&common::MC_26_1, plan);
+        let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let out = common::collect(child.stdout.take().unwrap());
+
+        let (kurz, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
+        assert!(kurz, "Schwelle {}: kein Chat. Ausgabe:\n{}", threshold, log);
+        let (lang, log) = common::wait_for(&out, TIMEOUT, &"L".repeat(600));
+        assert!(lang, "Schwelle {}: die lange Zeile fehlt. Ausgabe:\n{}", threshold, log);
+
+        // Und in die Gegenrichtung: ein langer Befehl muss beim Server heil ankommen.
+        let befehl = format!("/{}", "x".repeat(600));
+        let _ = writeln!(stdin, "{}", befehl);
+        let _ = stdin.flush();
+        let angekommen = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Command(text) if text.len() == 600)
+        });
+        assert!(angekommen, "Schwelle {}: der lange Befehl kam nicht an", threshold);
+        let _ = child.kill();
+    }
 }
 
 /// Derselbe Ablauf auf dem älteren Protokoll – dort sind mehrere Paketformate anders.
@@ -104,6 +186,53 @@ fn emoji_im_chat_kommen_heil_an() {
         "Ersatzzeichen in der Ausgabe:\n{}",
         seen.escape_debug()
     );
+    let _ = child.kill();
+}
+
+/// Echter Spielerchat kommt über ein ganz anderes Paket als Systemmeldungen – mit
+/// Quittungsliste, Signaturfeld und Filterangabe. Meldet der Server „teilweise gefiltert",
+/// folgt hinter der Angabe noch ein Bitfeld; der Client hat es nicht gelesen, stand danach
+/// mitten im Paket und ließ die Zeile wortlos fallen. Auf einem Server mit eingeschaltetem
+/// Chatfilter war damit **kein** Spielerchat mehr zu sehen.
+#[test]
+fn spieler_chat_kommt_an_auch_mit_filter() {
+    for ids in [&common::MC_26_1, &common::MC_1_21_1] {
+        for filter in [0, 2] {
+            let mut plan = plan_with_ground();
+            plan.player_chat = vec![format!("Filter {} sagt hallo", filter)];
+            plan.player_chat_filter = filter;
+            let server = common::start(ids, plan);
+            let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+            let out = common::collect(child.stdout.take().unwrap());
+            let (found, log) = common::wait_for(
+                &out,
+                TIMEOUT,
+                &format!("<Hugo> Filter {} sagt hallo", filter),
+            );
+            assert!(
+                found,
+                "Spielerchat fehlt ({}, Filter {}). Ausgabe:\n{}",
+                ids.name, filter, log
+            );
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Legt der Server auf, muss der Client die schon gelesenen Zeilen noch hinausschreiben, bevor
+/// er sich beendet. Der Chat geht über einen eigenen Thread, und `exit` wartet auf keinen –
+/// ausgerechnet die letzten Zeilen vor einem Kick sind aber die mit dem Grund.
+#[test]
+fn letzte_chatzeilen_gehen_vor_dem_beenden_noch_raus() {
+    let mut plan = plan_with_ground();
+    plan.chat = (1..=40).map(|n| format!("Zeile {}", n)).collect();
+    plan.close_after_chat = true;
+
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let out = common::collect(child.stdout.take().unwrap());
+    let (found, log) = common::wait_for(&out, TIMEOUT, "Zeile 40");
+    assert!(found, "die letzte Chatzeile fehlt. Ausgabe:\n{}", log);
     let _ = child.kill();
 }
 
@@ -162,6 +291,32 @@ fn server_transfer_wird_befolgt() {
     let _ = child.kill();
 }
 
+/// Cookies müssen den Transfer überleben – genau dafür gibt es sie.
+///
+/// Server A legt eines ab und schickt einen Transfer, Server B fragt es beim Login ab: So laufen
+/// Anmeldung und Warteschlange auf großen Netzwerken. Der Client hat seine Ablage aber bei
+/// **jedem** Verbindungsaufbau geleert und antwortete deshalb immer „habe ich nicht" – womit
+/// Server B den Spieler zurückschickte oder gleich hinauswarf.
+#[test]
+fn cookies_ueberleben_den_transfer() {
+    let mut ziel_plan = plan_with_ground();
+    ziel_plan.request_cookie = Some("afk:test".to_string());
+    let ziel = common::start(&common::MC_26_1, ziel_plan);
+
+    let mut plan = plan_with_ground();
+    plan.chat.clear();
+    plan.store_cookie = Some(("afk:test".to_string(), b"geheim".to_vec()));
+    plan.transfer_to = Some(("127.0.0.1".to_string(), ziel.port));
+    let start = common::start(&common::MC_26_1, plan);
+
+    let mut child = common::spawn_client(start.port, "26.1", &["--no-color"]);
+    let angekommen = common::wait_note(&ziel.notes, TIMEOUT, |note| {
+        matches!(note, Note::Cookie(key, Some(value)) if key == "afk:test" && value == b"geheim")
+    });
+    assert!(angekommen, "das Cookie kam beim Transferziel nicht an");
+    let _ = child.kill();
+}
+
 /// Die Seitenleiste muss auf allen drei Feldreihenfolgen des Team-Pakets herauskommen.
 ///
 /// Auf fast jedem Server ist der Eintrag selbst ein unsichtbarer Platzhalter; der sichtbare Text
@@ -179,21 +334,18 @@ fn seitenleiste_auf_allen_feldreihenfolgen() {
         let err = common::collect(child.stderr.take().unwrap());
 
         let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
-        assert!(joined, "{}: kein Beitritt. Ausgabe:
-{}", ids.name, log);
+        assert!(joined, "{}: kein Beitritt. Ausgabe:\n{}", ids.name, log);
 
         let (found, log) =
             common::poll_command(&mut stdin, &err, TIMEOUT, ":board", "Rang: hugo *");
         assert!(
             found,
-            "{}: die Seitenleiste kam nicht richtig heraus. Ausgabe:
-{}",
+            "{}: die Seitenleiste kam nicht richtig heraus. Ausgabe:\n{}",
             ids.name, log
         );
         assert!(
             log.contains("Testserver"),
-            "{}: die Überschrift fehlt. Ausgabe:
-{}",
+            "{}: die Überschrift fehlt. Ausgabe:\n{}",
             ids.name,
             log
         );
@@ -219,27 +371,23 @@ fn menue_inhalt_auf_beiden_komponententabellen() {
         let err = common::collect(child.stderr.take().unwrap());
 
         let (opened, log) = common::wait_for(&err, TIMEOUT, "Menü geöffnet: Warp-Menü");
-        assert!(opened, "{}: kein Menü gemeldet. Ausgabe:
-{}", ids.name, log);
+        assert!(opened, "{}: kein Menü gemeldet. Ausgabe:\n{}", ids.name, log);
 
         let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":menu", "Zum Spawn");
         assert!(
             found,
-            "{}: der Gegenstandsname fehlt. Ausgabe:
-{}",
+            "{}: der Gegenstandsname fehlt. Ausgabe:\n{}",
             ids.name, log
         );
         assert!(
             !log.contains("Ab Feld"),
-            "{}: der Inhalt war nicht vollständig lesbar. Ausgabe:
-{}",
+            "{}: der Inhalt war nicht vollständig lesbar. Ausgabe:\n{}",
             ids.name,
             log
         );
 
         let (lore, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":slot 4", "kostet nichts");
-        assert!(lore, "{}: die Lore fehlt. Ausgabe:
-{}", ids.name, log);
+        assert!(lore, "{}: die Lore fehlt. Ausgabe:\n{}", ids.name, log);
         let _ = child.kill();
     }
 }
@@ -276,6 +424,52 @@ fn voller_ausgabepuffer_blockiert_den_netz_thread_nicht() {
             "der Client hat aufgehört, KeepAlive zu beantworten – er steckt im Schreiben fest"
         );
         antworten += 1;
+    }
+    assert!(
+        child.try_wait().expect("Status").is_none(),
+        "der Client ist beendet, statt weiterzulaufen"
+    );
+    let _ = child.kill();
+}
+
+/// Dasselbe für die **Fehlerausgabe**: Auch über sie schreibt der Netz-Thread.
+///
+/// Beitritts-, Regel- und Ereignismeldungen gehen dorthin. Ein Panel, das nur die Standardausgabe
+/// mitliest, füllte damit die zweite Pipe – und der Netz-Thread blieb genauso darin stecken wie
+/// früher in der ersten. Der Test lässt stderr absichtlich ungelesen und sorgt mit einer
+/// Chat-Regel ohne Sperrzeit dafür, dass jede eingehende Zeile dort eine Meldung erzeugt.
+#[test]
+fn volle_fehlerausgabe_blockiert_den_netz_thread_nicht() {
+    let mut plan = plan_with_ground();
+    plan.chat_flood = 4000; // jede Zeile trifft die Regel und erzeugt eine Meldung auf stderr
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &[
+            "--no-color",
+            "--events",
+            "--on",
+            "chat:flut=/nichts",
+            "--on-cooldown",
+            "0",
+        ],
+    );
+    // stderr bleibt absichtlich ungelesen – genau das ist der Fall, um den es geht.
+    let out = common::collect(child.stdout.take().unwrap());
+    let (joined, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
+    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
+
+    let ids = &common::MC_26_1;
+    for _ in 0..3 {
+        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
+        });
+        assert!(
+            ok,
+            "der Client hat aufgehört, KeepAlive zu beantworten – er steckt im Schreiben auf die \
+             Fehlerausgabe fest"
+        );
     }
     assert!(
         child.try_wait().expect("Status").is_none(),
@@ -446,8 +640,16 @@ fn chunk_stapel_wird_bestaetigt() {
 #[cfg(feature = "pov")]
 #[test]
 fn pov_liest_alle_chunks() {
-    for ids in [&common::MC_26_1, &common::MC_1_21_1] {
-        let server = common::start(ids, plan_with_ground());
+    for (ids, compression) in [
+        (&common::MC_26_1, None),
+        (&common::MC_1_21_1, None),
+        // Chunk-Pakete sind die groessten, die je kommen – und auf einem echten Server sind sie
+        // immer komprimiert. Genau daran haengt der Entpackpfad mitsamt seinen Puffern.
+        (&common::MC_26_1, Some(256)),
+    ] {
+        let mut plan = plan_with_ground();
+        plan.compression = compression;
+        let server = common::start(ids, plan);
         let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
         let mut stdin = child.stdin.take().unwrap();
         let err = common::collect(child.stderr.take().unwrap());
@@ -578,19 +780,16 @@ fn ultra_wartet_ab_startet_aber_auf_wunsch() {
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
     let err = common::collect(child.stderr.take().unwrap());
     let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
-    assert!(joined, "kein Beitritt. Ausgabe:
-{}", log);
+    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
     let (found, log) = common::wait_for(&err, Duration::from_secs(3), "(:pov stop)");
-    assert!(!found, "Ultra startete die Ansicht ungefragt:
-{}", log);
+    assert!(!found, "Ultra startete die Ansicht ungefragt:\n{}", log);
     drop(child);
 
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--pov", "an"]);
     let err = common::collect(child.stderr.take().unwrap());
     let (found, log) = common::wait_for(&err, TIMEOUT, "(:pov stop)");
-    assert!(found, "--pov an blieb bei Ultra wirkungslos:
-{}", log);
+    assert!(found, "--pov an blieb bei Ultra wirkungslos:\n{}", log);
 }
 
 /// Messlauf statt Behauptung: 441 Chunks mit je acht gefüllten Abschnitten (so sieht eine
@@ -658,6 +857,62 @@ fn resident_memory(pid: u32) -> String {
         }
     }
     "unbekannt".to_string()
+}
+
+/// Jeder örtliche Befehl muss antworten – auch mit Unsinn als Argument.
+///
+/// Die `:`-Befehle laufen im Eingabe-Thread, greifen aber auf denselben Zustand zu wie der
+/// Netz-Thread (Menü, Anzeigetafel, Weltdaten, Bewegungseinstellungen). Ein Absturz dort reißt
+/// mit `panic = "abort"` den ganzen Prozess mit, und ein hängengebliebener Sperrvorgang kostet
+/// das nächste KeepAlive. Der Test schickt deshalb alles durch, inklusive der Eingaben, mit
+/// denen niemand rechnet.
+#[cfg(feature = "ultra")]
+#[test]
+fn alle_oertlichen_befehle_ueberstehen_auch_unsinn() {
+    let mut plan = plan_with_ground();
+    plan.scoreboard = true;
+    plan.menu = true;
+    plan.compression = Some(256);
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--events"]);
+    let mut stdin = child.stdin.take().unwrap();
+    let err = common::collect(child.stderr.take().unwrap());
+    let (joined, log) = common::wait_for(&err, TIMEOUT, "@event join");
+    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
+
+    for line in [
+        // Alles, was es gibt ...
+        ":help", ":pos", ":board", ":menu", ":inv", ":slot 4", ":click 4", ":click 4 rechts",
+        ":click 4 shift", ":close", ":pov info", ":pov frame", ":pov size 24 12", ":pov fps 3",
+        ":pov live", ":pov stop", ":sneak on", ":sneak off", ":sneak", ":sprint an", ":swing",
+        ":use", ":hand 3", ":antiafk 20", ":antiafk off", ":look nord", ":look 90 -10",
+        ":look links 30", ":go vor 1", ":stop", ":fall on", ":fall 2", ":home", ":home set",
+        ":home delay 1", ":home speed 4", ":home off", ":home clear", ":route", ":route rec",
+        ":route add", ":route stop", ":route del", ":route clear",
+        // ... und alles, womit niemand rechnet.
+        ":", ":go", ":go rueckwaerts abc", ":go vor -5", ":go vor 99999", ":look", ":look xyz",
+        ":click", ":click abc", ":click -1", ":click 999999999999999999999", ":slot",
+        ":slot xyz", ":slot 99999", ":hand 0", ":hand 99", ":hand x", ":pov size 9999 9999",
+        ":pov fps 0", ":pov unsinn", ":antiafk 000000000000000000", ":home delay -3",
+        ":home speed x", ":route del 99", ":sneak vielleicht", ":unbekannt", ":HELP", ":Pos",
+    ] {
+        assert!(writeln!(stdin, "{}", line).is_ok(), "Eingabe '{}' abgewiesen", line);
+    }
+    let _ = stdin.flush();
+
+    // Der Client muss danach noch da sein **und** weiter antworten.
+    let ids = &common::MC_26_1;
+    for _ in 0..2 {
+        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
+        });
+        assert!(ok, "nach den Befehlen kommt kein KeepAlive mehr");
+    }
+    assert!(
+        child.try_wait().expect("Status").is_none(),
+        "ein örtlicher Befehl hat den Client beendet"
+    );
+    let _ = child.kill();
 }
 
 /// Die gemeldete Sichtweite entscheidet, wie viele Chunkdaten der Server überhaupt schickt.

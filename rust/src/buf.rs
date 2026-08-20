@@ -114,11 +114,21 @@ impl<'a> Reader<'a> {
     }
 
     pub fn byte_array(&mut self) -> io::Result<Vec<u8>> {
+        Ok(self.byte_slice()?.to_vec())
+    }
+
+    /// Wie [`Reader::byte_array`], aber ohne Kopie.
+    ///
+    /// Die Live-Ansicht liest damit die Nutzdaten eines Chunk-Pakets unmittelbar aus dem
+    /// Paketpuffer statt sie erst zu vervielfältigen: Beim Beitritt kommen gut 170 Chunks mit je
+    /// einigen zehn Kilobyte, und jede dieser Kopien wurde nach dem Auswerten sofort wieder
+    /// weggeworfen.
+    pub fn byte_slice(&mut self) -> io::Result<&'a [u8]> {
         let len = self.var_int()?;
         if len < 0 {
             return Err(err("Byte-Array-Laenge negativ"));
         }
-        Ok(self.bytes(len as usize)?.to_vec())
+        self.bytes(len as usize)
     }
 
     pub fn uuid(&mut self) -> io::Result<[u8; 16]> {

@@ -27,6 +27,10 @@ const TURN_DEGREES: f32 = 7.0;
 const DEFAULT_SECONDS: u64 = 60;
 /// Untergrenze auch für den Befehl zur Laufzeit (dieselbe wie für `--antiafk`).
 const MIN_SECONDS: u64 = 15;
+/// Obergrenze (30 Tage), dieselbe wie in [`crate::options`]. Ohne sie machte `:antiafk
+/// 000000000000000000` aus dem Wartezeitraum eine Zahl, mit der keine Uhr mehr rechnen kann –
+/// und der Thread wäre bis zum Verbindungsende nie wieder aufgewacht.
+const MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Nach dem Beitritt: Thread starten, falls Anti-AFK an ist.
 pub fn on_join(shared: &Arc<Shared>) {
@@ -56,7 +60,7 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         }
         "off" | "aus" | "0" => 0,
         text => match text.parse::<u64>() {
-            Ok(value) => value.max(MIN_SECONDS),
+            Ok(value) => value.max(MIN_SECONDS).min(MAX_SECONDS),
             Err(_) => {
                 return console
                     .error("Nutzung: :antiafk   ·   :antiafk on|off   ·   :antiafk <sekunden>")
@@ -154,10 +158,16 @@ mod tests {
     /// Zu häufiges Zappeln fällt mehr auf als Stillstehen – die Untergrenze muss greifen.
     #[test]
     fn untergrenze_gilt_auch_zur_laufzeit() {
-        let parse = |text: &str| text.parse::<u64>().map(|v| v.max(MIN_SECONDS));
+        let parse =
+            |text: &str| text.parse::<u64>().map(|v| v.max(MIN_SECONDS).min(MAX_SECONDS));
         assert_eq!(parse("1").unwrap(), MIN_SECONDS);
         assert_eq!(parse("120").unwrap(), 120);
         assert!(parse("x").is_err());
+        // Auch nach oben: aus einer unmöglichen Zahl darf keine unmögliche Wartezeit werden.
+        assert_eq!(parse("000000000000000000").unwrap(), MAX_SECONDS);
+        assert!(std::time::Duration::from_secs(MAX_SECONDS)
+            .checked_add(std::time::Duration::from_secs(MAX_SECONDS))
+            .is_some());
     }
 
     /// Der Schwenk muss klein bleiben: er soll als Bewegung zählen, nicht als Herumfahren.

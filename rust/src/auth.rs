@@ -50,6 +50,10 @@ pub type Res<T> = Result<T, String>;
 pub struct DeviceCode {
     pub user_code: String,
     pub verification_uri: String,
+    /// Sekunden, die der Code gültig bleibt – so lange darf auch gewartet werden.
+    pub expires_in: i64,
+    /// Abstand zwischen zwei Abfragen, wie Microsoft ihn vorgibt.
+    pub interval: i64,
 }
 
 pub struct Account {
@@ -93,8 +97,9 @@ pub fn migrate_legacy(base: &Path) -> Option<String> {
     let text = std::fs::read_to_string(&legacy).ok()?;
     let json: Value = serde_json::from_str(&text).ok()?;
     let name = json["minecraftProfile"]["name"].as_str()?.to_string();
-    std::fs::create_dir_all(accounts_dir(base)).ok()?;
-    std::fs::write(account_file(base, &name), &text).ok()?;
+    // Wie jedes Speichern eines Kontos: unteilbar und nur für den eigenen Benutzer lesbar.
+    // `fs::write` legte die Datei mit 0644 an – in ihr stehen Microsoft-Token.
+    crate::options::write_atomic(&account_file(base, &name), &text);
     Some(name)
 }
 
@@ -129,7 +134,7 @@ pub fn load(base: &Path, name: &str) -> Res<Account> {
 pub fn add(base: &Path, on_code: impl Fn(&DeviceCode)) -> Res<Account> {
     let (device_code, code_info) = request_device_code()?;
     on_code(&code_info);
-    let (access, refresh, expires_ms) = poll_for_token(&device_code)?;
+    let (access, refresh, expires_ms) = poll_for_token(&device_code, &code_info)?;
 
     let json = json!({
         "_saveVersion": 1,
@@ -416,18 +421,25 @@ fn request_device_code() -> Res<(String, DeviceCode)> {
         DeviceCode {
             user_code: field(&json, "user_code")?,
             verification_uri: field(&json, "verification_uri")?,
+            // Microsoft nennt beides in der Antwort. Bisher stand hier eine feste Frist von
+            // fünf Minuten – wer den Browser erst suchen musste, kam damit zu spät, obwohl der
+            // Code laut Microsoft noch eine Viertelstunde galt.
+            expires_in: json["expires_in"].as_i64().unwrap_or(300).clamp(60, 1800),
+            interval: json["interval"].as_i64().unwrap_or(5).clamp(1, 60),
         },
     ))
 }
 
-/// Wartet, bis der Nutzer im Browser bestätigt hat (max. 5 Minuten).
+/// Wartet, bis der Nutzer im Browser bestätigt hat – so lange, wie Microsoft den Code gültig
+/// nennt (in der Regel eine Viertelstunde).
 ///
-/// Der Abstand zwischen zwei Anfragen steigt, sobald Microsoft `slow_down` meldet. Ohne das
-/// wurde weiter im festen Fünf-Sekunden-Takt gefragt – und Microsoft beantwortet das irgendwann
-/// gar nicht mehr, der Login lief dann in den Zeitablauf statt zustande zu kommen.
-fn poll_for_token(device_code: &str) -> Res<(String, String, i64)> {
-    let deadline = SystemTime::now() + Duration::from_secs(300);
-    let mut interval = Duration::from_secs(5);
+/// Der Abstand zwischen zwei Anfragen kommt ebenfalls aus der Antwort und steigt, sobald
+/// Microsoft `slow_down` meldet. Ohne das wurde weiter im festen Fünf-Sekunden-Takt gefragt –
+/// und Microsoft beantwortet das irgendwann gar nicht mehr, der Login lief dann in den
+/// Zeitablauf statt zustande zu kommen.
+fn poll_for_token(device_code: &str, code: &DeviceCode) -> Res<(String, String, i64)> {
+    let deadline = SystemTime::now() + Duration::from_secs(code.expires_in as u64);
+    let mut interval = Duration::from_secs(code.interval as u64);
     loop {
         let response = agent().post(TOKEN_URL).send_form(&[
             ("client_id", CLIENT_ID),

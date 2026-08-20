@@ -51,7 +51,9 @@ zu öffnen. Ein Kick oder gewöhnlicher Netzabbruch beendet dagegen den Client.
 - `Ping` mit `Pong` beantworten;
 - Server-Teleports bestätigen und die Position zurückspiegeln;
 - erzwungene Resource-Packs bestätigen, aber nicht laden;
-- Client-Information, Cookies und ab 1.21.11 den Verhaltenskodex beantworten;
+- Client-Information und ab 1.21.11 den Verhaltenskodex beantworten;
+- Cookies ablegen und beantworten – auch über einen Server-Transfer hinweg, denn genau dafür
+  gibt es sie (Server A legt eines ab, Server B fragt es beim Login ab);
 - signierte Chat-Nachrichten quittieren;
 - nach Tod automatisch respawnen.
 
@@ -81,11 +83,22 @@ Nullzeichen als Überlänge. Der Client dekodiert genau dieses Format; Emoji, Um
 Sonderzeichen kommen deshalb unverändert auf der Standardausgabe an. Dasselbe gilt für alles
 andere, was als NBT ankommt: Kick-Gründe, Scoreboard-Zeilen, Gegenstandsnamen und Lore.
 
-Geschrieben werden die Chatzeilen von einem eigenen Thread. Der Netz-Thread, der KeepAlive
-beantwortet, darf nicht an einer vollen Ausgabe hängen bleiben – sonst kostet ausgerechnet ein
-gerade beschäftigtes Panel die Verbindung. Holt niemand die Ausgabe ab, fällt nach 256 wartenden
-Zeilen die älteste heraus (mit einer einmaligen Meldung auf der Fehlerausgabe); die Verbindung zu
-halten hat Vorrang vor Zeilen, die ohnehin niemand liest.
+Geschrieben wird **von keinem der beiden Ströme im Netz-Thread**: Standardausgabe und
+Fehlerausgabe haben je einen eigenen Schreib-Thread. Der Netz-Thread, der KeepAlive beantwortet,
+darf nicht an einer vollen Pipe hängen bleiben – sonst kostet ausgerechnet ein gerade
+beschäftigtes Panel die Verbindung. Holt niemand die Ausgabe ab, fällt nach 256 wartenden Zeilen
+die älteste heraus (mit einer einmaligen Meldung); die Verbindung zu halten hat Vorrang vor
+Zeilen, die ohnehin niemand liest.
+
+Getrennte Threads je Strom, nicht einer für beides: Sonst hielte eine volle Standardausgabe auch
+die Fehlerausgabe an – und ausgerechnet `@event disconnect`, mit dem ein Panel erfährt, dass der
+Client weg ist, käme dann nie an.
+
+Ausgehender Chat wird auf **256 UTF-16-Einheiten** gekürzt, nicht auf 256 Zeichen: Der Server
+zählt mit Javas `String.length()` (jedes Emoji zählt dort doppelt) und deckelt zusätzlich die
+Bytezahl auf das Dreifache. Nach Zeichen gezählt passte eine Zeile aus 200 Emoji scheinbar, kam
+aber mit 800 statt höchstens 768 Byte an – und der Server brach die Verbindung schon beim
+Dekodieren ab.
 
 ## Bewegung
 

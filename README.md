@@ -8,7 +8,7 @@ Es gibt den Rust-Client in getrennten Bauformen und den bisherigen Java-Client:
 
 | | Datei | Minecraft-Versionen | Verbrauch |
 | --- | --- | --- | --- |
-| **Rust** (empfohlen) | `afk-windows.exe`, `afk-linux` | alle vier in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 2 Threads |
+| **Rust** (empfohlen) | `afk-windows.exe`, `afk-linux` | alle vier in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 4 Threads (Netz, Senden, je Ausgabestrom einer) |
 | **Rust mit Zusätzen** | `items-afk-*`, `premium-afk-*`, `premium-items-afk-*`, `pov-afk-*`, `ultra-afk-*` | dieselbe eine Datei je Bauform | nur die jeweils genannten Funktionen sind einkompiliert |
 | **Java** | `afk-1.21.1.jar` … `afk-26.2.jar` | eine Jar je Version | ~10 MB Jar, 40–70 MB RAM |
 
@@ -257,7 +257,8 @@ Rein protokollbasiert – genau das, was ein wartender Vanilla-Client tut, und *
 * `Ping` → `Pong`
 * Teleports bestätigen und die vorgegebene Position einmal zurückspiegeln (gegen Rubberband-Kick)
 * erzwungene Resource-Packs bestätigen, aber nicht laden
-* beim Beitritt `ClientInformation` senden, Cookies beantworten, ab 1.21.11 den Verhaltenskodex
+* beim Beitritt `ClientInformation` senden, Cookies beantworten (auch über einen Transfer
+  hinweg), ab 1.21.11 den Verhaltenskodex
 * empfangene signierte Chat-Nachrichten quittieren (sonst `chat_validation_failed`)
 * bei Tod automatisch respawnen, bei Server-Transfer dem neuen Ziel folgen
 

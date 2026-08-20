@@ -228,6 +228,12 @@ impl Proxy {
 
         let mut answer = [0u8; 2];
         stream.read_exact(&mut answer)?;
+        // Version der Anmelde-Teilverhandlung ist immer 1 (RFC 1929). Steht dort etwas anderes,
+        // spricht die Gegenstelle ein anderes Verfahren – dann ist auch das Statusbyte dahinter
+        // nichts, worauf man sich verlassen dürfte.
+        if answer[0] != 0x01 {
+            return Err(fail("Proxy antwortet nicht nach RFC 1929"));
+        }
         if answer[1] != 0x00 {
             return Err(fail("Proxy hat die Zugangsdaten abgelehnt"));
         }

@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use crate::items::{self, Item};
 
 /// Mehr Felder hat kein Fenster (Doppelkiste 90, Spielerinventar 46).
-#[cfg(feature = "items")]
 const MAX_SLOTS: usize = 200;
 
 /// Ein geöffnetes Fenster.
@@ -108,7 +107,9 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         In::ContainerContent => {
             let id = read_container_id(shared, r)?;
             let state = r.var_int()?;
-            let slots = r.var_int()?.max(0) as usize;
+            // Gedeckelt wie der gelesene Inhalt: sonst stünde in `:menu` eine Feldzahl, die es
+            // gar nicht geben kann, und `:click` prüfte gegen sie.
+            let slots = (r.var_int()?.max(0) as usize).min(MAX_SLOTS);
             #[cfg(feature = "items")]
             let content = read_content(shared, r, slots);
 
@@ -187,9 +188,17 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
 
         In::ContainerClose => {
             let id = read_container_id(shared, r)?;
-            let mut open = shared.extras.menu.open.lock().unwrap();
-            if open.as_ref().is_some_and(|current| current.id == id) {
-                *open = None;
+            let closed = {
+                let mut open = shared.extras.menu.open.lock().unwrap();
+                let closed = open.as_ref().is_some_and(|current| current.id == id);
+                if closed {
+                    *open = None;
+                }
+                closed
+            };
+            // Erst die Sperre los, dann melden: die Ausgabe kann blockieren, und daran hinge
+            // sonst der Netz-Thread mitsamt der KeepAlive-Antwort.
+            if closed {
                 shared.console.info("Menü geschlossen.");
                 shared.console.event("menu", "close");
             }
@@ -280,11 +289,37 @@ fn read_item_slot_with(
 
 // ===================== Befehle =====================
 
+/// Abzug des offenen Fensters. Gezogen wird er unter der Sperre, ausgegeben **danach**: Die
+/// Fehlerausgabe kann blockieren (Pipe voll), und wer dabei die Menü-Sperre hielte, hielte den
+/// Netz-Thread mit an – kein KeepAlive mehr, also `disconnect.timeout` wegen einer Anzeige.
+struct Snapshot {
+    id: i32,
+    title: String,
+    slots: usize,
+    #[cfg(feature = "items")]
+    items: Vec<Option<Item>>,
+    #[cfg(feature = "items")]
+    unknown_from: usize,
+}
+
+fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
+    let open = shared.extras.menu.open.lock().unwrap();
+    let current = open.as_ref()?;
+    Some(Snapshot {
+        id: current.id,
+        title: current.title.clone(),
+        slots: current.slots,
+        #[cfg(feature = "items")]
+        items: current.items.clone(),
+        #[cfg(feature = "items")]
+        unknown_from: current.unknown_from,
+    })
+}
+
 /// `:menu` – was gerade offen ist (mit `items` samt Inhalt).
 pub fn print(shared: &Arc<Shared>) {
-    let open = shared.extras.menu.open.lock().unwrap();
     let console = &shared.console;
-    let Some(current) = open.as_ref() else {
+    let Some(current) = snapshot(shared) else {
         return console.error("Gerade ist kein Menü offen.");
     };
     console.print("");
@@ -368,16 +403,24 @@ pub fn print_slot(shared: &Arc<Shared>, arg: &str) {
     else {
         return console.error("Nutzung: :slot <feld>     z. B.  :slot 13");
     };
-    let open = shared.extras.menu.open.lock().unwrap();
-    let Some(current) = open.as_ref() else {
-        return console.error("Gerade ist kein Menü offen (:menu).");
+    // Nur das eine Feld unter der Sperre abschreiben; ausgegeben wird danach (siehe [`Snapshot`]).
+    let found: Option<Result<Option<Item>, usize>> = {
+        let open = shared.extras.menu.open.lock().unwrap();
+        match open.as_ref() {
+            Some(current) => Some(match current.items.get(index) {
+                Some(slot) => Ok(slot.clone()),
+                None => Err(current.slots),
+            }),
+            None => None,
+        }
     };
-    match current.items.get(index) {
-        Some(Some(item)) => print_item(shared, index, item),
-        Some(None) => console.info(&format!("Feld {} ist leer.", index)),
-        None => console.error(&format!(
+    match found {
+        None => console.error("Gerade ist kein Menü offen (:menu)."),
+        Some(Ok(Some(item))) => print_item(shared, index, &item),
+        Some(Ok(None)) => console.info(&format!("Feld {} ist leer.", index)),
+        Some(Err(slots)) => console.error(&format!(
             "Feld {} gibt es nicht – das Menü hat {} Felder.",
-            index, current.slots
+            index, slots
         )),
     }
 }
@@ -385,7 +428,8 @@ pub fn print_slot(shared: &Arc<Shared>, arg: &str) {
 /// `:inv` – das eigene Inventar.
 #[cfg(feature = "items")]
 pub fn print_inventory(shared: &Arc<Shared>) {
-    let inventory = shared.extras.menu.inventory.lock().unwrap();
+    // Abschreiben, Sperre los, dann ausgeben – siehe [`Snapshot`].
+    let inventory = shared.extras.menu.inventory.lock().unwrap().clone();
     let console = &shared.console;
     console.print("");
     console.print(&format!("  {}", console.paint(BOLD, "Eigenes Inventar")));
@@ -461,24 +505,30 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
             .error(&format!("Feld {} gibt es in keinem Menü.", slot));
     }
 
-    let open = shared.extras.menu.open.lock().unwrap();
-    let Some(current) = open.as_ref() else {
+    // Fenster-Nummer, Zustandszähler und Feldanzahl unter der Sperre holen und sie dann sofort
+    // wieder loslassen: Gesendet wird über den Socket, und der kann bis zum Schreib-Zeitablauf
+    // hängen. Solange dürfte der Netz-Thread das Menü nicht anfassen – und käme in dieser Zeit
+    // nicht dazu, ein KeepAlive zu beantworten.
+    let Some((id, state, slots)) = ({
+        let open = shared.extras.menu.open.lock().unwrap();
+        open.as_ref().map(|current| (current.id, current.state, current.slots))
+    }) else {
         return shared.console.error("Gerade ist kein Menü offen (:menu).");
     };
     // Feldanzahl kennen wir erst, wenn der Server den Inhalt geschickt hat – vorher wird nicht
     // geprüft, sondern dem Nutzer geglaubt.
-    if current.slots > 0 && !(0..current.slots as i32).contains(&slot) {
+    if slots > 0 && !(0..slots as i32).contains(&slot) {
         return shared.console.error(&format!(
             "Feld {} gibt es nicht – das Menü hat {} Felder (0 bis {}).",
             slot,
-            current.slots,
-            current.slots - 1
+            slots,
+            slots - 1
         ));
     }
 
     let mut w = Writer::packet(shared.proto.extra.sb_container_click);
-    write_container_id(shared, &mut w, current.id);
-    w.var_int(current.state);
+    write_container_id(shared, &mut w, id);
+    w.var_int(state);
     w.u16(slot as u16); // Feldnummer ist ein Short
     w.u8(button);
     w.u8(mode);
@@ -490,12 +540,20 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
 
 /// `:close` – Fenster schließen (der Server erwartet das, sonst bleibt es für ihn offen).
 pub fn close_command(shared: &Arc<Shared>) {
-    let mut open = shared.extras.menu.open.lock().unwrap();
-    let Some(current) = open.take() else {
+    // Fenster erst aus dem Zustand nehmen, Sperre loslassen, dann senden (siehe `click_command`).
+    let Some(id) = shared
+        .extras
+        .menu
+        .open
+        .lock()
+        .unwrap()
+        .take()
+        .map(|current| current.id)
+    else {
         return shared.console.error("Gerade ist kein Menü offen.");
     };
     let mut w = Writer::packet(shared.proto.extra.sb_container_close);
-    write_container_id(shared, &mut w, current.id);
+    write_container_id(shared, &mut w, id);
     shared.send(w);
     shared.console.info("Menü geschlossen.");
 }

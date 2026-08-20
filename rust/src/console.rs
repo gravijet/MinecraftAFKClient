@@ -12,6 +12,18 @@
 //! Kein Rohmodus und keine Eingabe-Manipulation: das spart eine Abhängigkeit und macht den Client
 //! pipe-fähig. Nur die ausdrücklich gestartete POV-Bauform zeichnet auf stderr ANSI-Frames neu;
 //! Chat auf stdout bleibt weiterhin streng zeilenweise.
+//!
+//! **Geschrieben wird nie vom Netz-Thread**, und zwar auf keinem der beiden Ströme. Jeder hat
+//! seinen eigenen Schreib-Thread mit gedeckelter Warteschlange (siehe [`Channel`]). Der Grund
+//! steht bei [`Console::chat`]: Der Netz-Thread liest die Pakete *und* beantwortet KeepAlive –
+//! bleibt er in einer vollen Pipe stecken, fliegt der Client mit `disconnect.timeout` heraus,
+//! obwohl die Verbindung völlig in Ordnung war. Für die Standardausgabe galt das schon länger;
+//! die Fehlerausgabe schrieb er dagegen weiter selbst, und über sie gehen Beitritts-, Regel- und
+//! Ereignismeldungen. Ein Panel, das nur stdout mitliest, reichte damit aus.
+//!
+//! Zwei getrennte Threads und nicht einer für beides: Sonst hielte eine volle Standardausgabe
+//! auch die Fehlerausgabe an – und ausgerechnet `@event disconnect`, mit dem ein Panel erfährt,
+//! dass der Client weg ist, käme dann nie an.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -30,9 +42,9 @@ pub const CYAN: &str = "\x1b[96m";
 #[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub const BOLD: &str = "\x1b[1m";
 
-/// So viele Chatzeilen dürfen höchstens auf das Schreiben warten.
+/// So viele Zeilen dürfen je Strom höchstens auf das Schreiben warten.
 ///
-/// Bewusst klein: Sie liegen als fertige Zeichenketten im Speicher, und wer den Chat wirklich
+/// Bewusst klein: Sie liegen als fertige Zeichenketten im Speicher, und wer die Ausgabe wirklich
 /// mitliest, hängt nie so weit hinterher. Ist der Puffer voll, fällt die **älteste** Zeile heraus
 /// – dieselbe Regel wie in der Sendewarteschlange.
 ///
@@ -40,7 +52,82 @@ pub const BOLD: &str = "\x1b[1m";
 /// verhindern soll: Wartet der Netz-Thread, beantwortet er kein KeepAlive mehr. Und wer die
 /// Ausgabe nicht abholt, bekommt die Zeilen ohnehin nicht zu sehen – die Verbindung zu halten
 /// ist die eine Aufgabe dieses Clients.
-const MAX_CHAT_QUEUE: usize = 256;
+const MAX_QUEUE: usize = 256;
+
+/// Wohin eine Zeile gehört.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    /// Standardausgabe – ausschließlich Chat.
+    Out,
+    /// Standardfehlerausgabe – alles andere.
+    Err,
+}
+
+impl Stream {
+    fn name(self) -> &'static str {
+        match self {
+            Stream::Out => "Die Standardausgabe",
+            Stream::Err => "Die Fehlerausgabe",
+        }
+    }
+
+    fn thread_name(self) -> &'static str {
+        match self {
+            Stream::Out => "afk-out",
+            Stream::Err => "afk-err",
+        }
+    }
+}
+
+/// Was noch aussteht: die wartenden Zeilen **und** die eine, die der Schreib-Thread gerade in
+/// der Hand hat.
+///
+/// Ohne das zweite Merkmal galt die Ausgabe bereits als leer, sobald die letzte Zeile aus der
+/// Warteschlange geholt war – geschrieben war sie da noch nicht. [`Console::flush`] kehrte dann
+/// zurück, `std::process::exit` riss den Schreib-Thread mitten im Schreiben weg, und
+/// ausgerechnet die letzte Zeile vor einem Kick fehlte. Genau die, wegen der es `flush` gibt.
+#[derive(Default)]
+struct Waiting {
+    lines: VecDeque<String>,
+    /// Eine Zeile ist aus der Warteschlange heraus, aber noch nicht draußen.
+    writing: bool,
+}
+
+impl Waiting {
+    fn idle(&self) -> bool {
+        self.lines.is_empty() && !self.writing
+    }
+}
+
+/// Ein Ausgabestrom samt Warteschlange und – bei Bedarf gestartetem – Schreib-Thread.
+struct Channel {
+    waiting: Mutex<Waiting>,
+    /// Weckt den Schreib-Thread, sobald eine Zeile wartet.
+    filled: Condvar,
+    /// Weckt [`Console::flush`], sobald eine Zeile wirklich draußen ist.
+    drained: Condvar,
+    /// Läuft die Warteschlange gerade über? Verhindert, dass jede einzelne ausgelassene Zeile
+    /// eine eigene Meldung erzeugt – gemeldet wird der Beginn, nicht jede Wiederholung.
+    overflowing: AtomicBool,
+    /// Sorgt dafür, dass der Schreib-Thread genau einmal startet – und erst dann, wenn wirklich
+    /// etwas auf diesem Strom anfällt.
+    start: Once,
+    /// Läuft der Schreib-Thread? Wenn nicht (Start fehlgeschlagen), wird direkt geschrieben.
+    running: AtomicBool,
+}
+
+impl Default for Channel {
+    fn default() -> Channel {
+        Channel {
+            waiting: Mutex::new(Waiting::default()),
+            filled: Condvar::new(),
+            drained: Condvar::new(),
+            overflowing: AtomicBool::new(false),
+            start: Once::new(),
+            running: AtomicBool::new(false),
+        }
+    }
+}
 
 struct Inner {
     color: AtomicBool,
@@ -48,20 +135,17 @@ struct Inner {
     quiet: AtomicBool,
     /// Zusätzliche `@event`-Zeilen für ein Programm davor.
     events: AtomicBool,
-    /// Wartende Chatzeilen, siehe [`Console::chat`].
-    chat: Mutex<VecDeque<String>>,
-    /// Weckt den Schreib-Thread, sobald eine Zeile wartet.
-    filled: Condvar,
-    /// Weckt [`Console::flush_chat`], sobald eine Zeile draußen ist.
-    drained: Condvar,
-    /// Läuft die Warteschlange gerade über? Verhindert, dass jede einzelne ausgelassene Zeile
-    /// eine eigene Meldung erzeugt – gemeldet wird der Beginn, nicht jede Wiederholung.
-    overflowing: AtomicBool,
-    /// Sorgt dafür, dass der Schreib-Thread genau einmal startet – und erst dann, wenn wirklich
-    /// Chat anfällt. `--accounts` und `--login` bekommen dadurch keinen zusätzlichen Thread.
-    start: Once,
-    /// Läuft der Schreib-Thread? Wenn nicht (Start fehlgeschlagen), wird direkt geschrieben.
-    writing: AtomicBool,
+    out: Channel,
+    err: Channel,
+}
+
+impl Inner {
+    fn channel(&self, stream: Stream) -> &Channel {
+        match stream {
+            Stream::Out => &self.out,
+            Stream::Err => &self.err,
+        }
+    }
 }
 
 /// Beliebig oft klonbar (alle Klone teilen sich denselben Zustand).
@@ -72,19 +156,14 @@ pub struct Console {
 
 impl Console {
     pub fn new(color: bool, quiet: bool, events: bool) -> Console {
-        #[cfg(windows)]
-        enable_windows_utf8();
+        prepare_terminal();
         Console {
             inner: Arc::new(Inner {
                 color: AtomicBool::new(color),
                 quiet: AtomicBool::new(quiet),
                 events: AtomicBool::new(events),
-                chat: Mutex::new(VecDeque::new()),
-                filled: Condvar::new(),
-                drained: Condvar::new(),
-                start: Once::new(),
-                writing: AtomicBool::new(false),
-                overflowing: AtomicBool::new(false),
+                out: Channel::default(),
+                err: Channel::default(),
             }),
         }
     }
@@ -135,71 +214,91 @@ impl Console {
     /// Gestartet wird der Thread erst bei der ersten Chatzeile: `--accounts` und `--login`
     /// bekommen dadurch keinen.
     pub fn chat(&self, text: &str) {
-        if !self.start_writer() {
-            return write_chat(text); // kein Thread zu bekommen: dann eben wie bisher direkt
-        }
-        let mut queue = self.inner.chat.lock().unwrap();
-        let dropped = queue.len() >= MAX_CHAT_QUEUE;
-        if dropped {
-            queue.pop_front();
-        }
-        queue.push_back(text.to_string());
-        drop(queue);
-        self.inner.filled.notify_one();
+        self.queue(Stream::Out, text);
+    }
 
-        // Nur der Übergang wird gemeldet. Läuft die Ausgabe voll, kämen sonst tausende
-        // Warnungen – und die gingen auf denselben Weg wie das, was gerade nicht abfließt.
-        if dropped && !self.inner.overflowing.swap(true, Ordering::SeqCst) {
-            self.warn("Die Standardausgabe wird nicht gelesen – Chatzeilen fallen heraus.");
+    /// Eine Zeile in die Warteschlange ihres Stroms stellen.
+    ///
+    /// Läuft sie über, fällt die **älteste** heraus – und das wird genau einmal gemeldet, nicht
+    /// je ausgelassener Zeile: Die Meldung ginge sonst denselben Weg wie das, was gerade nicht
+    /// abfließt.
+    fn queue(&self, stream: Stream, text: &str) {
+        if !self.start_writer(stream) {
+            // Kein Thread zu bekommen: dann eben direkt, wie ohne diese Warteschlange.
+            return write_direct(stream, text);
+        }
+        let channel = self.inner.channel(stream);
+        let mut waiting = channel.waiting.lock().unwrap();
+        let dropped = waiting.lines.len() >= MAX_QUEUE;
+        if dropped {
+            waiting.lines.pop_front();
+        }
+        waiting.lines.push_back(text.to_string());
+        drop(waiting);
+        channel.filled.notify_one();
+
+        if dropped && !channel.overflowing.swap(true, Ordering::SeqCst) {
+            // Die Meldung geht selbst wieder durch diese Funktion; der Merker verhindert, dass
+            // sie sich dabei endlos selbst auslöst.
+            self.warn(&format!(
+                "{} wird nicht gelesen – Zeilen fallen heraus.",
+                stream.name()
+            ));
             // Auch als Ereignis: Mit `--quiet` gäbe es sonst überhaupt keinen Hinweis darauf,
             // dass gerade Zeilen fehlen – und ein Panel soll das erfahren können.
             self.event("output", "ausgelassen");
         }
     }
 
-    /// Wartende Chatzeilen noch hinausschreiben. Vor dem Beenden aufrufen – sonst gingen genau
-    /// die letzten Zeilen verloren, und das sind die mit dem Grund.
+    /// Wartende Zeilen beider Ströme noch hinausschreiben. Vor **jedem** `exit` aufrufen – sonst
+    /// gingen genau die letzten Zeilen verloren, und das sind die mit dem Grund.
     ///
     /// Mit Zeitlimit: Liest niemand mehr mit, soll das Beenden daran nicht hängen bleiben.
-    pub fn flush_chat(&self, limit: Duration) {
-        if !self.inner.writing.load(Ordering::SeqCst) {
-            return;
-        }
+    pub fn flush(&self, limit: Duration) {
         let until = Instant::now() + limit;
-        let mut queue = self.inner.chat.lock().unwrap();
-        while !queue.is_empty() {
-            let Some(left) = until.checked_duration_since(Instant::now()) else {
-                return;
-            };
-            queue = self.inner.drained.wait_timeout(queue, left).unwrap().0;
+        for stream in [Stream::Out, Stream::Err] {
+            let channel = self.inner.channel(stream);
+            if !channel.running.load(Ordering::SeqCst) {
+                continue;
+            }
+            let mut waiting = channel.waiting.lock().unwrap();
+            while !waiting.idle() {
+                let Some(left) = until.checked_duration_since(Instant::now()) else {
+                    return;
+                };
+                waiting = channel.drained.wait_timeout(waiting, left).unwrap().0;
+            }
         }
     }
 
-    /// `true`, sobald der Schreib-Thread läuft.
-    fn start_writer(&self) -> bool {
+    /// `true`, sobald der Schreib-Thread dieses Stroms läuft.
+    fn start_writer(&self, stream: Stream) -> bool {
+        let channel = self.inner.channel(stream);
         // Der Regelfall ist „läuft längst": dann nicht einmal den Arc anfassen.
-        if self.inner.start.is_completed() {
-            return self.inner.writing.load(Ordering::SeqCst);
+        if channel.start.is_completed() {
+            return channel.running.load(Ordering::SeqCst);
         }
         let inner = Arc::clone(&self.inner);
-        self.inner.start.call_once(move || {
+        channel.start.call_once(move || {
             let running = std::thread::Builder::new()
-                .name("afk-chat".into())
+                .name(stream.thread_name().into())
                 .spawn({
                     let inner = Arc::clone(&inner);
-                    move || write_loop(&inner)
+                    move || write_loop(&inner, stream)
                 })
                 .is_ok();
-            inner.writing.store(running, Ordering::SeqCst);
+            inner
+                .channel(stream)
+                .running
+                .store(running, Ordering::SeqCst);
         });
-        self.inner.writing.load(Ordering::SeqCst)
+        channel.running.load(Ordering::SeqCst)
     }
 
     /// Zustandsmeldung (Standardfehlerausgabe, mit `--quiet` unterdrückt).
     pub fn print(&self, text: &str) {
         if !self.inner.quiet.load(Ordering::Relaxed) {
-            let mut err = std::io::stderr().lock();
-            let _ = writeln!(err, "{}", text);
+            self.queue(Stream::Err, text);
         }
     }
 
@@ -221,8 +320,7 @@ impl Console {
 
     /// Fehler kommen auch mit `--quiet` durch – sonst stünde man ratlos vor einem stummen Client.
     pub fn error(&self, text: &str) {
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{}", self.paint(RED, text));
+        self.queue(Stream::Err, &self.paint(RED, text));
     }
 
     /// Maschinenlesbare Zustandszeile für ein Programm davor (`--events`):
@@ -234,13 +332,14 @@ impl Console {
         if !self.inner.events.load(Ordering::Relaxed) {
             return;
         }
-        let mut err = std::io::stderr().lock();
-        let _ = if detail.is_empty() {
-            writeln!(err, "@event {}", name)
-        } else {
-            writeln!(err, "@event {} {}", name, one_line(detail))
-        };
-        let _ = err.flush();
+        self.queue(
+            Stream::Err,
+            &if detail.is_empty() {
+                format!("@event {}", name)
+            } else {
+                format!("@event {} {}", name, one_line(detail))
+            },
+        );
     }
 
     /// Einen vollständigen POV-Frame direkt auf die Fehlerausgabe schreiben. Die normale
@@ -250,6 +349,10 @@ impl Console {
     /// `prefix` (die Cursor-Steuerung) geht **unter derselben Sperre** raus wie das Bild.
     /// Zwei getrennte Aufrufe ließen einen Zustandshinweis eines anderen Threads dazwischen
     /// rutschen – ein Programm davor sähe dann eine Statuszeile mitten im Bild.
+    ///
+    /// Bewusst ohne Warteschlange: Ein Bild ist bei 160x80 gut 300 KB, das gehört nicht in einen
+    /// Zeilenpuffer. Blockiert es, betrifft das nur den Zeichen-Thread – und genau dafür gibt es
+    /// ihn.
     #[cfg(feature = "pov")]
     pub fn pov_frame(&self, prefix: &str, frame: &str) {
         let mut err = std::io::stderr().lock();
@@ -267,10 +370,12 @@ impl Console {
     /// den Client damit dauerhaft taub, obwohl die Standardeingabe noch offen war. Beide Fälle
     /// haben die betroffene Zeile bereits verbraucht, ein erneuter Versuch kommt also voran.
     pub fn read_line(&self) -> Option<String> {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
         let mut line = String::new();
         loop {
             line.clear();
-            match std::io::stdin().lock().read_line(&mut line) {
+            match input.read_line(&mut line) {
                 Ok(0) => return None,
                 Ok(_) => return Some(line.trim_end_matches(['\r', '\n']).to_string()),
                 Err(e)
@@ -284,33 +389,59 @@ impl Console {
     }
 }
 
-/// Der Schreib-Thread: nimmt Zeilen aus der Warteschlange und schreibt sie hinaus. Blockiert er
-/// dabei (volle Pipe), betrifft das nur ihn – der Netz-Thread arbeitet weiter.
-fn write_loop(inner: &Inner) {
+/// Der Schreib-Thread eines Stroms: nimmt Zeilen aus seiner Warteschlange und schreibt sie
+/// hinaus. Blockiert er dabei (volle Pipe), betrifft das nur ihn – der Netz-Thread arbeitet
+/// weiter, und der jeweils andere Strom ebenfalls.
+fn write_loop(inner: &Inner, stream: Stream) {
+    let channel = inner.channel(stream);
     loop {
-        let (line, empty) = {
-            let mut queue = inner.chat.lock().unwrap();
+        let line = {
+            let mut waiting = channel.waiting.lock().unwrap();
             loop {
-                match queue.pop_front() {
-                    Some(line) => break (line, queue.is_empty()),
-                    None => queue = inner.filled.wait(queue).unwrap(),
+                match waiting.lines.pop_front() {
+                    Some(line) => {
+                        // Ab hier gilt die Zeile als „unterwegs", nicht als erledigt.
+                        waiting.writing = true;
+                        break line;
+                    }
+                    None => waiting = channel.filled.wait(waiting).unwrap(),
                 }
             }
         };
-        if empty {
+        write_direct(stream, &line);
+        // Erst **nach** dem Schreiben abmelden: Sonst hielte `flush` die Ausgabe schon für leer,
+        // während die letzte Zeile noch im Puffer steht.
+        let mut waiting = channel.waiting.lock().unwrap();
+        waiting.writing = false;
+        if waiting.lines.is_empty() {
             // Wieder aufgeholt: Die nächste Überlaufmeldung darf wieder kommen.
-            inner.overflowing.store(false, Ordering::SeqCst);
+            channel.overflowing.store(false, Ordering::SeqCst);
         }
-        // Erst wecken, dann schreiben: Der Platz ist ja schon frei.
-        inner.drained.notify_all();
-        write_chat(&line);
+        drop(waiting);
+        channel.drained.notify_all();
     }
 }
 
-fn write_chat(text: &str) {
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}", text);
-    let _ = out.flush();
+/// Eine Zeile in **einem** Schreibvorgang hinausgeben.
+///
+/// Der Zeilenumbruch wird vorher angehängt statt über `writeln!` geschrieben: Die Fehlerausgabe
+/// ist ungepuffert, `writeln!(err, "{}", text)` wären also zwei Systemaufrufe je Zeile. Eine
+/// kurze Zeichenkette anzulegen ist billiger als der zweite Aufruf.
+fn write_direct(stream: Stream, text: &str) {
+    let mut line = String::with_capacity(text.len() + 1);
+    line.push_str(text);
+    line.push('\n');
+    match stream {
+        Stream::Out => {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(line.as_bytes());
+            let _ = out.flush();
+        }
+        Stream::Err => {
+            let mut err = std::io::stderr().lock();
+            let _ = err.write_all(line.as_bytes());
+        }
+    }
 }
 
 /// Zeilenumbrüche und andere Steuerzeichen in Leerzeichen wandeln.
@@ -331,9 +462,13 @@ fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
-/// Ohne das zerlegt die Windows-Konsole jeden Umlaut.
+/// Das Terminal auf UTF-8 stellen. Ohne das zerlegt die Windows-Konsole jeden Umlaut.
+///
+/// Aufzurufen, **bevor** irgendetwas geschrieben wird – auch vor `--help` und `--accounts`. Die
+/// beiden legen keine [`Console`] an, geben aber einen Pfad aus; steht im Benutzernamen ein
+/// Umlaut, kam er bisher als Zeichensalat heraus.
 #[cfg(windows)]
-fn enable_windows_utf8() {
+pub fn prepare_terminal() {
     use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
     const UTF8: u32 = 65001;
     unsafe {
@@ -341,6 +476,9 @@ fn enable_windows_utf8() {
         SetConsoleCP(UTF8);
     }
 }
+
+#[cfg(not(windows))]
+pub fn prepare_terminal() {}
 
 #[cfg(test)]
 mod tests {
@@ -359,5 +497,35 @@ mod tests {
         ));
         // Umlaute und §-Codes bleiben unangetastet.
         assert_eq!(one_line("§cÜberfällig"), "§cÜberfällig");
+    }
+
+    /// Beide Ströme haben ihre eigene Warteschlange. Läuft die eine über, muss die andere
+    /// unberührt bleiben – sonst hielte eine volle Standardausgabe auch `@event disconnect` auf,
+    /// und ein Panel erführe nie, dass der Client weg ist.
+    #[test]
+    fn die_stroeme_haben_getrennte_warteschlangen() {
+        let console = Console::new(false, false, true);
+        let inner = &console.inner;
+        // Von Hand gefüllt: Der Test soll nichts wirklich hinausschreiben.
+        inner.out.waiting.lock().unwrap().lines.push_back("chat".into());
+        assert_eq!(inner.out.waiting.lock().unwrap().lines.len(), 1);
+        assert_eq!(inner.err.waiting.lock().unwrap().lines.len(), 0);
+        assert!(!inner.channel(Stream::Out).waiting.lock().unwrap().idle());
+        assert!(inner.channel(Stream::Err).waiting.lock().unwrap().idle());
+    }
+
+    /// `flush` darf erst zurückkehren, wenn die Zeile wirklich draußen ist – nicht schon,
+    /// sobald sie aus der Warteschlange geholt wurde.
+    #[test]
+    fn eine_zeile_in_arbeit_gilt_nicht_als_erledigt() {
+        let mut waiting = Waiting::default();
+        assert!(waiting.idle());
+        waiting.lines.push_back("x".into());
+        assert!(!waiting.idle());
+        waiting.lines.pop_front();
+        waiting.writing = true;
+        assert!(!waiting.idle(), "in Arbeit ist nicht dasselbe wie erledigt");
+        waiting.writing = false;
+        assert!(waiting.idle());
     }
 }

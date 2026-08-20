@@ -300,16 +300,56 @@ fn read_team(shared: &Arc<Shared>, inner: &mut Inner, r: &mut Reader) -> std::io
 /// Zusätzlich geht mit `--events` dieselbe Tafel als `@event board`-Zeilen raus, dort aber mit
 /// `§`-Farbcodes statt ANSI: ein Panel kann sie damit genauso einfärben wie im Spiel.
 pub fn print_sidebar(shared: &Arc<Shared>) {
-    let inner = shared.extras.board.inner.lock().unwrap();
     let console = &shared.console;
-
-    let Some(objective) = inner.sidebar.as_ref() else {
+    // Erst abschreiben, Sperre loslassen, **dann** ausgeben.
+    //
+    // Ausgeben heißt auf die Fehlerausgabe schreiben, und die blockiert, wenn niemand sie
+    // abholt (Pipe voll). Wer dabei die Tafel-Sperre hielte, hielte auch den Netz-Thread an –
+    // der braucht sie beim nächsten Punkte- oder Team-Paket. Damit bliebe das nächste KeepAlive
+    // unbeantwortet und der Server trännte mit `disconnect.timeout`: ein Kick wegen einer
+    // Bildschirmausgabe.
+    let Some((title, lines)) = sidebar_snapshot(shared) else {
         return console.error("Der Server zeigt gerade keine Seitenleiste an.");
     };
+
+    console.print("");
+    console.print(&format!("  {}", console.paint(BOLD, &console.text(&title))));
+    if lines.is_empty() {
+        console.print(&console.paint(GRAY, "    (keine Zeilen)"));
+    }
+    for (_, text, number) in &lines {
+        let number = number.as_deref().map(|text| console.text(text));
+        console.print(&match number {
+            Some(number) => format!("    {}  {}", console.text(text), number),
+            None => format!("    {}", console.text(text)),
+        });
+    }
+
+    console.event("board", &format!("titel {}", title));
+    for (value, text, number) in &lines {
+        console.event(
+            "board",
+            &format!(
+                "zeile wert={} zahl={} text={}",
+                value,
+                number.as_deref().unwrap_or(""),
+                text
+            ),
+        );
+    }
+}
+
+/// Überschrift und fertige Zeilen der Seitenleiste – alles, was die Anzeige braucht, in einem
+/// Zug unter der Sperre geholt. `None` = es gibt gerade keine Seitenleiste.
+type Line = (i32, String, Option<String>);
+
+fn sidebar_snapshot(shared: &Arc<Shared>) -> Option<(String, Vec<Line>)> {
+    let inner = shared.extras.board.inner.lock().unwrap();
+    let objective = inner.sidebar.as_ref()?;
     let objective_data = inner.objectives.get(objective);
     let title = objective_data
-        .map(|data| data.title.as_str())
-        .unwrap_or(objective);
+        .map(|data| data.title.clone())
+        .unwrap_or_else(|| objective.clone());
 
     // Die Seitenleiste ist nach Punktzahl absteigend sortiert – genau wie im Spiel. Bei gleicher
     // Punktzahl entscheidet der Eintragsname (auch das macht Vanilla so). Ohne dieses zweite
@@ -331,32 +371,13 @@ pub fn print_sidebar(shared: &Arc<Shared>) {
     };
     lines.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
     lines.truncate(MAX_LINES);
-
-    console.print("");
-    console.print(&format!("  {}", console.paint(BOLD, &console.text(title))));
-    if lines.is_empty() {
-        console.print(&console.paint(GRAY, "    (keine Zeilen)"));
-    }
-    for (_, _, text, number) in &lines {
-        let number = number.as_deref().map(|text| console.text(text));
-        console.print(&match number {
-            Some(number) => format!("    {}  {}", console.text(text), number),
-            None => format!("    {}", console.text(text)),
-        });
-    }
-
-    console.event("board", &format!("titel {}", title));
-    for (value, _, text, number) in &lines {
-        console.event(
-            "board",
-            &format!(
-                "zeile wert={} zahl={} text={}",
-                value,
-                number.as_deref().unwrap_or(""),
-                text
-            ),
-        );
-    }
+    Some((
+        title,
+        lines
+            .into_iter()
+            .map(|(value, _, text, number)| (value, text, number))
+            .collect(),
+    ))
 }
 
 fn number_for(score: &Score, objective: Option<&NumberFormat>) -> Option<String> {

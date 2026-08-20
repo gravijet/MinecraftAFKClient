@@ -22,10 +22,146 @@ Ultra-Varianten gibt es bewusst nur für Rust.
 # Was sich seit dem 16. August geändert hat
 
 Stand davor war der Commit, mit dem POV-, Items- und Ultra-Variante dazukamen. Seitdem gab es
-drei Runden: **2.1.0**, **2.2.0** und jetzt **2.3.0**. Der Java-Client bekam in 2.1.0 die
-einstellbare Sichtweite, in 2.3.0 jetzt eine Reihe echter Fehlerbehebungen.
+vier Runden: **2.1.0**, **2.2.0**, **2.3.0** und jetzt **2.4.0**. Der Java-Client bekam in 2.1.0
+die einstellbare Sichtweite und in 2.3.0 eine Reihe echter Fehlerbehebungen; 2.4.0 betrifft
+ausschließlich den Rust-Client.
 
-## Rust-Client 2.3.0 (neu)
+## Rust-Client 2.4.0 (neu)
+
+Diese Runde ist reine Fehlersuche. Vier der behobenen Fehler kosteten unter den richtigen
+Umständen die Verbindung, zwei weitere ließen Chat still verschwinden – und keiner davon wäre am
+Client selbst aufgefallen, sondern nur an einem Server, der sich völlig normal verhält.
+
+Für die sechs oben genannten gibt es je einen Test, der ohne die Änderung fehlschlägt; für den
+Rest zumindest einen, der das richtige Verhalten festhält.
+
+### Behobene Fehler, die die Verbindung kosteten
+
+- **Eine Zeile mit Emoji beendete die Verbindung.** Gekürzt wurde auf 256 *Zeichen*, der Server
+  zählt aber mit Javas `String.length()` – dort zählt jedes Zeichen über U+FFFF doppelt – und
+  deckelt zusätzlich die Bytezahl auf das Dreifache der erlaubten Länge. Eine Zeile aus 200 Emoji
+  ging deshalb glatt durch die eigene Prüfung und kam mit 400 Java-Zeichen und 800 statt höchstens
+  768 Byte an: Der Server brach schon beim Dekodieren ab. Gekürzt wird jetzt in UTF-16-Einheiten,
+  womit beide Grenzen zugleich eingehalten sind.
+- **Eine nicht gelesene Fehlerausgabe warf den Client aus dem Spiel.** Für die Standardausgabe war
+  das seit 2.3.0 behoben, für die Fehlerausgabe nicht – und über sie gehen Beitritts-, Regel- und
+  Ereignismeldungen, geschrieben vom Netz-Thread. Ein Panel, das nur stdout mitliest, füllte damit
+  die zweite Pipe, der Netz-Thread blieb darin stecken und der Server trennte mit
+  `disconnect.timeout`. Beide Ströme haben jetzt je einen eigenen Schreib-Thread mit gedeckelter
+  Warteschlange. Getrennt und nicht einer für beides: Sonst hielte eine volle Standardausgabe auch
+  `@event disconnect` auf – ausgerechnet die Zeile, an der ein Panel merkt, dass der Client weg
+  ist. Der neue Ablauftest lässt stderr absichtlich ungelesen volllaufen; ohne die Änderung
+  schlägt er fehl.
+- **Eine einzige unlesbare Chat-Komponente meldete den Client ab.** Beim Systemchat wurde ein
+  Lesefehler nach oben gereicht und beendete die ganze Verbindung. Pakete sind einzeln gerahmt –
+  das nächste beginnt ohnehin an einer bekannten Stelle, die Zeile wird jetzt einfach übersprungen.
+- **Zwischen dem letzten Klartextpaket und dem Umschalten auf Verschlüsselung war eine Lücke.**
+  Gesendet und umgeschaltet wurde unter zwei getrennten Sperren; ein anderer Thread konnte in
+  diesem Fenster ein Paket dazwischenschieben, das dann unverschlüsselt hinausging, während der
+  Server bereits entschlüsselte. Beides läuft jetzt unter einer Sperre.
+
+### Behobene Fehler, die still etwas verschluckten
+
+- **Spielerchat verschwand auf jedem Server mit eingeschaltetem Chatfilter.** Meldet der Server
+  „teilweise gefiltert", folgt hinter der Filterangabe noch ein Bitfeld. Es wurde nicht gelesen,
+  der Lesezeiger stand danach mitten im Paket, und die Zeile fiel wortlos weg – bei jeder
+  Nachricht.
+- **Cookies überlebten den Server-Transfer nicht.** Der Client leerte seine Ablage bei *jedem*
+  Verbindungsaufbau. Genau dafür gibt es Cookies aber: Server A legt eines ab und schickt einen
+  Transfer, Server B fragt es beim Login ab – so laufen Anmeldung und Warteschlange auf großen
+  Netzwerken. Der Client antwortete stattdessen immer „habe ich nicht", und Server B schickte den
+  Spieler zurück oder gleich hinaus. Der Vanilla-Client reicht sie aus demselben Grund an die neue
+  Verbindung weiter.
+- **Die letzte Chatzeile vor einem Kick ging verloren.** Vor dem Beenden wurde gewartet, bis die
+  Warteschlange leer ist – die zuletzt herausgenommene Zeile war da aber noch gar nicht
+  geschrieben. `exit` wartet auf keinen Thread, und ausgerechnet die letzten Zeilen sind die mit
+  dem Grund.
+- **Der Kick-Grund der Login-Phase stand als roher JSON-Text auf dem Bildschirm.** Dort kommt er
+  noch als JSON und nicht als NBT; aus `{"text":"Du bist gesperrt.","color":"red"}` wird jetzt
+  wieder ein lesbarer, eingefärbter Satz.
+- **Eine NBT-Liste ohne Elementtyp, aber mit Länge, ergab still eine leere Liste.** Der Lesezeiger
+  stand danach falsch, und der Rest des Pakets wurde aus zufälligen Bytes zusammengesetzt.
+- **Eine unplausible Parameterzahl in einer Chat-Verzierung wurde auf 16 gestaucht** und
+  weitergelesen – dieselbe Sorte Fehler, die 2.3.0 schon für die Quittungsliste und für
+  Gegenstandslisten behoben hat.
+
+### Weitere Behebungen
+
+- **Örtliche Befehle hielten Sperren, die der Netz-Thread braucht.** `:click` und `:close`
+  sendeten über den Socket, während sie das Menü gesperrt hielten; `:menu`, `:board`, `:inv` und
+  `:slot` gaben unter derselben Sperre aus. Beides kann bis zum Schreib-Zeitablauf dauern, und so
+  lange käme der Netz-Thread nicht dazu, ein KeepAlive zu beantworten. Jetzt wird der Stand
+  abgeschrieben, die Sperre losgelassen und erst danach gesendet bzw. ausgegeben. Dasselbe gilt
+  für das Speichern der Bewegungseinstellungen: geschrieben wird ohne die Sperre.
+- **Eine Adresse ohne Namen wurde angenommen.** `[]`, `[]:25565` und `:25565` scheiterten erst
+  beim Verbinden – mit einer Meldung des Netzstapels statt eines Hinweises auf den Tippfehler.
+- **Die Übernahme einer alten `auth.json` schrieb die Kontodatei mit 0644 und nicht unteilbar.**
+  In ihr stehen Microsoft-Token; jedes andere Speichern eines Kontos ging diesen Weg längst.
+- **Der Microsoft-Gerätecode lief nach fünf Minuten ab**, obwohl Microsoft in derselben Antwort
+  eine Viertelstunde nennt – wer den Browser erst suchen musste, kam zu spät. Auch der Abstand
+  zwischen zwei Abfragen kommt jetzt aus der Antwort statt aus einer festen Zahl.
+- **`:antiafk <riesige Zahl>` ergab eine Wartezeit, mit der keine Uhr mehr rechnet.** Dieselbe
+  Obergrenze wie auf der Kommandozeile (30 Tage) gilt jetzt auch zur Laufzeit.
+- **Unmögliche Zahlen in `movement.json` liefen ungeprüft in jede Rechnung.** Aus `1e400` macht
+  JSON eine Unendlichkeit; der Abstand zum Ziel war danach unendlich, die Schrittweite null, und
+  `:home go` lief bis ins Zeitlimit, ohne sich einen Block zu bewegen.
+- **`--help` und `--accounts` stellten die Windows-Konsole nicht auf UTF-8.** Beide legen keine
+  Konsole an, geben aber einen Pfad aus – steht im Benutzernamen ein Umlaut, kam er als
+  Zeichensalat heraus.
+- Die Feldanzahl eines Menüs wird gedeckelt übernommen; die SOCKS5-Anmeldung prüft die Version
+  der Teilverhandlung; ein fehlgeschlagener Thread-Start meldet den Grund, statt nur abzubrechen.
+
+### Tempo und Verbrauch
+
+- **Der Rahmenpuffer wird nicht mehr bei jedem Paket genullt.** `resize` füllte ihn erst
+  vollständig mit Nullen, die der Lesevorgang unmittelbar danach überschrieb – bei einem Megabyte
+  Chunkdaten also ein Megabyte reines Nullenschreiben je Paket. Er wächst jetzt nur noch und wird
+  weiterhin eingezogen, sobald ein Ausreißer vorbei ist.
+- **Reine Luft-Abschnitte werden übersprungen statt ausgepackt.** In einer gewachsenen Überwelt
+  sind das zwei Drittel aller Chunk-Abschnitte, und jeder von ihnen hat bisher 4096 Blockindizes
+  aufgebaut, um sie sofort wieder wegzuwerfen.
+- **Chunkdaten werden ohne Kopie aus dem Paketpuffer gelesen.** Beim Beitritt kommen gut 170
+  solche Pakete mit je einigen zehn Kilobyte; jede dieser Kopien lebte nur bis zum Ende einer
+  Funktion.
+- **Der POV-Zeichner schläft zwischen zwei Verbindungen, statt im Bildtakt aufzuwachen.**
+- **Eine Statuszeile ist ein Systemaufruf statt zwei** (die Fehlerausgabe ist ungepuffert, und
+  `writeln!` schreibt Text und Zeilenumbruch getrennt).
+- **Der Sendeabstand wird vor dem Senden abgewartet statt blind danach.** Derselbe Abstand – aber
+  wer eine Minute lang nichts schickt, ist seine nächste Zeile ohne Wartezeit los, und beim
+  Beenden hängt der Sender nicht in einem Schlaf fest, den niemand mehr braucht.
+
+Der Messlauf für das Chunk-Einlesen bleibt bei rund 0,06 ms je Chunk; die Arbeit steckt dort in
+den 4096 Blöcken der *gefüllten* Abschnitte, nicht in den leeren. Neu dazu kommt ein Messlauf für
+den Durchsatz der Verschlüsselung (`cfb8_durchsatz`): rund 68 MB/s, und mehr ist bauartbedingt
+nicht drin – CFB8 ist seriell, der Durchsatz ist genau die Latenz einer AES-Blockverschlüsselung
+je Byte. Gespart werden kann nur an der Datenmenge, und dafür gibt es `--view-distance`.
+
+### Tests
+
+Zwei ganze Codepfade, die auf **jedem** echten Server laufen, hatten bisher keinen einzigen
+Ablauftest – geprüft wurde immer nur der Zweig, den draußen kaum jemand benutzt:
+
+- **Verschlüsselung.** Der Testserver macht jetzt das vollständige Handshake eines
+  Online-Mode-Servers: RSA-Schlüsselpaar, Prüffolge, und danach läuft jedes Byte in beiden
+  Richtungen durch AES-128-CFB8 – auch die Rahmenlänge vor jedem Paket, die deshalb byteweise
+  entschlüsselt werden muss. Die Chiffre war vorher nur gegen sich selbst geprüft, nicht über
+  einen echten Socket.
+- **Kompression.** Drei Schwellen, in beide Richtungen, mit Paketen ober- und unterhalb der
+  Schwelle – und zusammen mit Verschlüsselung, weil ein echter Server beides gleichzeitig macht.
+
+Dazu neu: Spielerchat mit und ohne Filterangabe (auf beiden Protokollformaten), Cookies über einen
+Transfer hinweg, die volle Fehlerausgabe, die letzten Chatzeilen vor dem Beenden, und ein
+Durchlauf **aller** örtlichen `:`-Befehle – einschließlich der Eingaben, mit denen niemand rechnet
+(`:click -1`, `:pov size 9999 9999`, `:antiafk 000000000000000000`, `:hand x`).
+
+Die Ablauftests laufen jetzt außerdem in einem eigenen Konfigurationsverzeichnis je Client. Vorher
+schrieb ein Test mit `:home set` in die echte `movement.json` – ein Test darf weder etwas
+hinterlassen noch davon abhängen, was er vorfindet.
+
+Stand: **124 Modultests und 26 Ablauftests**, alle sieben Bauformen bauen und testen ohne eine
+einzige Warnung.
+
+## Rust-Client 2.3.0 (die Runde davor)
 
 ### Behobene Fehler
 
@@ -129,7 +265,7 @@ Testkomforts, den es seit 2.2.0 nicht mehr gibt.
 
 Stand: 113 Modultests und 19 Ablauftests, alle sieben Bauformen bauen ohne eine einzige Warnung.
 
-## Rust-Client 2.1.0 und 2.2.0 (die beiden Runden davor)
+## Rust-Client 2.1.0 und 2.2.0 (die Runden davor)
 
 - Absturz an gemischten Block-Paletten behoben – der traf jeden Beitritt auf einer normal
   erzeugten Welt, Sekunden nach dem Verbinden und ohne Zutun.
@@ -150,8 +286,9 @@ Stand: 113 Modultests und 19 Ablauftests, alle sieben Bauformen bauen ohne eine 
 
 ## Java-Client (`afk-*.jar`)
 
-In 2.1.0 kam hier nur `--view-distance` dazu (und die Duldung der Rust-Optionen); dies ist die
-erste Runde, die im Java-Client wieder Fehler behebt. Die Protokollarbeit erledigt weiterhin
+Unverändert seit 2.3.0 – die aktuelle Runde betrifft nur den Rust-Client. In 2.1.0 kam hier nur
+`--view-distance` dazu (und die Duldung der Rust-Optionen); 2.3.0 war die erste Runde, die im
+Java-Client wieder Fehler behebt. Die Protokollarbeit erledigt weiterhin
 MCProtocolLib; alles hier betrifft das Drumherum.
 
 - **Die Kontodatei wurde nicht unteilbar geschrieben.** Ein Abbruch mitten im Speichern hinterließ

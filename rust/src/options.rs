@@ -343,6 +343,11 @@ fn check_server(server: &str) -> Result<(), String> {
     let port = if let Some(rest) = server.strip_prefix('[') {
         // `[::1]:25565`: nur was hinter der schließenden Klammer steht, kann ein Port sein.
         match rest.split_once(']') {
+            // `[]` bzw. `[]:25565` ist keine Adresse. Bisher ging beides durch und scheiterte
+            // erst beim Verbinden – mit einer Meldung des Netzstapels statt eines Hinweises.
+            Some((host, _)) if host.trim().is_empty() => {
+                return Err(format!("Serveradresse ohne Namen: '{}'", server))
+            }
             Some((_, rest)) => rest.strip_prefix(':'),
             None => return Err(format!("Serveradresse ohne schließende Klammer: '{}'", server)),
         }
@@ -355,6 +360,11 @@ fn check_server(server: &str) -> Result<(), String> {
     // Port 0 ist kein Port, sondern die Bitte an das Betriebssystem, sich einen auszusuchen –
     // als Ziel einer Verbindung ergibt er keinen Sinn und führte nur zu einer kryptischen
     // Meldung des Netzstapels statt zu einem klaren Hinweis auf den Tippfehler.
+    // Ein Port ohne Namen davor (`:25565`) ist genauso wenig eine Adresse wie `[]`.
+    if server.split(':').next().is_some_and(str::is_empty) && !server.starts_with("::") {
+        return Err(format!("Serveradresse ohne Namen: '{}'", server));
+    }
+
     match port {
         Some(port) if !matches!(port.trim().parse::<u16>(), Ok(1..=u16::MAX)) => Err(format!(
             "Server-Port ist keine Zahl zwischen 1 und 65535: '{}'. Beispiel: mc.example.net:25565",
@@ -573,6 +583,19 @@ mod tests {
         assert!(parse_args(&["[::1]:25566"]).is_ok());
         assert!(parse_args(&["[::1]"]).is_ok());
         assert!(parse_args(&["::1"]).is_ok());
+    }
+
+    /// Eine Adresse ohne Namen ist keine. Bisher ging sie durch und scheiterte erst beim
+    /// Verbinden – mit einer Meldung des Netzstapels statt eines Hinweises auf den Tippfehler.
+    #[test]
+    fn adresse_ohne_namen_wird_abgelehnt() {
+        assert!(parse_args(&["[]"]).is_err());
+        assert!(parse_args(&["[]:25565"]).is_err());
+        assert!(parse_args(&[":25565"]).is_err());
+        // Gültige Schreibweisen bleiben gültig – auch nackte IPv6-Adressen.
+        assert!(parse_args(&["::1"]).is_ok());
+        assert!(parse_args(&["[::1]:25566"]).is_ok());
+        assert!(parse_args(&["mc.example.net:25566"]).is_ok());
     }
 
     #[test]

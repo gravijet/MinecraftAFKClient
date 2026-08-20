@@ -20,7 +20,7 @@
 //!   Lauf mit einer Meldung ab, statt gegen die Wand zu rennen.
 
 use crate::buf::Writer;
-use crate::client::{Position, Shared};
+use crate::client::{Position, Shared, WORLD_LIMIT};
 use crate::console::{Console, BOLD, CYAN, GRAY};
 use crate::options;
 
@@ -71,6 +71,35 @@ pub struct Spot {
 }
 
 impl Spot {
+    /// Einen aus der Datei gelesenen Punkt brauchbar machen.
+    ///
+    /// `movement.json` ist eine gewöhnliche Textdatei; darin kann alles stehen – auch `1e400`,
+    /// woraus JSON eine Unendlichkeit macht. Ein solcher Wert wanderte ungeprüft in jede
+    /// Rechnung: Der Abstand zum Ziel war dann unendlich, die Schrittweite null, und `:home go`
+    /// lief bis ins Zeitlimit, ohne sich einen Block zu bewegen.
+    fn normalize(&mut self) {
+        let coordinate = |value: f64| {
+            if value.is_finite() {
+                value.clamp(-WORLD_LIMIT, WORLD_LIMIT)
+            } else {
+                0.0
+            }
+        };
+        self.x = coordinate(self.x);
+        self.y = coordinate(self.y);
+        self.z = coordinate(self.z);
+        self.yaw = if self.yaw.is_finite() {
+            wrap_degrees(self.yaw)
+        } else {
+            0.0
+        };
+        self.pitch = if self.pitch.is_finite() {
+            self.pitch.clamp(-90.0, 90.0)
+        } else {
+            0.0
+        };
+    }
+
     fn describe(&self) -> String {
         format!(
             "x={:.1}  y={:.1}  z={:.1}  ·  Blick {:.0}° ({}) / {:.0}°",
@@ -141,9 +170,11 @@ impl Settings {
         self.fall_check_blocks = self.fall_check_blocks.clamp(0.5, 16.0);
         self.home_delay_seconds = self.home_delay_seconds.min(3600);
         self.route.truncate(MAX_ROUTE);
+        for point in &mut self.route {
+            point.normalize();
+        }
         if let Some(home) = &mut self.home {
-            home.pitch = home.pitch.clamp(-90.0, 90.0);
-            home.yaw = wrap_degrees(home.yaw);
+            home.normalize();
         }
     }
 
@@ -198,10 +229,18 @@ impl Mover {
     /// Einstellungen ändern und sofort speichern (unteilbar – siehe
     /// [`crate::options::write_atomic`]).
     fn edit(&self, change: impl FnOnce(&mut Settings)) {
-        let mut settings = self.settings.lock().unwrap();
-        change(&mut settings);
-        settings.normalize();
-        if let Ok(text) = serde_json::to_string_pretty(&*settings) {
+        let text = {
+            let mut settings = self.settings.lock().unwrap();
+            change(&mut settings);
+            settings.normalize();
+            serde_json::to_string_pretty(&*settings).ok()
+        };
+        // Erst die Sperre loslassen, dann auf die Platte schreiben.
+        //
+        // An dieser Sperre hängt beim Beitritt auch der Netz-Thread (er liest die
+        // Heimatposition), und ein Schreibvorgang kann dauern – auf einem ausgelasteten oder
+        // netzgebundenen Dateisystem lange genug, um ein KeepAlive zu verpassen.
+        if let Some(text) = text {
             options::write_atomic(&self.file, &text);
         }
     }
@@ -1546,6 +1585,33 @@ mod tests {
         // Und ein Sturz beschleunigt: der zweite Schritt ist größer als der erste.
         let second = (first - GRAVITY) * DRAG;
         assert!(second.abs() > first.abs());
+    }
+
+    /// `movement.json` ist eine gewöhnliche Textdatei – darin kann auch `1e400` stehen, und
+    /// JSON macht daraus eine Unendlichkeit. Ungeprüft war der Abstand zum Ziel danach unendlich
+    /// und die Schrittweite null: `:home go` lief bis ins Zeitlimit, ohne sich zu bewegen.
+    #[test]
+    fn unmoegliche_punkte_aus_der_datei_werden_geradegerueckt() {
+        let kaputt = Spot {
+            x: f64::INFINITY,
+            y: f64::NAN,
+            z: 1e300,
+            yaw: f64::INFINITY as f32,
+            pitch: 400.0,
+        };
+        let mut settings = Settings {
+            home: Some(kaputt),
+            route: vec![kaputt],
+            ..Settings::default()
+        };
+        settings.normalize();
+        for point in settings.route.iter().chain(settings.home.iter()) {
+            assert!(point.x.is_finite() && point.x.abs() <= WORLD_LIMIT, "{}", point.x);
+            assert!(point.y.is_finite() && point.y.abs() <= WORLD_LIMIT, "{}", point.y);
+            assert!(point.z.is_finite() && point.z.abs() <= WORLD_LIMIT, "{}", point.z);
+            assert!(point.yaw.is_finite() && point.yaw.abs() <= 180.0, "{}", point.yaw);
+            assert!((-90.0..=90.0).contains(&point.pitch), "{}", point.pitch);
+        }
     }
 
     /// Eine zu lange Route würde die Datei und den Heimlauf sinnlos aufblähen.

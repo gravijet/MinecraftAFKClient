@@ -50,6 +50,10 @@ use crate::proto::Protocol;
 use std::path::Path;
 
 fn main() {
+    // Zuerst, noch vor jeder Ausgabe: `--help` und `--accounts` legen keine `Console` an,
+    // schreiben aber Pfade – und die Windows-Konsole zerlegt sonst jeden Umlaut darin.
+    console::prepare_terminal();
+
     let command = match options::parse(std::env::args().skip(1)) {
         Ok(command) => command,
         Err(message) => {
@@ -64,6 +68,15 @@ fn main() {
         Command::Login => add_account_only(),
         Command::Run(options) => run(*options),
     }
+}
+
+/// Mit Fehlerstatus beenden – aber erst, wenn die letzte Meldung wirklich draußen ist.
+///
+/// Die Ausgabe läuft über einen eigenen Thread (siehe [`Console::chat`]), und `exit` wartet auf
+/// keinen. Ohne dieses Abwarten bliebe ausgerechnet die Meldung liegen, die den Abbruch erklärt.
+fn bail(console: &Console) -> ! {
+    console.flush(std::time::Duration::from_secs(2));
+    std::process::exit(1)
 }
 
 fn run(options: Options) {
@@ -83,7 +96,7 @@ fn run(options: Options) {
             }
             Err(e) => {
                 console.error(&format!("Offline-Name abgelehnt: {}", e));
-                std::process::exit(1);
+                bail(&console);
             }
         }
     } else {
@@ -93,7 +106,7 @@ fn run(options: Options) {
             Ok(account) => account,
             Err(e) => {
                 console.error(&format!("Login fehlgeschlagen: {}", e));
-                std::process::exit(1);
+                bail(&console);
             }
         }
     };
@@ -231,10 +244,15 @@ fn add_account_only() {
     let console = Console::new(true, false, false);
     options::migrate();
     match device_code_login(&console, &options::dir()) {
-        Ok(account) => println!("{}", account.name),
+        Ok(account) => {
+            // Erst die Anweisungen des Logins hinausschreiben, dann den Namen: Beides ginge
+            // sonst in unterschiedlicher Reihenfolge heraus.
+            console.flush(std::time::Duration::from_secs(2));
+            println!("{}", account.name);
+        }
         Err(e) => {
             console.error(&format!("Login fehlgeschlagen: {}", e));
-            std::process::exit(1);
+            bail(&console);
         }
     }
 }

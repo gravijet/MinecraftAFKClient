@@ -371,13 +371,21 @@ fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section
             return Err(crate::buf::err("POV: Fluidzaehler unplausibel"));
         }
     }
+
+    // Ein Abschnitt ohne einen einzigen Nicht-Luft-Block wird ohnehin verworfen – dann braucht
+    // seine Palette gar nicht erst ausgepackt zu werden, sie muss nur exakt übersprungen werden.
+    // In einer gewachsenen Überwelt sind das zwei Drittel aller Abschnitte, und jeder von ihnen
+    // hat bisher 4096 Indizes ausgepackt und sofort wieder weggeworfen.
+    if block_count == 0 {
+        skip_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
+        skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
+        return Ok(None);
+    }
+
     let palette = read_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
     // Biome braucht die Geometrie nicht – nur exakt überspringen.
     skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
 
-    if block_count == 0 {
-        return Ok(None);
-    }
     Ok(compact(palette, block_count as usize).map(Arc::new))
 }
 
@@ -786,12 +794,14 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     } else {
         crate::nbt::read_network(r)?;
     }
-    let data = r.byte_array()?;
+    // Ohne Kopie: die Chunkdaten werden unmittelbar aus dem Paketpuffer gelesen. Beim Beitritt
+    // kommen gut 170 solche Pakete, und jede dieser Kopien lebte nur bis zum Ende dieser Funktion.
+    let data = r.byte_slice()?;
 
     let pov = &shared.extras.pov;
     let dimension = pov.world.lock().unwrap().dimension.clone();
     let preferred = pov.preferred_format(shared);
-    let (chunk, format) = Format::probe(preferred, &dimension, &data)?;
+    let (chunk, format) = Format::probe(preferred, &dimension, data)?;
     if pov.format.swap(format.code(), Ordering::Relaxed) != format.code() {
         // Nur beim Wechsel melden – sonst stünde es bei jedem Chunk in der Ausgabe.
         if format != preferred {
@@ -1346,10 +1356,14 @@ fn start_renderer(shared: &Arc<Shared>) {
                 while owned.running.load(Ordering::Relaxed)
                     && owned.extras.pov.live.load(Ordering::Relaxed)
                 {
-                    let started = Instant::now();
-                    if owned.in_game.load(Ordering::Relaxed) {
-                        draw_once(&owned, true, false);
+                    // Zwischen zwei Verbindungen gibt es nichts zu zeichnen; dann muss auch
+                    // nicht im Bildtakt aufgewacht werden.
+                    if !owned.in_game.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
                     }
+                    let started = Instant::now();
+                    draw_once(&owned, true, false);
                     let interval = Duration::from_millis(
                         1000 / owned.extras.pov.fps.load(Ordering::Relaxed).max(1) as u64,
                     );
@@ -2411,9 +2425,7 @@ mod tests {
             std::hint::black_box(&chunk);
         }
         let each = started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
-        println!("
-Chunk einlesen: {:.3} ms je Chunk ({} Runden)
-", each, ROUNDS);
+        println!("\nChunk einlesen: {:.3} ms je Chunk ({} Runden)\n", each, ROUNDS);
     }
 
     #[test]

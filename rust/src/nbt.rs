@@ -124,8 +124,14 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Re
         9 => {
             let inner = r.u8()?;
             let len = r.i32()?;
+            // Eine Liste vom Typ TAG_End darf nur leer sein. Steht dort trotzdem eine Länge,
+            // ist der Lesezeiger schon verschoben – dann lieber abbrechen als eine leere Liste
+            // zurückgeben und den Rest des Pakets aus zufälligen Bytes zusammensetzen.
+            if inner == 0 && len > 0 {
+                return Err(crate::buf::err("NBT-Liste ohne Elementtyp"));
+            }
             let mut items = Vec::new();
-            if len > 0 && inner != 0 {
+            if len > 0 {
                 items.reserve(len.min(4096) as usize);
                 for _ in 0..len {
                     items.push(read_payload(r, inner, depth + 1, budget)?);
@@ -235,6 +241,50 @@ fn decode_modified_utf8(raw: &[u8]) -> String {
         out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
     }
     out
+}
+
+/// Eine Text-Komponente im **JSON**-Format anzeigen.
+///
+/// Nur die Login-Phase schickt Komponenten noch so (`ClientboundLoginDisconnectPacket` trägt
+/// seinen Grund als JSON-Zeichenkette); alles danach ist NBT. Ohne diese Umsetzung stand ein
+/// Kick-Grund als roher JSON-Text auf dem Bildschirm – ausgerechnet die Meldung, die erklären
+/// soll, warum der Login gescheitert ist:
+///
+/// ```text
+/// Login fehlgeschlagen: {"text":"Du bist gesperrt.","color":"red"}
+/// ```
+///
+/// Ist der Text kein JSON (ältere Proxys schicken schlicht Klartext), bleibt er, wie er ist.
+pub fn render_json(text: &str, fmt: Fmt) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => render(&from_json(&value), fmt),
+        Err(_) => text.to_string(),
+    }
+}
+
+/// JSON in dieselbe Baumform bringen, die [`render`] ohnehin versteht.
+///
+/// Die Tiefe ist unkritisch: `serde_json` bricht das Einlesen schon bei 128 Ebenen ab, tiefer
+/// kann dieser Baum also gar nicht werden.
+fn from_json(value: &serde_json::Value) -> Nbt {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Nbt::Str(text.clone()),
+        Value::Bool(flag) => Nbt::Byte(*flag as i8),
+        Value::Number(number) => number
+            .as_i64()
+            .map(Nbt::Long)
+            .or_else(|| number.as_f64().map(Nbt::Double))
+            .unwrap_or(Nbt::End),
+        Value::Array(items) => Nbt::List(items.iter().map(from_json).collect()),
+        Value::Object(fields) => Nbt::Compound(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), from_json(value)))
+                .collect(),
+        ),
+        Value::Null => Nbt::End,
+    }
 }
 
 // ===================== Rendern =====================
@@ -760,6 +810,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Der Kick-Grund der Login-Phase kommt als JSON, nicht als NBT. Ungerendert stand er
+    /// wörtlich auf dem Bildschirm – mit Klammern, Anführungszeichen und allem.
+    #[test]
+    fn json_komponenten_werden_gerendert() {
+        assert_eq!(
+            render_json(r#"{"text":"Du bist gesperrt.","color":"red"}"#, Fmt::Plain),
+            "Du bist gesperrt."
+        );
+        assert_eq!(
+            render_json(r#"{"text":"a","extra":[{"text":"b","bold":true}]}"#, Fmt::Legacy),
+            "§ra§r§lb"
+        );
+        // Eine nackte Zeichenkette ist ebenfalls eine gültige Komponente.
+        assert_eq!(render_json(r#""nur Text""#, Fmt::Plain), "nur Text");
+        // Was kein JSON ist, bleibt unverändert – manche Proxys schicken Klartext.
+        assert_eq!(render_json("Kein JSON!", Fmt::Plain), "Kein JSON!");
+        assert_eq!(render_json("", Fmt::Plain), "");
+        // Und tief verschachtelter Unsinn darf nicht den Stapel sprengen.
+        let tief = format!("{}{}{}", "[".repeat(200), "1", "]".repeat(200));
+        let _ = render_json(&tief, Fmt::Plain);
     }
 
     /// Verschachtelte Komponenten erben den Stil des Elternteils.
