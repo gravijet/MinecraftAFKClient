@@ -26,6 +26,7 @@ fn plan_with_ground() -> Plan {
         mixed_palette: false,
         filled_sections: 1,
         position: (8.0, 16.0, 8.0),
+        broken_chat: false,
         chat: vec!["Willkommen auf dem Testserver".to_string()],
         player_chat: Vec::new(),
         player_chat_filter: 0,
@@ -169,6 +170,33 @@ fn beitritt_auch_auf_1_21_1() {
     let (chat, seen) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
     assert!(chat, "Chat kam nicht an. Ausgabe:\n{}", seen);
 
+    let _ = child.kill();
+}
+
+/// Eine unlesbare Chat-Komponente darf die Zeile kosten, nicht die Verbindung.
+///
+/// Pakete sind einzeln gerahmt – das nächste beginnt ohnehin an einer bekannten Stelle. Vorher
+/// wurde ein Lesefehler nach oben gereicht und beendete die ganze Verbindung: Eine einzige
+/// seltsame Zeile eines Plugins meldete den Client ab.
+#[test]
+fn kaputte_chatzeile_kostet_nicht_die_verbindung() {
+    let mut plan = plan_with_ground();
+    plan.broken_chat = true;
+    plan.chat = vec!["Danach geht es weiter".to_string()];
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let out = common::collect(child.stdout.take().unwrap());
+
+    let (found, log) = common::wait_for(&out, TIMEOUT, "Danach geht es weiter");
+    assert!(
+        found,
+        "die kaputte Zeile hat die Verbindung mitgenommen. Ausgabe:\n{}",
+        log
+    );
+    assert!(
+        child.try_wait().expect("Status").is_none(),
+        "der Client hat sich beendet"
+    );
     let _ = child.kill();
 }
 

@@ -509,6 +509,11 @@ pub struct Plan {
     pub filled_sections: usize,
     /// Startposition des Spielers.
     pub position: (f64, f64, f64),
+    /// Vor dem gewöhnlichen Chat eine Systemmeldung mit unlesbarer Komponente schicken.
+    ///
+    /// So etwas kommt von Plugins, die ihre Komponenten selbst zusammenbauen. Der Client darf
+    /// die Zeile verwerfen – aber nicht die Verbindung.
+    pub broken_chat: bool,
     /// Diese Chatzeilen werden nach dem Beitritt geschickt.
     pub chat: Vec<String>,
     /// Zeilen als **Spieler**-Chat (`ClientboundPlayerChatPacket`), Absender „Hugo".
@@ -710,6 +715,12 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
         let mut done = Buf::packet(ids.cb_chunk_batch_finished);
         done.var_int(plan.chunks.len() as i32);
         conn.send(&done);
+    }
+
+    if plan.broken_chat {
+        let mut chat = Buf::packet(ids.cb_system_chat);
+        chat.u8(99).raw(b"kein NBT").bool(false); // 99 ist kein NBT-Typ
+        conn.send(&chat);
     }
 
     for line in &plan.chat {

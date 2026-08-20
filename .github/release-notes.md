@@ -32,8 +32,10 @@ Diese Runde ist reine Fehlersuche. Vier der behobenen Fehler kosteten unter den 
 Umständen die Verbindung, zwei weitere ließen Chat still verschwinden – und keiner davon wäre am
 Client selbst aufgefallen, sondern nur an einem Server, der sich völlig normal verhält.
 
-Für die sechs oben genannten gibt es je einen Test, der ohne die Änderung fehlschlägt; für den
-Rest zumindest einen, der das richtige Verhalten festhält.
+Fünf davon sind mit einem Test belegt, der ohne die Änderung wirklich fehlschlägt – nachgeprüft,
+nicht behauptet. Zwei hängen an der Zeitabfolge und lassen sich nicht festnageln: die Lücke vor
+dem Umschalten auf Verschlüsselung und die zuletzt geschriebene Zeile beim Beenden. Für sie hält
+je ein Test das richtige Verhalten fest.
 
 ### Behobene Fehler, die die Verbindung kosteten
 
@@ -157,7 +159,8 @@ Ablauftest – geprüft wurde immer nur der Zweig, den draußen kaum jemand benu
   und fällt deshalb niemandem auf, wenn es falsch ist.
 
 Dazu neu: Spielerchat mit und ohne Filterangabe (auf beiden Protokollformaten), Cookies über einen
-Transfer hinweg, die volle Fehlerausgabe, die letzten Chatzeilen vor dem Beenden, die genaue
+Transfer hinweg, eine Systemmeldung mit unlesbarer Komponente (die Zeile darf fallen, die
+Verbindung nicht), die volle Fehlerausgabe, die letzten Chatzeilen vor dem Beenden, die genaue
 Bytelänge des Chat-Pakets je Protokollversion (ab 1.21.11 ist es ein Byte länger – die Prüfsumme),
 und ein Durchlauf **aller** örtlichen `:`-Befehle einschließlich der Eingaben, mit denen niemand
 rechnet (`:click -1`, `:pov size 9999 9999`, `:antiafk 000000000000000000`, `:hand x`).
@@ -166,7 +169,7 @@ Die Ablauftests laufen jetzt außerdem in einem eigenen Konfigurationsverzeichni
 schrieb ein Test mit `:home set` in die echte `movement.json` – ein Test darf weder etwas
 hinterlassen noch davon abhängen, was er vorfindet.
 
-Stand: **124 Modultests und 28 Ablauftests**, alle sieben Bauformen bauen und testen ohne eine
+Stand: **124 Modultests und 29 Ablauftests**, alle sieben Bauformen bauen und testen ohne eine
 einzige Warnung.
 
 ## Rust-Client 2.3.0 (die Runde davor)
