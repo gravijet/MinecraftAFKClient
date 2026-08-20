@@ -274,6 +274,7 @@ Premium, Premium + Items und Ultra:
 | `@event menu open …` / `close` | Menüstatus |
 | `@event slot …` / `lore …` | Gegenstände samt `§`-Formatierung |
 | `@event board …` | Scoreboard samt `§`-Formatierung |
+| `@event output ausgelassen` | die Standardausgabe wird nicht abgeholt, Chatzeilen fallen heraus |
 
 Es gibt kein Reconnect-Ereignis mehr, weil der Rust-Client nach einem Kick nicht erneut verbindet.
 

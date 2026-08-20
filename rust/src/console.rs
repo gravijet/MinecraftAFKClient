@@ -151,6 +151,9 @@ impl Console {
         // Warnungen – und die gingen auf denselben Weg wie das, was gerade nicht abfließt.
         if dropped && !self.inner.overflowing.swap(true, Ordering::SeqCst) {
             self.warn("Die Standardausgabe wird nicht gelesen – Chatzeilen fallen heraus.");
+            // Auch als Ereignis: Mit `--quiet` gäbe es sonst überhaupt keinen Hinweis darauf,
+            // dass gerade Zeilen fehlen – und ein Panel soll das erfahren können.
+            self.event("output", "ausgelassen");
         }
     }
 
@@ -159,7 +162,7 @@ impl Console {
     ///
     /// Mit Zeitlimit: Liest niemand mehr mit, soll das Beenden daran nicht hängen bleiben.
     pub fn flush_chat(&self, limit: Duration) {
-        if !self.inner.writing.load(Ordering::Relaxed) {
+        if !self.inner.writing.load(Ordering::SeqCst) {
             return;
         }
         let until = Instant::now() + limit;
@@ -168,16 +171,16 @@ impl Console {
             let Some(left) = until.checked_duration_since(Instant::now()) else {
                 return;
             };
-            let (next, result) = self.inner.drained.wait_timeout(queue, left).unwrap();
-            queue = next;
-            if result.timed_out() && queue.is_empty() {
-                return;
-            }
+            queue = self.inner.drained.wait_timeout(queue, left).unwrap().0;
         }
     }
 
     /// `true`, sobald der Schreib-Thread läuft.
     fn start_writer(&self) -> bool {
+        // Der Regelfall ist „läuft längst": dann nicht einmal den Arc anfassen.
+        if self.inner.start.is_completed() {
+            return self.inner.writing.load(Ordering::SeqCst);
+        }
         let inner = Arc::clone(&self.inner);
         self.inner.start.call_once(move || {
             let running = std::thread::Builder::new()
