@@ -125,7 +125,11 @@ Rest zumindest einen, der das richtige Verhalten festhält.
   Funktion.
 - **Der POV-Zeichner schläft zwischen zwei Verbindungen, statt im Bildtakt aufzuwachen.**
 - **Eine Statuszeile ist ein Systemaufruf statt zwei** (die Fehlerausgabe ist ungepuffert, und
-  `writeln!` schreibt Text und Zeilenumbruch getrennt).
+  `writeln!` schreibt Text und Zeilenumbruch getrennt), und die Schreib-Threads geben alles auf
+  einmal hinaus, was gerade wartet, statt einen Systemaufruf je Zeile zu machen. Im Regelfall ist
+  das dieselbe eine Zeile wie vorher; bei einem Schwall Chat war der Systemaufruf je Zeile aber
+  der Engpass – der Netz-Thread füllte die Warteschlange schneller, als sie geleert wurde, und
+  die ältesten Zeilen fielen heraus, obwohl das Programm davor durchaus mitlas.
 - **Der Sendeabstand wird vor dem Senden abgewartet statt blind danach.** Derselbe Abstand – aber
   wer eine Minute lang nichts schickt, ist seine nächste Zeile ohne Wartezeit los, und beim
   Beenden hängt der Sender nicht in einem Schlaf fest, den niemand mehr braucht.

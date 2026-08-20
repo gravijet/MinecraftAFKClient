@@ -389,28 +389,38 @@ impl Console {
     }
 }
 
+/// So groß darf der Sammelpuffer des Schreib-Threads bleiben, bevor er wieder eingezogen wird.
+const WRITE_BUFFER_KEEP: usize = 8 * 1024;
+
 /// Der Schreib-Thread eines Stroms: nimmt Zeilen aus seiner Warteschlange und schreibt sie
 /// hinaus. Blockiert er dabei (volle Pipe), betrifft das nur ihn – der Netz-Thread arbeitet
 /// weiter, und der jeweils andere Strom ebenfalls.
+///
+/// Geschrieben wird **alles auf einmal, was gerade dasteht**, nicht Zeile für Zeile. Im
+/// Regelfall ist das genau eine Zeile und damit derselbe eine Schreibvorgang wie vorher. Kommt
+/// dagegen ein Schwall Chat, war ein Systemaufruf je Zeile der Engpass: Der Netz-Thread füllte
+/// die Warteschlange schneller, als der Schreib-Thread sie leeren konnte, und die ältesten
+/// Zeilen fielen heraus – obwohl das Programm davor durchaus mitlas.
 fn write_loop(inner: &Inner, stream: Stream) {
     let channel = inner.channel(stream);
+    let mut batch = String::new();
     loop {
-        let line = {
+        batch.clear();
+        {
             let mut waiting = channel.waiting.lock().unwrap();
-            loop {
-                match waiting.lines.pop_front() {
-                    Some(line) => {
-                        // Ab hier gilt die Zeile als „unterwegs", nicht als erledigt.
-                        waiting.writing = true;
-                        break line;
-                    }
-                    None => waiting = channel.filled.wait(waiting).unwrap(),
-                }
+            while waiting.lines.is_empty() {
+                waiting = channel.filled.wait(waiting).unwrap();
             }
-        };
-        write_direct(stream, &line);
+            for line in waiting.lines.drain(..) {
+                batch.push_str(&line);
+                batch.push('\n');
+            }
+            // Ab hier gelten die Zeilen als „unterwegs", nicht als erledigt.
+            waiting.writing = true;
+        }
+        write_raw(stream, &batch);
         // Erst **nach** dem Schreiben abmelden: Sonst hielte `flush` die Ausgabe schon für leer,
-        // während die letzte Zeile noch im Puffer steht.
+        // während die letzten Zeilen noch im Puffer stehen.
         let mut waiting = channel.waiting.lock().unwrap();
         waiting.writing = false;
         if waiting.lines.is_empty() {
@@ -419,10 +429,14 @@ fn write_loop(inner: &Inner, stream: Stream) {
         }
         drop(waiting);
         channel.drained.notify_all();
+        // Ein einzelner Schwall darf den Puffer nicht dauerhaft groß halten.
+        if batch.capacity() > WRITE_BUFFER_KEEP {
+            batch = String::new();
+        }
     }
 }
 
-/// Eine Zeile in **einem** Schreibvorgang hinausgeben.
+/// Eine einzelne Zeile in **einem** Schreibvorgang hinausgeben.
 ///
 /// Der Zeilenumbruch wird vorher angehängt statt über `writeln!` geschrieben: Die Fehlerausgabe
 /// ist ungepuffert, `writeln!(err, "{}", text)` wären also zwei Systemaufrufe je Zeile. Eine
@@ -431,15 +445,20 @@ fn write_direct(stream: Stream, text: &str) {
     let mut line = String::with_capacity(text.len() + 1);
     line.push_str(text);
     line.push('\n');
+    write_raw(stream, &line);
+}
+
+/// Fertigen Text (Zeilenumbrüche inklusive) hinausgeben.
+fn write_raw(stream: Stream, text: &str) {
     match stream {
         Stream::Out => {
             let mut out = std::io::stdout().lock();
-            let _ = out.write_all(line.as_bytes());
+            let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         }
         Stream::Err => {
             let mut err = std::io::stderr().lock();
-            let _ = err.write_all(line.as_bytes());
+            let _ = err.write_all(text.as_bytes());
         }
     }
 }

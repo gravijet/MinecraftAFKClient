@@ -1043,3 +1043,36 @@ fn sichtweite_passt_zur_bauform() {
     assert!(ok, "--view-distance 12 kam nicht an");
     let _ = child.kill();
 }
+
+/// Messlauf statt Behauptung: Wie viele Zeilen eines Schwalls kommen wirklich an?
+///
+/// Die Warteschlange der Ausgabe ist gedeckelt (256 Zeilen); läuft sie über, fällt die älteste
+/// heraus. Ob das passiert, hängt allein davon ab, ob der Schreib-Thread mit dem Netz-Thread
+/// mithält – und genau daran ändert es etwas, mehrere wartende Zeilen zu **einem**
+/// Schreibvorgang zusammenzufassen statt je Zeile einen Systemaufruf zu machen. Auf einem
+/// Rechner, der ohnehin mithält, kommt mit und ohne dasselbe heraus; auf einem ausgelasteten
+/// fielen vorher die ersten Zeilen heraus, obwohl mitgelesen wurde.
+///
+/// Läuft nicht im normalen Testlauf mit – die Zahl hängt vom Rechner ab. Aufruf:
+/// `cargo test --release --features ultra --test live -- --ignored --nocapture chatzeilen`
+#[test]
+#[ignore]
+fn messlauf_wie_viele_chatzeilen_ankommen() {
+    const ZEILEN: usize = 4000;
+    let mut plan = plan_with_ground();
+    plan.chat = (1..=ZEILEN).map(|n| format!("Zeile {}", n)).collect();
+    plan.close_after_chat = true;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let out = common::collect(child.stdout.take().unwrap());
+    // Bis zum Ende mitlesen: Der Server legt nach dem Chat auf, der Client schreibt noch aus.
+    let (_, log) = common::wait_for(&out, Duration::from_secs(10), "kommt nie");
+    let angekommen = log.lines().filter(|l| l.starts_with("Zeile ")).count();
+    println!(
+        "\nvon {} Chatzeilen angekommen: {} ({} herausgefallen)\n",
+        ZEILEN,
+        angekommen,
+        ZEILEN - angekommen
+    );
+    let _ = child.kill();
+}
