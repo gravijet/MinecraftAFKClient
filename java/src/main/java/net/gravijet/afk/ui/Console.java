@@ -39,8 +39,24 @@ public class Console {
     private final BufferedReader in =
             new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
 
+    /**
+     * So viele Chatzeilen dürfen höchstens auf das Schreiben warten.
+     *
+     * <p>Die Warteschlange war unbegrenzt. Liest das Programm davor die Standardausgabe gerade
+     * nicht mit, läuft die Pipe voll, der Schreib-Thread bleibt im {@code println} stehen – und
+     * die Warteschlange wächst danach ohne Ende weiter. Jetzt fällt die älteste Zeile heraus,
+     * dieselbe Regel wie in der Sendewarteschlange.
+     */
+    private static final int MAX_QUEUE = 256;
+
     private final java.util.concurrent.BlockingQueue<String> queue =
             new java.util.concurrent.LinkedBlockingQueue<>();
+    /**
+     * Läuft die Warteschlange gerade über? Gemeldet wird nur der Beginn – sonst käme je
+     * ausgelassener Zeile eine eigene Warnung.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean overflowing =
+            new java.util.concurrent.atomic.AtomicBoolean();
     private final boolean color;
     private final boolean quiet;
 
@@ -53,16 +69,35 @@ public class Console {
         // Der Ausgabestrom ist gepuffert und der Schreib-Thread ein Daemon: Beim Beenden – ein
         // Kick ohne Reconnect ruft System.exit – verschwanden dadurch die zuletzt empfangenen
         // Chatzeilen, ausgerechnet die mit dem Grund. Der Haken schreibt sie noch heraus.
-        Runtime.getRuntime().addShutdownHook(new Thread(this::flushRemaining, "afk-console-ende"));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::flushOnExit, "afk-console-ende"));
     }
 
-    /** Alles noch Wartende schreiben und den Puffer leeren. Läuft beim Beenden des Prozesses. */
+    /**
+     * Beim Beenden: das noch Wartende hinausschreiben – aber höchstens zwei Sekunden lang.
+     *
+     * <p>Das Schreiben selbst läuft in einem Daemon-Thread, auf den hier nur begrenzt gewartet
+     * wird. Ohne dieses Zeitlimit hinge das Beenden für immer, wenn niemand die Standardausgabe
+     * abholt: {@code println} blockiert dann in der vollen Pipe, und ein hängender Abschluss-Haken
+     * hält die ganze JVM.
+     */
+    private void flushOnExit() {
+        Thread drain = new Thread(this::flushRemaining, "afk-console-rest");
+        drain.setDaemon(true);
+        drain.start();
+        try {
+            drain.join(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        System.err.flush();
+    }
+
+    /** Alles noch Wartende schreiben und den Puffer leeren. */
     private void flushRemaining() {
         for (String line = queue.poll(); line != null; line = queue.poll()) {
             System.out.println(line);
         }
         System.out.flush();
-        System.err.flush();
     }
 
     public boolean isColor() {
@@ -76,7 +111,14 @@ public class Console {
 
     /** Eine Chat-Zeile. Das Einzige, was auf der Standardausgabe erscheint. */
     public void chat(String text) {
+        boolean dropped = false;
+        while (queue.size() >= MAX_QUEUE && queue.poll() != null) {
+            dropped = true;
+        }
         queue.offer(text);
+        if (dropped && overflowing.compareAndSet(false, true)) {
+            warn("Die Standardausgabe wird nicht gelesen – Chatzeilen fallen heraus.");
+        }
     }
 
     private void drain() {
@@ -88,6 +130,8 @@ public class Console {
                 // bei einzelnen Zeilen bleibt die Ausgabe sofort sichtbar.
                 if (queue.isEmpty()) {
                     System.out.flush();
+                    // Wieder aufgeholt: Die nächste Überlaufmeldung darf wieder kommen.
+                    overflowing.set(false);
                 }
             }
         } catch (InterruptedException e) {

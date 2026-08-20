@@ -22,8 +22,8 @@ Ultra-Varianten gibt es bewusst nur für Rust.
 # Was sich seit dem 16. August geändert hat
 
 Stand davor war der Commit, mit dem POV-, Items- und Ultra-Variante dazukamen. Seitdem gab es
-drei Runden: **2.1.0** und **2.2.0** (beide nur Rust) und jetzt **2.3.0** – die erste Runde, die
-auch den Java-Client wieder anfasst.
+drei Runden: **2.1.0**, **2.2.0** und jetzt **2.3.0**. Der Java-Client bekam in 2.1.0 die
+einstellbare Sichtweite, in 2.3.0 jetzt eine Reihe echter Fehlerbehebungen.
 
 ## Rust-Client 2.3.0 (neu)
 
@@ -78,6 +78,14 @@ auch den Java-Client wieder anfasst.
   gegriffen hätte – es kamen ja laufend Daten.
 - **Der Microsoft-Login ignorierte `slow_down`.** Microsoft beantwortet zu häufiges Nachfragen
   irgendwann gar nicht mehr; der Login lief dann in den Zeitablauf, statt zustande zu kommen.
+- **Eine nicht gelesene Standardausgabe hat den Client aus dem Spiel geworfen.** Der Netz-Thread
+  liest den Chat aus dem Paket *und* beantwortet KeepAlive. Er schrieb die Chatzeile bisher selbst
+  – war die Pipe voll, weil das Panel gerade nicht mitlas, blieb er darin stecken und flog mit
+  `disconnect.timeout` heraus, obwohl die Verbindung völlig in Ordnung war. Chat geht jetzt über
+  einen eigenen Thread mit gedeckelter Warteschlange; läuft die über, fällt die älteste Zeile
+  heraus (dieselbe Regel wie beim Senden) und es gibt **eine** Meldung dazu. Der neue Ablauftest
+  lässt die Standardausgabe absichtlich ungelesen volllaufen und prüft, dass weiter geantwortet
+  wird – ohne die Änderung schlägt er fehl.
 
 ### Tempo und Verbrauch
 
@@ -119,7 +127,7 @@ hätte der Emoji-Fehler dort gar nicht auftauchen können. Der Messlauf für die
 außerdem den Weg, den der Client wirklich geht (wiederverwendete Puffer) statt eines
 Testkomforts, den es seit 2.2.0 nicht mehr gibt.
 
-Stand: 113 Modultests und 18 Ablauftests, alle sieben Bauformen bauen ohne eine einzige Warnung.
+Stand: 113 Modultests und 19 Ablauftests, alle sieben Bauformen bauen ohne eine einzige Warnung.
 
 ## Rust-Client 2.1.0 und 2.2.0 (die beiden Runden davor)
 
@@ -136,10 +144,14 @@ Stand: 113 Modultests und 18 Ablauftests, alle sieben Bauformen bauen ohne eine 
   eine negative Paket-ID traf nicht mehr auf die `-1`-Einträge der Versionstabelle.
 - Live-POV 12–14 % schneller, wiederverwendete Bildpuffer, Chat-Ausgabe ohne
   Zwischenzeichenketten, eine 16-Byte-Kopie je Byte weniger in der Verschlüsselung.
+- **Beide** Clients melden die Sichtweite jetzt einstellbar (`--view-distance`, Standard 2, in den
+  POV-Bauformen 6) und nehmen die Optionen des jeweils anderen an, statt am Start abzubrechen.
+  Das ist die einzige Änderung, die in diesen beiden Runden auch den Java-Client betraf.
 
 ## Java-Client (`afk-*.jar`)
 
-Zum ersten Mal seit dem 14. August wieder geändert. Die Protokollarbeit erledigt weiterhin
+In 2.1.0 kam hier nur `--view-distance` dazu (und die Duldung der Rust-Optionen); dies ist die
+erste Runde, die im Java-Client wieder Fehler behebt. Die Protokollarbeit erledigt weiterhin
 MCProtocolLib; alles hier betrifft das Drumherum.
 
 - **Die Kontodatei wurde nicht unteilbar geschrieben.** Ein Abbruch mitten im Speichern hinterließ
@@ -170,6 +182,10 @@ MCProtocolLib; alles hier betrifft das Drumherum.
   Rust-Client abgefangen.
 - Die Sendewarteschlange ist gedeckelt; das Kürzen einer Nachricht zerschneidet kein Emoji mehr in
   der Mitte; `--ansicht` wird als Rust-Option angenommen statt abgelehnt.
+- Die Chat-Warteschlange war unbegrenzt: Liest niemand die Standardausgabe, bleibt der
+  Schreib-Thread in der vollen Pipe stehen und die Schlange wuchs ohne Ende weiter. Jetzt gilt
+  dieselbe Grenze wie im Rust-Client, und das Hinausschreiben beim Beenden hat ein Zeitlimit –
+  sonst hinge ein Abschluss-Haken für immer und mit ihm die ganze JVM.
 
 ## Unverändert
 

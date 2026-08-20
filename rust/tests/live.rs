@@ -27,6 +27,7 @@ fn plan_with_ground() -> Plan {
         filled_sections: 1,
         position: (8.0, 16.0, 8.0),
         chat: vec!["Willkommen auf dem Testserver".to_string()],
+        chat_flood: 0,
         kill: false,
         scoreboard: false,
         menu: false,
@@ -241,6 +242,46 @@ fn menue_inhalt_auf_beiden_komponententabellen() {
 {}", ids.name, log);
         let _ = child.kill();
     }
+}
+
+/// Liest niemand die Standardausgabe mit, darf der Client trotzdem nicht stehen bleiben.
+///
+/// Der Netz-Thread liest den Chat aus dem Paket **und** beantwortet KeepAlive. Schrieb er die
+/// Zeile selbst und war die Pipe voll (Panel gerade beschäftigt), blockierte er darin – und flog
+/// mit `disconnect.timeout` heraus, obwohl die Verbindung völlig in Ordnung war. Der Test füllt
+/// genau diese Pipe: Die Standardausgabe wird bewusst **nicht** gelesen.
+#[test]
+fn voller_ausgabepuffer_blockiert_den_netz_thread_nicht() {
+    let mut plan = plan_with_ground();
+    // Reichlich mehr, als in eine Pipe passt (die fasst je nach System 4 bis 64 KB).
+    plan.chat_flood = 4000;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--events"]);
+    // stdout bleibt absichtlich ungelesen – genau das ist der Fall, um den es geht.
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let (joined, log) = common::wait_for(&err, TIMEOUT, "@event join");
+    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
+
+    // Der Testserver schickt alle 500 ms ein KeepAlive. Antwortet der Client noch, während die
+    // Pipe längst voll ist, hängt er nicht im Schreiben fest.
+    let ids = &common::MC_26_1;
+    let mut antworten = 0;
+    while antworten < 3 {
+        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
+        });
+        assert!(
+            ok,
+            "der Client hat aufgehört, KeepAlive zu beantworten – er steckt im Schreiben fest"
+        );
+        antworten += 1;
+    }
+    assert!(
+        child.try_wait().expect("Status").is_none(),
+        "der Client ist beendet, statt weiterzulaufen"
+    );
+    let _ = child.kill();
 }
 
 /// Der Teleport muss bestätigt werden, sonst holt der Server uns per Rubberband zurück.

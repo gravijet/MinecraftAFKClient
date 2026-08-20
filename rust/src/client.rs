@@ -540,6 +540,11 @@ fn net_loop(shared: Arc<Shared>) {
         // beenden ließe den Prozess deshalb nach einem Kick scheinbar weiterlaufen. Ein
         // Verbindungsabbruch ist für einen einzelnen AFK-Prozess ein Fehlerstatus; ein
         // Dienst/Panel kann ihn dadurch ebenfalls zuverlässig erkennen.
+        //
+        // Vorher aber die noch wartenden Chatzeilen hinausschreiben: Der Chat geht über einen
+        // eigenen Thread (siehe [`Console::chat`]), und `exit` wartet auf keinen Thread. Gerade
+        // die letzten Zeilen vor einem Kick sind die interessanten.
+        shared.console.flush_chat(Duration::from_secs(2));
         std::process::exit(1);
     }
 }

@@ -257,6 +257,7 @@ pub struct Ids {
     pub sb_chat: i32,
     pub sb_chunk_batch_received: i32,
     pub sb_accept_teleportation: i32,
+    pub sb_keep_alive: i32,
     pub sb_move: i32,
     pub sb_use_item: i32,
     pub cb_set_health: i32,
@@ -288,6 +289,7 @@ pub static MC_26_1: Ids = Ids {
     sb_chat: 9,
     sb_chunk_batch_received: 11,
     sb_accept_teleportation: 0,
+    sb_keep_alive: 28,
     sb_move: 31,
     sb_use_item: 67,
     cb_set_health: 104,
@@ -319,6 +321,7 @@ pub static MC_1_21_1: Ids = Ids {
     sb_chat: 6,
     sb_chunk_batch_received: 8,
     sb_accept_teleportation: 0,
+    sb_keep_alive: 24,
     sb_move: 27,
     sb_use_item: 57,
     cb_set_health: 93,
@@ -371,6 +374,8 @@ pub struct Plan {
     pub position: (f64, f64, f64),
     /// Diese Chatzeilen werden nach dem Beitritt geschickt.
     pub chat: Vec<String>,
+    /// So viele zusätzliche Chatzeilen hinterher – genug, um eine ungelesene Pipe zu füllen.
+    pub chat_flood: usize,
     /// Den Spieler nach dem Beitritt sterben lassen (Lebenspunkte 0).
     pub kill: bool,
     /// Eine Seitenleiste aufbauen: Ziel, Anzeigebereich, Team mit Präfix/Suffix und eine Punktzahl.
@@ -515,6 +520,18 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
     for line in &plan.chat {
         let mut chat = Buf::packet(ids.cb_system_chat);
         chat.nbt_text(line).bool(false);
+        conn.send(&chat);
+    }
+
+    // Eine Flut, die keiner abholt: So läuft die Standardausgabe des Clients voll. Schreibt er
+    // sie im Netz-Thread, bleibt er darin stecken und beantwortet kein KeepAlive mehr.
+    for index in 0..plan.chat_flood {
+        let mut chat = Buf::packet(ids.cb_system_chat);
+        chat.nbt_text(&format!(
+            "Flut {} – eine lange Zeile, damit die Pipe des Clients schnell voll ist ........",
+            index
+        ))
+        .bool(false);
         conn.send(&chat);
     }
 

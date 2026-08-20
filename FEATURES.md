@@ -81,6 +81,12 @@ Nullzeichen als Überlänge. Der Client dekodiert genau dieses Format; Emoji, Um
 Sonderzeichen kommen deshalb unverändert auf der Standardausgabe an. Dasselbe gilt für alles
 andere, was als NBT ankommt: Kick-Gründe, Scoreboard-Zeilen, Gegenstandsnamen und Lore.
 
+Geschrieben werden die Chatzeilen von einem eigenen Thread. Der Netz-Thread, der KeepAlive
+beantwortet, darf nicht an einer vollen Ausgabe hängen bleiben – sonst kostet ausgerechnet ein
+gerade beschäftigtes Panel die Verbindung. Holt niemand die Ausgabe ab, fällt nach 256 wartenden
+Zeilen die älteste heraus (mit einer einmaligen Meldung auf der Fehlerausgabe); die Verbindung zu
+halten hat Vorrang vor Zeilen, die ohnehin niemand liest.
+
 ## Bewegung
 
 In Bewegung, Premium, Premium + Items und Ultra:
