@@ -3,6 +3,7 @@ package net.gravijet.afk.auth;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.gravijet.afk.Storage;
 import net.lenni0451.commons.httpclient.HttpClient;
 import net.raphimc.minecraftauth.MinecraftAuth;
 import net.raphimc.minecraftauth.java.JavaAuthManager;
@@ -184,10 +185,14 @@ public class AuthManager {
         return m;
     }
 
+    /**
+     * Konto speichern. Unteilbar (siehe {@link Storage}): Ein Abbruch mitten im Schreiben hätte
+     * sonst eine halbe Kontodatei hinterlassen – und damit ein unbrauchbares Refresh-Token, das
+     * sich nur noch mit {@code --login} ersetzen lässt.
+     */
     private void saveFile(Path file, JavaAuthManager m) throws Exception {
-        Files.createDirectories(file.getParent());
         String json = new GsonBuilder().setPrettyPrinting().create()
                 .toJson(JavaAuthManager.toJson(m));
-        Files.writeString(file, json);
+        Storage.write(file, json);
     }
 }

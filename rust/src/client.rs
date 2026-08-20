@@ -85,7 +85,20 @@ pub struct Shared {
     pub(crate) mover: crate::movement::Mover,
 
     /// Optionale Zustände (Anzeigetafel, Menüs, Gegenstände, POV, Tastenzustand, Anti-AFK).
+    ///
+    /// `extras` allein ist nur der gemeinsame Unterbau (Paket-IDs, Verteilerstelle); erst eine
+    /// der darauf aufbauenden Funktionen liest hier etwas heraus.
     #[cfg(feature = "extras")]
+    #[cfg_attr(
+        not(any(
+            feature = "board",
+            feature = "menu",
+            feature = "pov",
+            feature = "state",
+            feature = "antiafk"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) extras: crate::extras::Extras,
 
     /// Eigene Entitäts-Nummer aus dem Login-Paket. Das Schleich-Paket von 1.21.1 braucht sie.
@@ -182,6 +195,9 @@ impl Client {
     /// zuerst die Gelegenheit; alles Übrige geht an die Bewegung.
     #[cfg(feature = "local")]
     pub fn local_command(&self, verb: &str, arg: &str) {
+        // Ohne Zusatzteile und ohne Bewegung nimmt niemand das Argument entgegen.
+        #[cfg(not(any(feature = "extras", feature = "movement")))]
+        let _ = arg;
         if matches!(verb, "help" | "hilfe" | "?") {
             return self.local_help();
         }
@@ -1047,12 +1063,15 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
             value
         }
     };
-    let new = (
-        relative(0, previous.0, x),
-        relative(1, previous.1, y),
-        relative(2, previous.2, z),
-        relative(3, previous.3 as f64, yaw as f64) as f32,
-        relative(4, previous.4 as f64, pitch as f64) as f32,
+    let new = sane(
+        (
+            relative(0, previous.0, x),
+            relative(1, previous.1, y),
+            relative(2, previous.2, z),
+            relative(3, previous.3 as f64, yaw as f64) as f32,
+            relative(4, previous.4 as f64, pitch as f64) as f32,
+        ),
+        previous,
     );
     shared.set_position(new);
 
@@ -1073,6 +1092,35 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     move_packet.u8(0x01);
     shared.send(move_packet);
     Ok(())
+}
+
+/// Die Weltgrenze von Minecraft. Alles darüber hinaus ist keine Position mehr, sondern ein
+/// Rechenfehler auf der Gegenseite.
+const WORLD_LIMIT: f64 = 3.2e7;
+
+/// Eine vom Server gemeldete Position brauchbar machen.
+///
+/// Sie geht ungeprüft in jede weitere Rechnung ein – und wandert als Bewegungspaket auch wieder
+/// zurück zum Server. Ein `NaN` darin (aus einem kaputten Plugin oder einem übergelaufenen
+/// relativen Teleport) steckte damit dauerhaft im Zustand: `:go` rechnete anschließend nur noch
+/// mit `NaN`, die Live-Ansicht zeichnete nichts mehr, und der Server trennte wegen einer
+/// unmöglichen Bewegung. Unbrauchbare Werte werden deshalb durch die bisherigen ersetzt.
+fn sane(new: Position, previous: Position) -> Position {
+    let coordinate = |value: f64, fallback: f64| {
+        if value.is_finite() && value.abs() <= WORLD_LIMIT {
+            value
+        } else {
+            fallback
+        }
+    };
+    let angle = |value: f32, fallback: f32| if value.is_finite() { value } else { fallback };
+    (
+        coordinate(new.0, previous.0),
+        coordinate(new.1, previous.1),
+        coordinate(new.2, previous.2),
+        angle(new.3, previous.3),
+        angle(new.4, previous.4),
+    )
 }
 
 /// Ergebnis eines Spieler-Chat-Pakets.
@@ -1121,7 +1169,14 @@ fn parse_chat_body(shared: &Arc<Shared>, r: &mut Reader) -> Option<String> {
     r.i64().ok()?; // timestamp
     r.i64().ok()?; // salt
 
-    let seen = r.var_int().ok()?.clamp(0, 20);
+    // Der Server führt höchstens zwanzig zuletzt gesehene Nachrichten mit. Eine andere Zahl
+    // heißt, dass der Lesezeiger schon falsch steht – dann lieber gar keine Zeile anzeigen als
+    // eine aus zufällig gelesenen Bytes. (Vorher wurde die Zahl auf 20 gestaucht und einfach
+    // weitergelesen.)
+    let seen = r.var_int().ok()?;
+    if !(0..=20).contains(&seen) {
+        return None;
+    }
     for _ in 0..seen {
         let id = r.var_int().ok()? - 1;
         if id == -1 {
@@ -1340,6 +1395,21 @@ mod tests {
             ("mc.example.net".into(), 25566, false)
         );
         assert_eq!(parse_host("[::1]:25566"), ("::1".into(), 25566, false));
+    }
+
+    /// Ein `NaN` aus einem kaputten Teleport blieb dauerhaft im Zustand stehen: jede weitere
+    /// Rechnung lieferte danach wieder `NaN`, und der Server trennte wegen unmöglicher Bewegung.
+    #[test]
+    fn unmoegliche_positionen_werden_abgefangen() {
+        let alt = (10.0, 64.0, -20.0, 90.0, 0.0);
+        assert_eq!(sane((1.0, 2.0, 3.0, 4.0, 5.0), alt), (1.0, 2.0, 3.0, 4.0, 5.0));
+        assert_eq!(sane((f64::NAN, 2.0, 3.0, 4.0, 5.0), alt).0, alt.0);
+        assert_eq!(sane((1.0, f64::INFINITY, 3.0, 4.0, 5.0), alt).1, alt.1);
+        assert_eq!(sane((1.0, 2.0, 1e300, 4.0, 5.0), alt).2, alt.2);
+        assert_eq!(sane((1.0, 2.0, 3.0, f32::NAN, 5.0), alt).3, alt.3);
+        assert_eq!(sane((1.0, 2.0, 3.0, 4.0, f32::NAN), alt).4, alt.4);
+        // Genau auf der Weltgrenze bleibt gültig.
+        assert_eq!(sane((WORLD_LIMIT, 2.0, 3.0, 4.0, 5.0), alt).0, WORLD_LIMIT);
     }
 
     /// Die Paket-IDs jeder Version müssen sich eindeutig zuordnen lassen – ein Tippfehler in der

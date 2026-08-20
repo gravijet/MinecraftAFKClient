@@ -37,6 +37,7 @@ wissen, welche vor ihm steht. Dasselbe gilt für den Java-Client in beide Richtu
 | alternativer Handshake-Host | `--fakehost <host[:port]>` |
 | Kompression/Verschlüsselung | automatisch: zlib und AES-128-CFB8 |
 | gemeldete Sichtweite | `--view-distance <2–32>`; Standard 2, in den POV-Bauformen 6 |
+| Zeitlimit beim Verbindungsaufbau | 20 s, danach eine klare Meldung statt stiller Wartezeit |
 | Server-Transfer | wird als Teil derselben Sitzung ohne Wartezeit befolgt |
 | Kick/Verbindungsabbruch | kein automatischer Neuverbindungsversuch; Prozess endet mit Status 1 |
 
@@ -73,6 +74,12 @@ Das ist vom optionalen Anti-AFK getrennt. Der normale Client bewegt sich nicht v
 Nachrichten und Befehle werden bereinigt, auf die Protokollgrenzen gekürzt und über dieselbe
 rate-limitierte Warteschlange gesendet. Chat-Regeln werden nur ausgewertet, wenn mindestens eine
 `chat:`-Regel existiert.
+
+Eingehender Chat kommt als Netzwerk-NBT, und dessen Zeichenketten stehen in Javas
+**modifiziertem** UTF-8: Zeichen über U+FFFF – also jedes Emoji – als zwei Drei-Byte-Folgen, das
+Nullzeichen als Überlänge. Der Client dekodiert genau dieses Format; Emoji, Umlaute und
+Sonderzeichen kommen deshalb unverändert auf der Standardausgabe an. Dasselbe gilt für alles
+andere, was als NBT ankommt: Kick-Gründe, Scoreboard-Zeilen, Gegenstandsnamen und Lore.
 
 ## Bewegung
 
@@ -220,6 +227,18 @@ Der Unterschied kommt aus vier Stellen: Palettenindizes als `u8`/`u16` statt `u3
 Luft-Abschnitte werden gar nicht erst behalten, Abschnitte hängen einzeln an einem `Arc` (ein
 Blockwechsel kopiert nicht mehr den ganzen Chunk), und Chunks weiter als 6 Chunks von der Kamera
 fallen wieder raus.
+
+Die Obergrenze für gehaltene Chunks leitet sich aus genau diesem Radius ab (17×17 = 289 statt
+vormals einer glatten 1024). Sie greift nur in dem kurzen Fenster, in dem noch nicht aufgeräumt
+werden kann – der Server schickt Chunks, bevor er die erste Position schickt. Im Regelbetrieb
+bleiben es die 169 Chunks aus der Tabelle oben.
+
+Wie lange das Einlesen dauert, misst ein zweiter Test am fertigen Chunk (24 Abschnitte, acht davon
+gefüllt, gemischte Palette):
+
+```bash
+cd rust && cargo test --release --features pov -- --ignored --nocapture chunk_einlesen
+```
 
 ## Tastenzustand und Anti-AFK
 

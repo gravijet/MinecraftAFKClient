@@ -18,6 +18,29 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// Nimmt die Gegenstelle nichts mehr an, darf das Senden nicht ewig blockieren: der Sender hält
 /// dabei die Schreibsperre, an der auch der Netz-Thread hängt (KeepAlive!).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// So lange darf der TCP-Aufbau höchstens dauern. `TcpStream::connect` kennt von sich aus **kein**
+/// Zeitlimit: Ein Server, der das SYN verschluckt (Firewall, falscher Port), hing damit je nach
+/// Betriebssystem zwei Minuten am Netz-Thread, ohne dass der Client etwas gemeldet hätte.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Ab dieser Größe gilt ein Puffer als Ausreißer und wird nach dem Gebrauch wieder eingezogen.
+///
+/// Die Puffer bleiben absichtlich zwischen den Paketen bestehen – sonst kostete jedes Paket eine
+/// neue Allokation. Sie wachsen dabei aber auf das **größte je gesehene** Paket und geben diesen
+/// Platz nie wieder her: Ein einzelner 8-MB-Chunk beim Beitritt hielt so für den Rest der Laufzeit
+/// 8 MB belegt, obwohl danach nur noch Chat mit ein paar Dutzend Byte kommt.
+const BUFFER_HIGH_WATER: usize = 1024 * 1024;
+/// So viel bleibt beim Einziehen stehen – genug für jedes gewöhnliche Paket.
+const BUFFER_KEEP: usize = 64 * 1024;
+
+/// Einen ausgeuferten Puffer wieder einziehen (siehe [`BUFFER_HIGH_WATER`]). Der Regelfall kostet
+/// genau einen Vergleich.
+#[inline]
+fn trim(buffer: &mut Vec<u8>) {
+    if buffer.capacity() > BUFFER_HIGH_WATER && buffer.len() <= BUFFER_KEEP {
+        buffer.shrink_to(BUFFER_KEEP);
+    }
+}
 
 // ===================== AES-128-CFB8 =====================
 
@@ -152,9 +175,15 @@ impl PacketReader {
             dec.decrypt(&mut self.frame);
         }
 
+        // Vor dem Leeren: So entscheidet die Größe des **vorigen** Pakets, ob der Puffer
+        // eingezogen wird. Nach dem Leeren wäre er immer leer – und ein Server, der lauter große
+        // Pakete schickt, bekäme dann bei jedem einzelnen erst ein Schrumpfen und sofort danach
+        // wieder ein Wachsen.
+        trim(out);
         out.clear();
         if self.threshold < 0 {
             out.extend_from_slice(&self.frame);
+            trim(&mut self.frame);
             return Ok(());
         }
 
@@ -164,6 +193,7 @@ impl PacketReader {
         let start = self.frame.len() - r.remaining();
         if uncompressed_len == 0 {
             out.extend_from_slice(&self.frame[start..]);
+            trim(&mut self.frame);
             return Ok(());
         }
         if !(0..=32 * 1024 * 1024).contains(&uncompressed_len) {
@@ -178,6 +208,7 @@ impl PacketReader {
         if out.len() != expected {
             return Err(err("Entpackte Laenge weicht ab"));
         }
+        trim(&mut self.frame);
         Ok(())
     }
 }
@@ -237,7 +268,10 @@ impl PacketWriter {
         if let Some(enc) = &mut self.enc {
             enc.encrypt(&mut self.frame);
         }
-        self.stream.write_all(&self.frame)
+        let result = self.stream.write_all(&self.frame);
+        trim(&mut self.body);
+        trim(&mut self.frame);
+        result
     }
 }
 
@@ -255,7 +289,7 @@ pub fn connect(
 ) -> io::Result<(PacketReader, PacketWriter)> {
     let stream = match proxy {
         Some(proxy) => proxy.connect(host, port)?,
-        None => TcpStream::connect((host, port))?,
+        None => dial(host, port)?,
     };
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -273,9 +307,45 @@ pub fn connect(
     ))
 }
 
+/// TCP-Verbindung mit Zeitlimit. `connect_timeout` verlangt eine bereits aufgelöste Adresse,
+/// deshalb wird der Name hier selbst aufgelöst; scheitert jeder Kandidat, kommt der letzte
+/// Fehler heraus (das ist der aussagekräftige – „connection refused" statt „unbekannter Name").
+fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = None;
+    for address in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| err("Serveradresse liess sich nicht aufloesen")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ein einzelnes großes Paket beim Beitritt hielt seinen Puffer für die ganze Laufzeit belegt.
+    #[test]
+    fn grosse_puffer_werden_wieder_eingezogen() {
+        let mut buffer: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
+        buffer.resize(64, 0);
+        trim(&mut buffer);
+        assert!(buffer.capacity() <= BUFFER_KEEP, "{}", buffer.capacity());
+        assert_eq!(buffer.len(), 64, "der Inhalt bleibt unberührt");
+
+        // Gewöhnliche Puffer werden nicht angefasst – sonst kostete jedes Paket eine Allokation.
+        let mut normal: Vec<u8> = Vec::with_capacity(4096);
+        trim(&mut normal);
+        assert_eq!(normal.capacity(), 4096);
+
+        // Ein großer Puffer, der gerade wirklich gebraucht wird, bleibt ebenfalls stehen.
+        let mut busy: Vec<u8> = vec![0; 4 * 1024 * 1024];
+        let before = busy.capacity();
+        trim(&mut busy);
+        assert_eq!(busy.capacity(), before);
+    }
 
     /// Vergleichsimplementierung: CFB8 direkt aus der Definition, ohne Ringspeicher.
     fn reference(key: &[u8; 16], data: &[u8], encrypt: bool) -> Vec<u8> {

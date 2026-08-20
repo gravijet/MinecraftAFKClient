@@ -224,8 +224,11 @@ fn write_container_id(shared: &Shared, w: &mut Writer, id: i32) {
 fn read_content(shared: &Arc<Shared>, r: &mut Reader, slots: usize) -> (Vec<Option<Item>>, usize) {
     let slots = slots.min(MAX_SLOTS);
     let mut items = Vec::with_capacity(slots);
+    // Die vom Server synchronisierte Namensliste einmal je Paket sperren statt einmal je Feld:
+    // eine Doppelkiste hat 90 Felder, und ihr Inhalt kommt bei jeder Änderung neu.
+    let names = shared.extras.item_names.lock().unwrap();
     for index in 0..slots {
-        match read_item_slot(shared, r) {
+        match read_item_slot_with(shared, r, &names) {
             Ok(slot) => {
                 let synced = slot.synced;
                 items.push(slot.item);
@@ -250,14 +253,26 @@ fn read_content(shared: &Arc<Shared>, r: &mut Reader, slots: usize) -> (Vec<Opti
 /// Paket hat immer Vorrang und behält seine Farbcodes.
 #[cfg(feature = "items")]
 fn read_item_slot(shared: &Arc<Shared>, r: &mut Reader) -> std::io::Result<items::Slot> {
+    let names = shared.extras.item_names.lock().unwrap();
+    read_item_slot_with(shared, r, &names)
+}
+
+/// Wie [`read_item_slot`], aber mit bereits geöffneter Namensliste – siehe [`read_content`].
+#[cfg(feature = "items")]
+fn read_item_slot_with(
+    shared: &Shared,
+    r: &mut Reader,
+    names: &[String],
+) -> std::io::Result<items::Slot> {
     let mut slot = items::read_slot(shared.proto, r)?;
     if let Some(item) = slot.item.as_mut() {
         if item.name.is_none() {
-            let live_name = usize::try_from(item.id)
+            item.name = usize::try_from(item.id)
                 .ok()
-                .and_then(|id| shared.extras.item_names.lock().unwrap().get(id).cloned());
-            item.name = live_name
-                .or_else(|| crate::item_names::get(shared.proto.name, item.id).map(str::to_string));
+                .and_then(|id| names.get(id).cloned())
+                .or_else(|| {
+                    crate::item_names::get(shared.proto.name, item.id).map(str::to_string)
+                });
         }
     }
     Ok(slot)
@@ -435,7 +450,12 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
 
     // Übertragen wird die Feldnummer als Short. Alles außerhalb passt schon aufs Kabel nicht und
     // käme beim Server als eine ganz andere Zahl an – dann lieber hier ablehnen.
-    if i16::try_from(slot).is_err() {
+    //
+    // Negative Zahlen gehören ausdrücklich dazu: `-1` kam beim Server als 65535 an und heißt dort
+    // „außerhalb des Fensters" – der Klick warf den Gegenstand also weg, statt ein Feld zu
+    // treffen. Auffallen konnte das nur, solange der Server den Fensterinhalt noch nicht
+    // geschickt hat: vorher greift die Feldanzahl-Prüfung weiter unten gar nicht.
+    if slot < 0 || i16::try_from(slot).is_err() {
         return shared
             .console
             .error(&format!("Feld {} gibt es in keinem Menü.", slot));

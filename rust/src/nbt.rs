@@ -165,12 +165,76 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Re
     })
 }
 
-/// NBT-Strings: u16-Länge, danach (modifiziertes) UTF-8. Ungültige Bytes ersetzen wir,
+/// NBT-Strings: u16-Länge, danach **modifiziertes** UTF-8. Ungültige Bytes ersetzen wir,
 /// statt die Verbindung wegen einer kaputten Chat-Nachricht zu verlieren.
 fn read_nbt_string(r: &mut Reader) -> io::Result<String> {
     let len = r.u16()? as usize;
     let raw = r.bytes(len)?;
-    Ok(String::from_utf8_lossy(raw).into_owned())
+    Ok(decode_modified_utf8(raw))
+}
+
+/// Javas „modifiziertes UTF-8" (das Format von `DataOutput.writeUTF` und damit das aller
+/// NBT-Zeichenketten) in einen Rust-String wandeln.
+///
+/// Es weicht an genau zwei Stellen vom echten UTF-8 ab, und beide kommen im Chat wirklich vor:
+///
+/// * **Zeichen über U+FFFF** – also jedes Emoji – stehen als **zwei** Drei-Byte-Folgen da, je eine
+///   je Ersatzzeichen-Hälfte (CESU-8). Echtes UTF-8 verbietet diese Halbzeichen; `from_utf8_lossy`
+///   machte daraus zwei Ersatzzeichen, aus einem Emoji wurden also zwei Kästchen. Auf einem
+///   Server, der Emoji im Chat, in Gegenstandsnamen oder in der Seitenleiste benutzt, betraf das
+///   jede zweite Zeile.
+/// * **U+0000** steht als `C0 80` statt als Nullbyte (in echtem UTF-8 eine verbotene Überlänge).
+///
+/// Der Regelfall bleibt kostenlos: Ist der Text schon gültiges UTF-8 – und das ist er, solange
+/// weder ein Emoji noch ein Nullzeichen darin vorkommt –, wird er unverändert übernommen.
+fn decode_modified_utf8(raw: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let first = raw[i];
+        // Ein Fortsetzungsbyte holen; fehlt es, ist die Folge abgeschnitten.
+        let part = |offset: usize| -> Option<u32> {
+            raw.get(i + offset)
+                .filter(|b| *b & 0xC0 == 0x80)
+                .map(|b| (*b & 0x3F) as u32)
+        };
+        let (code, width) = match first {
+            0x00..=0x7F => (first as u32, 1),
+            0xC0..=0xDF => match part(1) {
+                Some(b) => ((((first & 0x1F) as u32) << 6) | b, 2),
+                None => (0xFFFD, 1),
+            },
+            0xE0..=0xEF => match (part(1), part(2)) {
+                (Some(b), Some(c)) => ((((first & 0x0F) as u32) << 12) | (b << 6) | c, 3),
+                _ => (0xFFFD, 1),
+            },
+            // Fortsetzungsbyte ohne Anfang; echte Vier-Byte-Folgen gibt es in diesem Format nicht.
+            _ => (0xFFFD, 1),
+        };
+        i += width;
+
+        // Hohe Ersatzzeichen-Hälfte: die tiefe muss unmittelbar folgen, sonst ist es kein Paar.
+        if (0xD800..0xDC00).contains(&code) {
+            let low = match (raw.get(i), raw.get(i + 1), raw.get(i + 2)) {
+                (Some(a), Some(b), Some(c)) if a & 0xF0 == 0xE0 => {
+                    (((a & 0x0F) as u32) << 12) | (((b & 0x3F) as u32) << 6) | (c & 0x3F) as u32
+                }
+                _ => 0,
+            };
+            if (0xDC00..0xE000).contains(&low) {
+                i += 3;
+                let full = 0x1_0000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                out.push(char::from_u32(full).unwrap_or(char::REPLACEMENT_CHARACTER));
+                continue;
+            }
+        }
+        out.push(char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+    out
 }
 
 // ===================== Rendern =====================
@@ -624,6 +688,78 @@ mod tests {
         small.resize(small.len() + 1000, 0);
         let mut r = crate::buf::Reader::new(&small);
         assert!(matches!(read_network(&mut r), Ok(Nbt::List(items)) if items.len() == 1000));
+    }
+
+    /// Emoji stehen in NBT als **zwei** Drei-Byte-Folgen (CESU-8), nicht als Vier-Byte-Zeichen.
+    /// Mit der reinen UTF-8-Lesung wurde daraus je Emoji zwei Ersatzzeichen – auf einem Server,
+    /// der Emoji im Chat oder in der Seitenleiste benutzt, also fast jede Zeile.
+    #[test]
+    fn emoji_ueberleben_das_nbt_format() {
+        // Ein Zeichen so kodieren, wie Java es in NBT schreibt: über U+FFFF als zwei
+        // Drei-Byte-Folgen für die beiden Ersatzzeichen-Hälften.
+        fn cesu8(text: &str, out: &mut Vec<u8>) {
+            for unit in text.encode_utf16() {
+                let unit = unit as u32;
+                out.push(0xE0 | (unit >> 12) as u8);
+                out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                out.push(0x80 | (unit & 0x3F) as u8);
+            }
+        }
+
+        for emoji in ["\u{1F389}", "\u{1F609}", "\u{10FFFF}"] {
+            let mut raw = b"Hi ".to_vec();
+            cesu8(emoji, &mut raw);
+            raw.push(b'!');
+            assert_eq!(decode_modified_utf8(&raw), format!("Hi {}!", emoji));
+        }
+        // Nullzeichen steht als C0 80 statt als Nullbyte.
+        assert_eq!(decode_modified_utf8(&[b'a', 0xC0, 0x80, b'b']), "a\u{0}b");
+        // Alles Normale bleibt unverändert – und ist der schnelle Weg ohne Kopie je Zeichen.
+        assert_eq!(decode_modified_utf8("Grün §6Gold".as_bytes()), "Grün §6Gold");
+        assert_eq!(decode_modified_utf8(&[]), "");
+    }
+
+    /// Kaputte Folgen dürfen nicht abstürzen und nicht in eine Endlosschleife laufen – die Bytes
+    /// kommen vom Server.
+    #[test]
+    fn kaputte_folgen_stuerzen_nicht_ab() {
+        for raw in [
+            vec![0xED, 0xA0, 0xBD],             // hohe Hälfte ohne tiefe
+            vec![0xED, 0xB8, 0x89],             // tiefe Hälfte ohne hohe
+            vec![0xE0],                         // abgeschnitten
+            vec![0xC2],                         // abgeschnitten
+            vec![0x80, 0x80, 0x80],             // nur Fortsetzungsbytes
+            vec![0xED, 0xA0, 0xBD, 0x41],       // hohe Hälfte, dann ASCII
+            vec![0xFF, 0xFE, 0xFD],             // gibt es in keinem UTF-8
+        ] {
+            let text = decode_modified_utf8(&raw);
+            assert!(text.chars().count() <= raw.len(), "{:?} -> {:?}", raw, text);
+        }
+    }
+
+    /// Beliebige Bytes dürfen den Leser weder abstürzen lassen noch in eine Endlosschleife
+    /// schicken – sie kommen vom Server, und der Client läuft mit `panic = "abort"`: ein Absturz
+    /// im Netz-Thread reißt den ganzen Prozess mit.
+    #[test]
+    fn beliebige_bytes_stuerzen_nicht_ab() {
+        let mut seed = 0x853C_49E6_748F_EA9Bu64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (random() % 512) as usize;
+            let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            let mut r = crate::buf::Reader::new(&data);
+            if let Ok(tag) = read_network(&mut r) {
+                // Was gelesen wurde, muss sich auch in allen drei Formaten ausgeben lassen.
+                for fmt in [Fmt::Plain, Fmt::Ansi, Fmt::Legacy] {
+                    let _ = render(&tag, fmt);
+                }
+            }
+        }
     }
 
     /// Verschachtelte Komponenten erben den Stil des Elternteils.

@@ -149,8 +149,13 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
     }
     #[cfg(not(feature = "pov"))]
     {
-        if options.pov_size.is_some() || options.pov_autostart.is_some() {
-            console.warn("--pov/--pov-size brauchen die POV- oder Ultra-Datei; wird ignoriert.");
+        if options.pov_size.is_some()
+            || options.pov_autostart.is_some()
+            || options.pov_fps.is_some()
+        {
+            console.warn(
+                "--pov/--pov-size/--pov-fps brauchen die POV- oder Ultra-Datei; wird ignoriert.",
+            );
         }
     }
     #[cfg(all(feature = "state", feature = "pov"))]

@@ -329,8 +329,12 @@ impl Protocol {
     /// Zahlenvergleiche.
     #[cfg(feature = "extras")]
     fn incoming_extra(&self, id: i32) -> In {
+        // Eine Bauform, die nur Tastenzustände sendet (`--features state`), liest überhaupt kein
+        // Zusatzpaket – dann bleiben beide hier ungenutzt.
         #[allow(unused_variables)]
         let e = &self.extra;
+        #[allow(unused_variables)]
+        let id = id;
 
         // Welt- und Entitätspakete kommen im Sekundentakt – die stehen deshalb vorn.
         #[cfg(feature = "pov")]

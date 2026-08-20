@@ -13,6 +13,13 @@ const MIN_REPEAT_SECONDS: u64 = 5;
 const MIN_CHAT_DELAY_MS: u64 = 200;
 /// Untergrenze für die Anti-AFK-Aktionen: häufiger ist kein Zappeln mehr, sondern auffällig.
 const MIN_ANTIAFK_SECONDS: u64 = 15;
+/// Obergrenze für jede Zeitangabe in Sekunden (30 Tage).
+///
+/// Nicht Willkür, sondern eine Notbremse: Aus `--join-delay` und `--cmd <sek>:` werden
+/// `Duration`-Werte, die der Befehls-Planer addiert – und `Duration + Duration` **bricht das
+/// Programm ab**, sobald die Summe überläuft. Ein vertipptes `--join-delay 000000000000000000`
+/// hat den Client damit beim ersten Befehl beendet statt eine Meldung zu zeigen.
+const MAX_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Verzeichnis mit `accounts/` (und `movement.json` im Bewegungs-Build). Reine Pfadauskunft:
 /// liegt nur das alte `hugoafk`-Verzeichnis vor, wird dessen Pfad geliefert.
@@ -48,6 +55,7 @@ pub fn migrate() {
 pub fn write_atomic(path: &std::path::Path, text: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        private(parent);
     }
     let mut temporary = path.to_path_buf();
     // Nicht `with_extension`: die Endung muss erhalten bleiben, damit ein liegengebliebener
@@ -56,21 +64,46 @@ pub fn write_atomic(path: &std::path::Path, text: &str) {
     name.push(".neu");
     temporary.set_file_name(name);
 
-    if std::fs::write(&temporary, text).is_err() {
-        return;
+    // Vor dem Umbenennen auf die Platte zwingen. Ohne das darf das Dateisystem den Namen schon
+    // umhängen, während der Inhalt noch im Zwischenspeicher liegt – nach einem Stromausfall
+    // stünde dann eine leere Datei am Platz der alten, gültigen.
+    match std::fs::File::create(&temporary) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if file.write_all(text.as_bytes()).is_err() {
+                let _ = std::fs::remove_file(&temporary);
+                return;
+            }
+            let _ = file.sync_all();
+        }
+        Err(_) => return,
     }
-    // Unter Windows scheitert `rename` auf eine vorhandene Datei – dort muss die alte zuerst weg.
-    // Das ist genau das Fenster, das es sonst gar nicht gäbe; es bleibt aber ungleich kleiner als
-    // ein vollständiger Schreibvorgang.
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(path);
+    private(&temporary);
+
+    // `rename` ersetzt eine vorhandene Datei auf allen Zielsystemen unteilbar – unter Windows
+    // über `MoveFileEx` mit `MOVEFILE_REPLACE_EXISTING`. Die Datei vorher zu löschen (wie hier
+    // früher) wäre genau das Fenster, das es zu vermeiden gilt: dazwischen gibt es gar keine.
     if std::fs::rename(&temporary, path).is_err() {
         // Ließ sich nicht umbenennen (etwa über Dateisystemgrenzen hinweg): lieber direkt
         // schreiben als gar nicht zu speichern.
         let _ = std::fs::write(path, text);
+        private(path);
         let _ = std::fs::remove_file(&temporary);
     }
 }
+
+/// Nur für den eigenen Benutzer lesbar. In diesen Dateien stehen Microsoft-Token; auf einem
+/// gemeinsam genutzten Rechner konnte sie bisher jeder mitlesen (`fs::write` legt mit 0644 an).
+/// Unter Windows regeln das die vererbten Zugriffsrechte des Benutzerprofils.
+#[cfg(unix)]
+fn private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if path.is_dir() { 0o700 } else { 0o600 };
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn private(_path: &std::path::Path) {}
 
 fn config_base() -> PathBuf {
     match std::env::var("XDG_CONFIG_HOME") {
@@ -137,8 +170,12 @@ pub struct Options {
     pub pov_autostart: Option<bool>,
     /// Bildgröße in Pixeln, falls auf der Kommandozeile vorgegeben.
     pub pov_size: Option<(usize, usize)>,
-    /// Bilder je Sekunde.
-    pub pov_fps: usize,
+    /// Bilder je Sekunde, falls vorgegeben. `None` = die Vorgabe der Bauform.
+    ///
+    /// Bewusst optional wie die beiden anderen POV-Optionen: Nur so lässt sich beim Start sagen,
+    /// dass eine Bauform ohne Live-Ansicht die Angabe gar nicht umsetzen kann. Vorher stand hier
+    /// eine feste 8, und `--pov-fps` verpuffte im schlanken Client wortlos.
+    pub pov_fps: Option<usize>,
 
     /// Optionen, die dieser Client angenommen, aber nicht umgesetzt hat (weil es sie nur im
     /// Java-Client gibt). Wird beim Start einmal genannt.
@@ -171,7 +208,7 @@ impl Default for Options {
             view_distance: DEFAULT_VIEW_DISTANCE,
             pov_autostart: None,
             pov_size: None,
-            pov_fps: 8,
+            pov_fps: None,
             ignored: Vec::new(),
         }
     }
@@ -214,16 +251,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             "--fakehost" => o.fakehost = Some(parse_fakehost(&value("--fakehost")?)?),
             "--on" => o.rules.push(parse_rule(&value("--on")?)?),
             "--on-cooldown" => {
-                o.rule_cooldown_seconds = number(&value("--on-cooldown")?, "--on-cooldown")?
+                o.rule_cooldown_seconds = seconds(&value("--on-cooldown")?, "--on-cooldown")?
             }
             "--events" => o.events = true,
             "--antiafk" => {
                 // 0 heißt ausdrücklich „aus"; alles andere bekommt die Untergrenze.
-                let seconds = number(&value("--antiafk")?, "--antiafk")?;
-                o.antiafk_seconds = if seconds == 0 {
+                let every = seconds(&value("--antiafk")?, "--antiafk")?;
+                o.antiafk_seconds = if every == 0 {
                     0
                 } else {
-                    seconds.max(MIN_ANTIAFK_SECONDS)
+                    every.max(MIN_ANTIAFK_SECONDS)
                 };
             }
             "--sneak" => o.sneak = true,
@@ -245,7 +282,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 };
             }
             "--pov-size" | "--pov-groesse" => o.pov_size = Some(parse_size(&value("--pov-size")?)?),
-            "--pov-fps" => o.pov_fps = number(&value("--pov-fps")?, "--pov-fps")?.clamp(1, 20) as usize,
+            "--pov-fps" => {
+                o.pov_fps = Some(number(&value("--pov-fps")?, "--pov-fps")?.clamp(1, 20) as usize)
+            }
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
                 o.protocol = Protocol::find(&name).ok_or_else(|| {
@@ -257,10 +296,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 })?;
             }
             "-c" | "--cmd" => o.commands.push(parse_command(&value("--cmd")?)?),
-            "--join-delay" => join_delay = number(&value("--join-delay")?, "--join-delay")?,
+            "--join-delay" => join_delay = seconds(&value("--join-delay")?, "--join-delay")?,
             "--chat-delay" => {
-                o.chat_min_delay_ms =
-                    number(&value("--chat-delay")?, "--chat-delay")?.max(MIN_CHAT_DELAY_MS)
+                o.chat_min_delay_ms = number(&value("--chat-delay")?, "--chat-delay")?
+                    .clamp(MIN_CHAT_DELAY_MS, MAX_SECONDS * 1000)
             }
             "--no-color" => o.color = false,
             "-q" | "--quiet" => o.quiet = true,
@@ -457,7 +496,7 @@ fn parse_command(input: &str) -> Result<AutoCommand, String> {
         // Nur zerlegen, wenn vorn wirklich eine Zahl steht – sonst zerschnitte man Befehle,
         // die selbst einen Doppelpunkt tragen.
         Some((head, rest)) if head.trim().parse::<u64>().is_ok() => {
-            (head.trim().parse::<u64>().unwrap(), rest)
+            (head.trim().parse::<u64>().unwrap().min(MAX_SECONDS), rest)
         }
         _ => (0, input),
     };
@@ -480,6 +519,11 @@ fn number(text: &str, name: &str) -> Result<u64, String> {
     text.trim()
         .parse::<u64>()
         .map_err(|_| format!("{} braucht eine Zahl, nicht '{}'.", name, text))
+}
+
+/// Zahl in Sekunden – mit Obergrenze, siehe [`MAX_SECONDS`].
+fn seconds(text: &str, name: &str) -> Result<u64, String> {
+    Ok(number(text, name)?.min(MAX_SECONDS))
 }
 
 #[cfg(test)]
@@ -680,6 +724,30 @@ mod tests {
         assert!(parse_args(&["x", "--kein-schalter"]).is_err());
     }
 
+    /// Aus den Sekundenangaben werden `Duration`-Werte, die der Befehls-Planer addiert. Ohne
+    /// Obergrenze brach das Programm beim ersten Befehl ab („overflow when adding durations"),
+    /// statt eine vertippte Zahl einfach zu deckeln.
+    #[test]
+    fn zeitangaben_haben_eine_obergrenze() {
+        let riesig = "000000000000000000"; // u64::MAX – parst, überläuft aber jede Addition
+        let o = options(&["x", "--join-delay", riesig, "-c", &format!("{}:/afk", riesig)]);
+        assert_eq!(o.commands[0].delay_seconds, MAX_SECONDS);
+        assert_eq!(o.commands[0].repeat_seconds, MAX_SECONDS);
+        // Und die Summe, an der es hing, bleibt bildbar.
+        let at = std::time::Duration::from_secs(o.commands[0].delay_seconds);
+        let repeat = std::time::Duration::from_secs(o.commands[0].repeat_seconds);
+        assert!(at.checked_add(repeat).is_some());
+
+        assert_eq!(options(&["x", "--antiafk", riesig]).antiafk_seconds, MAX_SECONDS);
+        assert_eq!(options(&["x", "--on-cooldown", riesig]).rule_cooldown_seconds, MAX_SECONDS);
+        assert_eq!(
+            options(&["x", "--chat-delay", riesig]).chat_min_delay_ms,
+            MAX_SECONDS * 1000
+        );
+        // Eine Zahl, die gar keine ist, bleibt ein Fehler.
+        assert!(parse_args(&["x", "--join-delay", "-1"]).is_err());
+    }
+
     /// Ohne Live-Ansicht wird kein Chunk gelesen – dann muss die kleinste Sichtweite raus.
     #[test]
     fn sichtweite_hat_grenzen() {
@@ -693,7 +761,10 @@ mod tests {
     fn pov_groesse_und_takt() {
         assert_eq!(options(&["x", "--pov-size", "160x80"]).pov_size, Some((160, 80)));
         assert_eq!(options(&["x", "--pov-size", "80*40"]).pov_size, Some((80, 40)));
-        assert_eq!(options(&["x", "--pov-fps", "99"]).pov_fps, 20);
+        assert_eq!(options(&["x", "--pov-fps", "99"]).pov_fps, Some(20));
+        assert_eq!(options(&["x", "--pov-fps", "4"]).pov_fps, Some(4));
+        // Ohne Angabe entscheidet die Bauform – daran hängt auch die Warnung beim Start.
+        assert_eq!(options(&["x"]).pov_fps, None);
         // Ohne Angabe entscheidet die Bauform, nicht die Optionsauswertung.
         assert_eq!(options(&["x"]).pov_autostart, None);
         assert_eq!(options(&["x", "--pov", "an"]).pov_autostart, Some(true));

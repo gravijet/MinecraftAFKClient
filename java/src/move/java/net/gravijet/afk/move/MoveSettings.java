@@ -2,6 +2,7 @@ package net.gravijet.afk.move;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import net.gravijet.afk.Storage;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -119,19 +120,40 @@ public class MoveSettings {
         }
     }
 
+    /**
+     * Eine unabhängige Kopie – Grundlage jeder Änderung (siehe {@code Movement.update}).
+     *
+     * <p>Die Wegpunkte werden dabei mitkopiert, nicht geteilt: sonst änderte ein {@code :route
+     * add} weiterhin genau die Liste, die ein laufender Heimlauf gerade abarbeitet.
+     */
+    public MoveSettings copy() {
+        MoveSettings copy = new MoveSettings();
+        copy.homeEnabled = homeEnabled;
+        copy.homeDelaySeconds = homeDelaySeconds;
+        copy.home = home == null ? null : new Spot(home.x, home.y, home.z, home.yaw, home.pitch);
+        copy.route = new ArrayList<>(route);
+        copy.walkSpeed = walkSpeed;
+        copy.turnSpeed = turnSpeed;
+        copy.maxWalkSeconds = maxWalkSeconds;
+        copy.autoFall = autoFall;
+        copy.fallCheckBlocks = fallCheckBlocks;
+        copy.file = file;
+        return copy;
+    }
+
     /** Strecke je Tick in Blöcken. */
     public double step() {
         return walkSpeed * Movement.TICK_MILLIS / 1000.0;
     }
 
+    /** Unteilbar speichern – siehe {@link Storage}. */
     public void save() {
         if (file == null) {
             return;
         }
         normalize();
         try {
-            Files.createDirectories(file.getParent());
-            Files.writeString(file, GSON.toJson(this));
+            Storage.write(file, GSON.toJson(this));
         } catch (Exception ignored) {
             // Speichern ist nicht kritisch – still ignorieren.
         }

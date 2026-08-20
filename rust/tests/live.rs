@@ -27,6 +27,10 @@ fn plan_with_ground() -> Plan {
         filled_sections: 1,
         position: (8.0, 16.0, 8.0),
         chat: vec!["Willkommen auf dem Testserver".to_string()],
+        kill: false,
+        scoreboard: false,
+        menu: false,
+        transfer_to: None,
         hold_secs: 20,
     }
 }
@@ -71,6 +75,172 @@ fn beitritt_auch_auf_1_21_1() {
     assert!(chat, "Chat kam nicht an. Ausgabe:\n{}", seen);
 
     let _ = child.kill();
+}
+
+/// Emoji und Sonderzeichen im Chat müssen heil ankommen.
+///
+/// Minecraft schickt Chat als NBT, und NBT-Zeichenketten stehen in Javas modifiziertem UTF-8:
+/// Zeichen über U+FFFF – also jedes Emoji – als **zwei** Drei-Byte-Folgen. Der Client las das als
+/// gewöhnliches UTF-8 und machte daraus zwei Ersatzzeichen; auf einem Server, der Emoji im Chat
+/// benutzt, war damit fast jede zweite Zeile verstümmelt.
+#[test]
+fn emoji_im_chat_kommen_heil_an() {
+    const LINE: &str = "Hallo \u{1F389} Welt \u{1F60A} – Gruesse \u{20AC}";
+    let mut plan = plan_with_ground();
+    plan.chat = vec![LINE.to_string()];
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let out = common::collect(child.stdout.take().unwrap());
+
+    let (found, seen) = common::wait_for(&out, TIMEOUT, LINE);
+    assert!(
+        found,
+        "Emoji kamen nicht heil an. Ausgabe:\n{}",
+        seen.escape_debug()
+    );
+    assert!(
+        !seen.contains('\u{FFFD}'),
+        "Ersatzzeichen in der Ausgabe:\n{}",
+        seen.escape_debug()
+    );
+    let _ = child.kill();
+}
+
+/// Stirbt der Spieler, muss der Client von selbst wieder einsteigen – sonst steht er bis in alle
+/// Ewigkeit auf dem Todesbildschirm, ohne dass jemand etwas davon merkt. Zugleich die Probe auf
+/// `--on death=`: die Regel muss genau dann feuern.
+#[test]
+fn tod_loest_respawn_und_regel_aus() {
+    let mut plan = plan_with_ground();
+    plan.kill = true;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &["--no-color", "--events", "--on", "death=/spawn"],
+    );
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let respawned = common::wait_note(&server.notes, TIMEOUT, |note| {
+        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_client_command)
+    });
+    assert!(respawned, "der Client hat nicht von selbst respawnt");
+
+    let fired = common::wait_note(&server.notes, TIMEOUT, |note| {
+        matches!(note, Note::Command(c) if c == "spawn")
+    });
+    let (_, log) = common::wait_for(&err, Duration::from_millis(300), "@event death");
+    assert!(fired, "--on death hat nicht ausgeloest. Ausgabe:\n{}", log);
+    let _ = child.kill();
+}
+
+/// Ein vom Server angeordneter Transfer ist kein Kick: der Client muss die neue Adresse
+/// übernehmen und dort neu beitreten. Genau das ist der Unterschied zum Verbindungsabbruch, nach
+/// dem sich der Rust-Client bewusst beendet.
+#[test]
+fn server_transfer_wird_befolgt() {
+    // Ziel zuerst starten, damit seine Adresse feststeht.
+    let ziel = common::start(&common::MC_26_1, plan_with_ground());
+    let mut plan = plan_with_ground();
+    plan.chat.clear();
+    plan.transfer_to = Some(("127.0.0.1".to_string(), ziel.port));
+    let start = common::start(&common::MC_26_1, plan);
+
+    let mut child = common::spawn_client(start.port, "26.1", &["--no-color", "--events"]);
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let angekommen = common::wait_note(&ziel.notes, TIMEOUT, |note| {
+        matches!(note, Note::Joined)
+    });
+    let (_, log) = common::wait_for(&err, Duration::from_millis(300), "Server-Transfer");
+    assert!(
+        angekommen,
+        "der Client ist dem Transfer nicht gefolgt. Ausgabe:\n{}",
+        log
+    );
+    let _ = child.kill();
+}
+
+/// Die Seitenleiste muss auf allen drei Feldreihenfolgen des Team-Pakets herauskommen.
+///
+/// Auf fast jedem Server ist der Eintrag selbst ein unsichtbarer Platzhalter; der sichtbare Text
+/// steckt in Präfix und Suffix des Teams. Wird davon auch nur ein Feld falsch gelesen, steht in
+/// der Anzeige Müll – und zwar genau auf einer der vier Versionen.
+#[cfg(feature = "board")]
+#[test]
+fn seitenleiste_auf_allen_feldreihenfolgen() {
+    for ids in [&common::MC_1_21_1, &common::MC_26_1, &common::MC_26_2] {
+        let mut plan = plan_with_ground();
+        plan.scoreboard = true;
+        let server = common::start(ids, plan);
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let err = common::collect(child.stderr.take().unwrap());
+
+        let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
+        assert!(joined, "{}: kein Beitritt. Ausgabe:
+{}", ids.name, log);
+
+        let (found, log) =
+            common::poll_command(&mut stdin, &err, TIMEOUT, ":board", "Rang: hugo *");
+        assert!(
+            found,
+            "{}: die Seitenleiste kam nicht richtig heraus. Ausgabe:
+{}",
+            ids.name, log
+        );
+        assert!(
+            log.contains("Testserver"),
+            "{}: die Überschrift fehlt. Ausgabe:
+{}",
+            ids.name,
+            log
+        );
+        let _ = child.kill();
+    }
+}
+
+/// Menüinhalte müssen auf beiden Komponenten-Tabellen herauskommen.
+///
+/// Ein Gegenstand besteht seit 1.20.5 aus einer Liste von Komponenten **ohne Längenangabe**: Wer
+/// eine davon nicht kennt, findet auch die nächste nicht mehr. Die Tabelle dazu unterscheidet
+/// sich zwischen 1.21.1 und den neueren Versionen erheblich – ein Fehler darin fällt nur genau
+/// hier auf.
+#[cfg(feature = "items")]
+#[test]
+fn menue_inhalt_auf_beiden_komponententabellen() {
+    for ids in [&common::MC_1_21_1, &common::MC_26_1] {
+        let mut plan = plan_with_ground();
+        plan.menu = true;
+        let server = common::start(ids, plan);
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let err = common::collect(child.stderr.take().unwrap());
+
+        let (opened, log) = common::wait_for(&err, TIMEOUT, "Menü geöffnet: Warp-Menü");
+        assert!(opened, "{}: kein Menü gemeldet. Ausgabe:
+{}", ids.name, log);
+
+        let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":menu", "Zum Spawn");
+        assert!(
+            found,
+            "{}: der Gegenstandsname fehlt. Ausgabe:
+{}",
+            ids.name, log
+        );
+        assert!(
+            !log.contains("Ab Feld"),
+            "{}: der Inhalt war nicht vollständig lesbar. Ausgabe:
+{}",
+            ids.name,
+            log
+        );
+
+        let (lore, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":slot 4", "kostet nichts");
+        assert!(lore, "{}: die Lore fehlt. Ausgabe:
+{}", ids.name, log);
+        let _ = child.kill();
+    }
 }
 
 /// Der Teleport muss bestätigt werden, sonst holt der Server uns per Rubberband zurück.

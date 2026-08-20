@@ -60,6 +60,7 @@ public final class Options {
             java.util.Map.entry("--on-cooldown", true),
             java.util.Map.entry("--antiafk", true),
             java.util.Map.entry("--pov", true),
+            java.util.Map.entry("--ansicht", true),
             java.util.Map.entry("--pov-size", true),
             java.util.Map.entry("--pov-groesse", true),
             java.util.Map.entry("--pov-fps", true),
@@ -144,10 +145,53 @@ public final class Options {
                             + ".jar --server mc.example.net");
         }
         o.server = o.server.trim();
+        checkServer(o.server);
         for (String raw : rawCommands) {
             o.commands.add(parseCommand(raw, joinDelay));
         }
         return o;
+    }
+
+    /**
+     * Serveradresse auf einen brauchbaren Port prüfen.
+     *
+     * <p>Zerlegt wird sie später in {@code Main.parseHost}; dort ist ein unlesbarer Port
+     * stillschweigend zu 25565 geworden. Ein Tippfehler wie {@code mc.example.net:2556x} führte
+     * damit zu einer Verbindung auf einen ganz anderen Port – und zur Fehlersuche am falschen
+     * Ende. Der Rust-Client prüft an derselben Stelle genauso.
+     */
+    private static void checkServer(String server) {
+        String port;
+        if (server.startsWith("[")) {
+            // `[::1]:25565`: nur was hinter der schließenden Klammer steht, kann ein Port sein.
+            int end = server.indexOf(']');
+            if (end < 0) {
+                throw new IllegalArgumentException(
+                        "Serveradresse ohne schließende Klammer: '" + server + "'");
+            }
+            String rest = server.substring(end + 1);
+            port = rest.startsWith(":") ? rest.substring(1) : null;
+        } else if (server.indexOf(':') != server.lastIndexOf(':')) {
+            port = null; // nackte IPv6-Adresse – da ist kein Port dabei
+        } else {
+            int colon = server.lastIndexOf(':');
+            port = colon < 0 ? null : server.substring(colon + 1);
+        }
+        if (port == null) {
+            return;
+        }
+        // Port 0 ist kein Ziel, sondern die Bitte an das Betriebssystem, sich einen auszusuchen.
+        try {
+            int value = Integer.parseInt(port.trim());
+            if (value >= 1 && value <= 65535) {
+                return;
+            }
+        } catch (NumberFormatException ignored) {
+            // fällt unten in dieselbe Meldung
+        }
+        throw new IllegalArgumentException(
+                "Server-Port ist keine Zahl zwischen 1 und 65535: '" + port
+                        + "'. Beispiel: mc.example.net:25565");
     }
 
     /** {@code --cmd /afk} (einmalig) oder {@code --cmd 300:/afk} (alle 300 s). */

@@ -44,8 +44,6 @@ use std::time::{Duration, Instant};
 
 const SECTION_BLOCKS: usize = 16 * 16 * 16;
 const SECTION_BIOMES: usize = 4 * 4 * 4;
-/// Notbremse. Normalerweise begrenzt die angeforderte Sichtweite die Zahl der Chunks vorher.
-const MAX_CHUNKS: usize = 1024;
 const MAX_ENTITIES: usize = 4096;
 const MAX_SECTIONS: usize = 256;
 /// Weiter entfernte Chunks kann die Ansicht nie sehen: [`MAX_DISTANCE`] sind 72 Blöcke, ein Strahl
@@ -53,6 +51,14 @@ const MAX_SECTIONS: usize = 256;
 /// sobald ein neuer Chunk ankommt – ohne das lassen Server, die nie ein `ForgetChunk` schicken,
 /// den Speicher unbegrenzt wachsen.
 const KEEP_CHUNK_RADIUS: i32 = 6;
+/// Notbremse für die Zeit, in der noch nicht aufgeräumt werden kann (der Server schickt Chunks,
+/// bevor er die erste Position schickt).
+///
+/// Abgeleitet aus [`KEEP_CHUNK_RADIUS`] statt frei gegriffen: Aufgeräumt wird auf 13x13 Chunks,
+/// mehr als zwei Chunks Anlauf darüber hinaus kann keine Ansicht je brauchen. Vorher stand hier
+/// eine glatte 1024 – rund das Sechsfache, und ein Chunk mit den üblichen acht gefüllten
+/// Abschnitten wiegt gut 35 KB. Aus höchstens 40 MB werden damit höchstens 11.
+const MAX_CHUNKS: usize = (2 * (KEEP_CHUNK_RADIUS as usize + 2) + 1).pow(2);
 const HORIZONTAL_FOV: f64 = 90.0;
 const MAX_DISTANCE: f64 = 72.0;
 const DEFAULT_WIDTH: usize = 64;
@@ -62,6 +68,8 @@ const MIN_WIDTH: usize = 24;
 const MAX_WIDTH: usize = 160;
 const MIN_HEIGHT: usize = 12;
 const MAX_HEIGHT: usize = 80;
+/// Bilder je Sekunde ohne `--pov-fps`.
+const DEFAULT_FPS: usize = 8;
 /// Auch ein unverändertes Bild wird spätestens so oft wiederholt – ein Programm davor soll an
 /// der Stille nicht ablesen, die Ansicht sei tot.
 const REPEAT_UNCHANGED: Duration = Duration::from_secs(2);
@@ -115,11 +123,17 @@ enum Indices {
 }
 
 impl Indices {
-    fn new(values: &[u16], palette_len: usize) -> Indices {
+    /// Aus den rohen Paletten-Steckplätzen einen Abschnitt bauen und dabei gleich umnummerieren.
+    ///
+    /// Bewusst in einem Durchgang: vorher entstand erst ein voller Zwischenvektor mit 4096
+    /// `u16`-Einträgen und daraus dann der endgültige. Das waren je Chunk-Abschnitt 8 KB, die
+    /// unmittelbar wieder weggeworfen wurden – beim Beitritt mit gut 170 Chunks also mehrere
+    /// Dutzend Megabyte reine Verwaltungsarbeit.
+    fn remapped(slots: &[u16], remap: &[u16], palette_len: usize) -> Indices {
         if palette_len <= u8::MAX as usize + 1 {
-            Indices::Small(values.iter().map(|v| *v as u8).collect())
+            Indices::Small(slots.iter().map(|s| remap[*s as usize] as u8).collect())
         } else {
-            Indices::Large(values.to_vec().into_boxed_slice())
+            Indices::Large(slots.iter().map(|s| remap[*s as usize]).collect())
         }
     }
 
@@ -215,9 +229,10 @@ impl Format {
         }
     }
 
-    /// Alle vier Spielarten, die bevorzugte zuerst.
+    /// Alle vier Spielarten, die bevorzugte zuerst. Danach die, die sich in genau einem Merkmal
+    /// unterscheiden – ein Protokollupdate dreht erfahrungsgemäß nur eines von beiden.
     fn candidates(preferred: Format) -> [Format; 4] {
-        let mut all = [
+        [
             preferred,
             Format {
                 modern_palette: !preferred.modern_palette,
@@ -231,9 +246,7 @@ impl Format {
                 modern_palette: !preferred.modern_palette,
                 fluid_count: !preferred.fluid_count,
             },
-        ];
-        all.sort_by_key(|f| (f.code() != preferred.code()) as u8);
-        all
+        ]
     }
 
     /// Chunk lesen und dabei die passende Spielart bestimmen. Bevorzugt wird die, die den Puffer
@@ -385,6 +398,10 @@ struct World {
     own_entity: i32,
     /// Zuletzt bekannter eigener Chunk – daran hängt das Verwerfen weit entfernter Chunks.
     center: (i32, i32),
+    /// Zählt jede Änderung an [`World::chunks`]. Der Zeichner vergleicht sie mit seinem Stand und
+    /// kopiert die Chunk-Tabelle nur, wenn sich wirklich etwas geändert hat – siehe
+    /// [`Pov::fill_scene`].
+    revision: u64,
 }
 
 impl Default for World {
@@ -395,31 +412,44 @@ impl Default for World {
             entities: HashMap::new(),
             own_entity: -1,
             center: (0, 0),
+            // Nicht 0: der Zeichner beginnt bei 0 und muss beim ersten Bild kopieren.
+            revision: 1,
         }
     }
 }
 
 impl World {
+    /// Nach jeder Änderung an den Chunks aufrufen.
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     fn clear_visible(&mut self) {
         self.chunks.clear();
         self.chunks.shrink_to_fit();
         self.entities.clear();
         self.entities.shrink_to_fit();
+        self.touch();
     }
 
     fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
         let key = (x.div_euclid(16), z.div_euclid(16));
         if let Some(chunk) = self.chunks.get_mut(&key) {
             Arc::make_mut(chunk).set_block(x, y, z, state);
+            self.touch();
         }
     }
 
     /// Alles wegwerfen, was die Ansicht ohnehin nie erreicht.
     fn prune(&mut self) {
         let (cx, cz) = self.center;
+        let before = self.chunks.len();
         self.chunks.retain(|(x, z), _| {
             (x - cx).abs() <= KEEP_CHUNK_RADIUS && (z - cz).abs() <= KEEP_CHUNK_RADIUS
         });
+        if self.chunks.len() != before {
+            self.touch();
+        }
     }
 }
 
@@ -427,6 +457,8 @@ impl World {
 struct Scene {
     chunks: HashMap<(i32, i32), Arc<Chunk>>,
     entities: Vec<Entity>,
+    /// Stand von [`World::revision`], zu dem `chunks` gehört.
+    chunk_revision: u64,
 }
 
 /// Wiederverwendete Puffer des Zeichners.
@@ -541,7 +573,7 @@ impl Pov {
             renderer_running: AtomicBool::new(false),
             width: AtomicUsize::new(width.clamp(MIN_WIDTH, MAX_WIDTH)),
             height: AtomicUsize::new(height.clamp(MIN_HEIGHT, MAX_HEIGHT)),
-            fps: AtomicUsize::new(options.pov_fps.clamp(1, 20)),
+            fps: AtomicUsize::new(options.pov_fps.unwrap_or(DEFAULT_FPS).clamp(1, 20)),
             parse_errors: AtomicU32::new(0),
             format: AtomicU32::new(u32::MAX),
             last_frame: AtomicU64::new(0),
@@ -579,7 +611,14 @@ impl Pov {
     /// Chunks einlesen.
     fn fill_scene(&self, scene: &mut Scene) {
         let world = self.world.lock().unwrap();
-        scene.chunks.clone_from(&world.chunks);
+        // Die Chunk-Tabelle nur kopieren, wenn sich seit dem letzten Bild wirklich etwas geändert
+        // hat. Ein stillstehender Bot bekommt minutenlang keinen neuen Chunk; die Tabelle mit
+        // ihren gut 170 Einträgen trotzdem achtmal je Sekunde neu aufzubauen (mit einem
+        // Arc-Zähler je Eintrag) war der teuerste Posten des Zeichners im Leerlauf.
+        if scene.chunk_revision != world.revision {
+            scene.chunks.clone_from(&world.chunks);
+            scene.chunk_revision = world.revision;
+        }
         scene.entities.clear();
         scene.entities.extend(world.entities.values().copied());
     }
@@ -683,7 +722,10 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
             // ChunkPos ist ein Long: x in den unteren, z in den oberen 32 Bit. Zwei
             // nacheinander gelesene i32 wären durch die Netzwerk-Bytefolge genau vertauscht.
             let key = unpack_chunk_pos(r.i64()?);
-            shared.extras.pov.world.lock().unwrap().chunks.remove(&key);
+            let mut world = shared.extras.pov.world.lock().unwrap();
+            if world.chunks.remove(&key).is_some() {
+                world.touch();
+            }
             Ok(())
         }
         In::BlockUpdate => {
@@ -776,6 +818,7 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     }
     if world.chunks.len() < MAX_CHUNKS || world.chunks.contains_key(&(x, z)) {
         world.chunks.insert((x, z), Arc::new(chunk));
+        world.touch();
     }
     if center.is_some() {
         world.prune();
@@ -985,13 +1028,16 @@ fn read_palette(
     if let Some(values) = local {
         let mut counts = vec![0u32; values.len()];
         let mut indices = Vec::with_capacity(size);
-        for index in 0..size {
-            let packed = unpack(&data, index, per_long, bits, mask)?;
-            if packed >= values.len() {
-                return Err(crate::buf::err("POV: Palettenindex ausserhalb"));
+        let mut fault = None;
+        unpack_all(&data, size, per_long, bits, mask, |packed| {
+            match counts.get_mut(packed) {
+                Some(count) => *count += 1,
+                None => fault = Some("POV: Palettenindex ausserhalb"),
             }
-            counts[packed] += 1;
             indices.push(packed as u16);
+        })?;
+        if let Some(message) = fault {
+            return Err(crate::buf::err(message));
         }
         return Ok(RawPalette {
             values,
@@ -1005,13 +1051,15 @@ fn read_palette(
     let mut counts: Vec<u32> = Vec::new();
     let mut seen: HashMap<u32, u16> = HashMap::new();
     let mut indices = Vec::with_capacity(size);
-    for index in 0..size {
-        let state = unpack(&data, index, per_long, bits, mask)? as u32;
+    let mut fault = None;
+    unpack_all(&data, size, per_long, bits, mask, |packed| {
+        let state = packed as u32;
         let slot = match seen.get(&state) {
             Some(slot) => *slot,
             None => {
                 if values.len() >= u16::MAX as usize {
-                    return Err(crate::buf::err("POV: Abschnitt mit zu vielen Zustaenden"));
+                    fault = Some("POV: Abschnitt mit zu vielen Zustaenden");
+                    return;
                 }
                 let slot = values.len() as u16;
                 values.push(state);
@@ -1022,6 +1070,9 @@ fn read_palette(
         };
         counts[slot as usize] += 1;
         indices.push(slot);
+    })?;
+    if let Some(message) = fault {
+        return Err(crate::buf::err(message));
     }
     Ok(RawPalette {
         values,
@@ -1051,12 +1102,39 @@ fn skip_palette(
     r.skip(longs * 8)
 }
 
-/// Einen Eintrag aus den gepackten Longs holen – mit Bereichsprüfung statt blindem Zugriff.
-fn unpack(data: &[u64], index: usize, per_long: usize, bits: u8, mask: u64) -> io::Result<usize> {
-    let long = *data
-        .get(index / per_long)
-        .ok_or_else(|| crate::buf::err("POV: Palettendaten zu kurz"))?;
-    Ok(((long >> ((index % per_long) * bits as usize)) & mask) as usize)
+/// Alle gepackten Einträge der Reihe nach an `f` geben.
+///
+/// Bewusst über die Longs statt über die Blocknummern: Vorher kostete **jeder einzelne der 4096
+/// Blöcke** eine Division, eine Modulo-Rechnung, einen Bereichstest und eine variable
+/// Schiebeoperation. Jetzt wird ein Long einmal geholt und dann Eintrag für Eintrag
+/// herausgeschoben – bei rund 170 Chunks mit je einem guten Dutzend Abschnitten sind das ein paar
+/// Millionen eingesparte Divisionen pro Beitritt.
+#[inline]
+fn unpack_all(
+    data: &[u64],
+    size: usize,
+    per_long: usize,
+    bits: u8,
+    mask: u64,
+    mut f: impl FnMut(usize),
+) -> io::Result<()> {
+    let mut left = size;
+    for long in data {
+        if left == 0 {
+            break;
+        }
+        let mut value = *long;
+        let take = per_long.min(left);
+        for _ in 0..take {
+            f((value & mask) as usize);
+            value >>= bits;
+        }
+        left -= take;
+    }
+    if left > 0 {
+        return Err(crate::buf::err("POV: Palettendaten zu kurz"));
+    }
+    Ok(())
 }
 
 /// Aus der gelesenen Palette einen Abschnitt bauen: Luftzustände auf Eintrag 0 zusammenlegen,
@@ -1088,8 +1166,7 @@ fn compact(raw: RawPalette, non_air: usize) -> Option<Section> {
         return None; // doch nur Luft
     }
 
-    let mapped: Vec<u16> = indices.iter().map(|slot| remap[*slot as usize]).collect();
-    let indices = Indices::new(&mapped, palette.len());
+    let indices = Indices::remapped(&indices, &remap, palette.len());
     Some(Section { palette, indices })
 }
 
@@ -1183,9 +1260,10 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
             let width = parts.next().and_then(|v| v.parse::<usize>().ok());
             let height = parts.next().and_then(|v| v.parse::<usize>().ok());
             match (width, height) {
-                (Some(width), Some(height)) => {
-                    let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
-                    let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
+                (Some(width), Some(height))
+                    if (MIN_WIDTH..=MAX_WIDTH).contains(&width)
+                        && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height) =>
+                {
                     shared.extras.pov.width.store(width, Ordering::Relaxed);
                     shared.extras.pov.height.store(height, Ordering::Relaxed);
                     shared.extras.pov.last_frame.store(0, Ordering::Relaxed);
@@ -1193,9 +1271,12 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
                         .console
                         .info(&format!("POV-Groesse: {}x{} Pixel.", width, height));
                 }
-                _ => shared
-                    .console
-                    .error("Nutzung: :pov size <breite> <hoehe>   z. B. :pov size 160 80"),
+                // Nicht stillschweigend zurechtbiegen: wer 400x300 tippt, meint etwas anderes
+                // als 160x80 – genau wie bei `--pov-size` auf der Kommandozeile.
+                _ => shared.console.error(&format!(
+                    "Nutzung: :pov size <breite {}-{}> <hoehe {}-{}>   z. B. :pov size 160 80",
+                    MIN_WIDTH, MAX_WIDTH, MIN_HEIGHT, MAX_HEIGHT
+                )),
             }
         }
         "fps" | "takt" => match parts.next().and_then(|v| v.parse::<usize>().ok()) {
@@ -1327,7 +1408,11 @@ fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
     pov.fill_scene(scene);
     render_into(scene, position, width, height, color, pixels, frame);
 
-    if !force && !frame_changed(pov, frame) {
+    // Auch bei `force` mitrechnen: Sonst behielte der Merker den Stand von **vor** dem
+    // erzwungenen Bild, und das nächste Bild der Live-Ansicht galt fälschlich als unverändert –
+    // nach einem `:pov frame` blieb die Ansicht dann bis zu zwei Sekunden stehen.
+    let changed = frame_changed(pov, frame);
+    if !force && !changed {
         return;
     }
     // Cursor-Steuerung und Bild in einem Zug – sonst rutscht eine Statuszeile dazwischen.
@@ -1375,14 +1460,11 @@ fn render_into(
     out: &mut String,
 ) {
     let origin = (position.0, position.1 + 1.62, position.2);
+    // Nur Platz schaffen, nicht füllen: jeder Bildpunkt wird gleich darunter ohnehin geschrieben.
+    // Das vorherige `resize` legte 160x80 Werte an, die im selben Atemzug wieder überschrieben
+    // wurden – bei zwanzig Bildern je Sekunde reine Verschwendung.
     pixels.clear();
-    pixels.resize(
-        width * height,
-        Pixel {
-            rgb: (0, 0, 0),
-            depth: MAX_DISTANCE,
-        },
-    );
+    pixels.reserve(width * height);
 
     // Echte Zentralprojektion statt gleichmäßig verteilter Winkel: sonst „biegt" sich der
     // Horizont bei 90° Blickfeld sichtbar nach außen.
@@ -1402,7 +1484,9 @@ fn render_into(
                 basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
                 basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
             ));
-            pixels[py * width + px] = match cast(&mut cursor, origin, direction) {
+            // Zeilenweise von links nach rechts – genau die Reihenfolge, in der `pixels`
+            // gelesen wird, deshalb reicht Anhängen statt Indizieren.
+            pixels.push(match cast(&mut cursor, origin, direction) {
                 Some((state, distance, face)) => Pixel {
                     rgb: fog(block_color(state, face, distance), sky, distance),
                     depth: distance,
@@ -1411,7 +1495,7 @@ fn render_into(
                     rgb: sky,
                     depth: MAX_DISTANCE,
                 },
-            };
+            });
         }
     }
     overlay_entities(
@@ -1462,23 +1546,6 @@ fn render_into(
             out.push('\n');
         }
     }
-}
-
-/// Bequeme Fassung für die Tests und den Messlauf: legt die Puffer selbst an.
-#[cfg(test)]
-fn render(
-    scene: &Scene,
-    position: (f64, f64, f64, f32, f32),
-    width: usize,
-    height: usize,
-    color: bool,
-) -> String {
-    let mut pixels = Vec::new();
-    let mut out = String::new();
-    render_into(
-        scene, position, width, height, color, &mut pixels, &mut out,
-    );
-    out
 }
 
 /// `\x1b[38;2;r;g;bm` ohne `format!` – bei 160x80 sind das sonst 12 800 Allokationen je Bild.
@@ -2157,6 +2224,7 @@ mod tests {
         let scene = Scene {
             chunks,
             entities: Vec::new(),
+            chunk_revision: 0,
         };
 
         // Auch genau auf Blockgrenzen und Abschnittsgrenzen: dort trifft die Rundung zu.
@@ -2211,31 +2279,42 @@ mod tests {
 
     /// Messlauf statt Behauptung: wie lange braucht ein Bild wirklich?
     ///
+    /// Gemessen wird genau das, was [`draw_once`] tut: Szene übernehmen **und** in die
+    /// wiederverwendeten Puffer zeichnen. Vorher lief hier die bequeme Testfassung `render`, die
+    /// ihre Puffer jedes Mal neu anlegt – das macht der Client seit 2.2.0 gerade nicht mehr, die
+    /// Zahl beschrieb also einen Weg, den es so nicht mehr gibt.
+    ///
     /// Läuft nicht im normalen Testlauf mit – die Zahl hängt vom Rechner ab. Aufruf:
-    /// `cargo test --features ultra -- --ignored --nocapture bildrate`
+    /// `cargo test --release --features ultra -- --ignored --nocapture bildrate`
     #[test]
     #[ignore]
     fn messlauf_bildrate() {
-        // 13x13 Chunks – genau so viele behält die Ansicht nach dem Aufräumen.
-        let mut chunks = HashMap::new();
-        for x in -6..=6 {
-            for z in -6..=6 {
-                chunks.insert((x, z), ground_chunk());
+        let pov = Pov::new(&crate::options::Options::default());
+        {
+            let mut world = pov.world.lock().unwrap();
+            // 13x13 Chunks – genau so viele behält die Ansicht nach dem Aufräumen.
+            for x in -6..=6i32 {
+                for z in -6..=6i32 {
+                    world.chunks.insert((x, z), ground_chunk());
+                }
             }
         }
-        let scene = Scene {
-            chunks,
-            entities: Vec::new(),
-        };
         let position = (8.0, 18.0, 8.0, 30.0f32, -10.0f32);
+        let mut scene = Scene::default();
+        let mut pixels = Vec::new();
+        let mut frame = String::new();
 
         for (width, height) in [(64usize, 32usize), (160, 80)] {
             // Einmal warmlaufen, damit die Messung nicht den ersten Zugriff mitzählt.
-            let _ = render(&scene, position, width, height, true);
-            let runs = 100;
+            pov.fill_scene(&mut scene);
+            render_into(&scene, position, width, height, true, &mut pixels, &mut frame);
+
+            let runs = 200;
             let started = Instant::now();
             for _ in 0..runs {
-                let _ = render(&scene, position, width, height, true);
+                pov.fill_scene(&mut scene);
+                render_into(&scene, position, width, height, true, &mut pixels, &mut frame);
+                std::hint::black_box(&frame);
             }
             let each = started.elapsed() / runs;
             println!(
@@ -2262,6 +2341,7 @@ mod tests {
         let scene = Scene {
             chunks,
             entities: Vec::new(),
+            chunk_revision: 0,
         };
         let mut cursor = Cursor::new(&scene);
         // Quer durch mehrere Chunks und auch daneben, wo keiner geladen ist.
@@ -2295,6 +2375,47 @@ mod tests {
 
     /// Der Decoder bekommt vom Server beliebige Bytes. Er darf daran nie in Panik geraten –
     /// `panic = "abort"` würde sonst den ganzen Client abschießen.
+    /// Messlauf statt Behauptung: wie lange das Einlesen eines realistischen Chunks dauert.
+    ///
+    /// Läuft nicht im normalen Testlauf mit – die Zahl hängt vom Rechner ab. Aufruf:
+    /// `cargo test --release --features pov -- --ignored --nocapture chunk_einlesen`
+    #[test]
+    #[ignore]
+    fn chunk_einlesen_dauert() {
+        // Eine gewachsene Überwelt: acht gefüllte Abschnitte mit gemischter Palette, der Rest Luft.
+        let mut states = vec![0u32; SECTION_BLOCKS];
+        for (index, state) in states.iter_mut().enumerate() {
+            *state = (index % 37) as u32 + 1;
+        }
+        let mut w = Writer::default();
+        for section in 0..24usize {
+            if (8..16).contains(&section) {
+                write_section(&mut w, MODERN_FLUID, &states, SECTION_BLOCKS);
+            } else {
+                write_section(&mut w, MODERN_FLUID, &[0u32; SECTION_BLOCKS], 0);
+            }
+        }
+        let dim = Dimension {
+            name: "test".into(),
+            min_y: -64,
+            height: 384,
+        };
+        // Einmal vorweg, damit der Zwischenspeicher warm ist.
+        let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data).expect("lesbar");
+        assert_eq!(chunk.sections.iter().flatten().count(), 8);
+
+        const ROUNDS: usize = 400;
+        let started = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data).expect("lesbar");
+            std::hint::black_box(&chunk);
+        }
+        let each = started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
+        println!("
+Chunk einlesen: {:.3} ms je Chunk ({} Runden)
+", each, ROUNDS);
+    }
+
     #[test]
     fn beliebige_bytes_stuerzen_nicht_ab() {
         let mut seed = 0x243F_6A88_85A3_08D3u64;

@@ -99,9 +99,38 @@ impl Buf {
         self.u8(8); // TAG_String
         self.i16(4);
         self.raw(b"text");
-        self.i16(text.len() as i16);
-        self.raw(text.as_bytes());
+        self.nbt_string(text);
         self.u8(0)
+    }
+
+    /// Eine NBT-Zeichenkette: u16-Länge, danach Javas **modifiziertes** UTF-8.
+    ///
+    /// Für reinen ASCII-Text ist das dasselbe wie gewöhnliches UTF-8 – für alles darüber nicht,
+    /// und genau daran hing ein Fehler: Zeichen über U+FFFF (jedes Emoji) schreibt Java als
+    /// **zwei** Drei-Byte-Folgen, eine je Ersatzzeichen-Hälfte. Der Testserver muss das genauso
+    /// machen, sonst prüft der Test etwas, das so nie vom Netz kommt.
+    pub fn nbt_string(&mut self, text: &str) -> &mut Self {
+        let mut bytes = Vec::with_capacity(text.len());
+        let mut units = [0u16; 2];
+        for c in text.chars() {
+            let code = c as u32;
+            if code != 0 && code < 0x80 {
+                bytes.push(code as u8);
+            } else if code < 0x800 {
+                // Die 0 gehört bewusst hierher: sie wird als Überlänge C0 80 geschrieben.
+                bytes.push(0xC0 | (code >> 6) as u8);
+                bytes.push(0x80 | (code & 0x3F) as u8);
+            } else {
+                for unit in c.encode_utf16(&mut units) {
+                    let unit = *unit as u32;
+                    bytes.push(0xE0 | (unit >> 12) as u8);
+                    bytes.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                    bytes.push(0x80 | (unit & 0x3F) as u8);
+                }
+            }
+        }
+        self.i16(bytes.len() as i16);
+        self.raw(&bytes)
     }
 }
 
@@ -190,10 +219,33 @@ impl Conn {
 
 // ===================== Protokolltabelle (Testkopie aus proto.rs) =====================
 
+/// Feldreihenfolge im Team-Paket – die einzige Stelle, die sich zwischen den vier Versionen
+/// dreimal ändert (siehe `proto::TeamLayout`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TeamLayout {
+    /// 1.21.1: Flags, Sichtbarkeit und Kollision als **Zeichenketten**, dann Farbe, Präfix, Suffix.
+    Legacy,
+    /// 1.21.11 und 26.1: wie Legacy, aber Sichtbarkeit und Kollision als VarInt.
+    VarIntRules,
+    /// 26.2: Präfix und Suffix direkt hinter dem Anzeigenamen, Farbe optional, Flags zuletzt.
+    Reordered,
+}
+
 pub struct Ids {
     pub name: &'static str,
     pub modern: bool,
     pub fluid_count: bool,
+    pub team_layout: TeamLayout,
+    pub cb_set_objective: i32,
+    pub cb_set_display_objective: i32,
+    pub cb_set_player_team: i32,
+    pub cb_set_score: i32,
+    pub cb_open_screen: i32,
+    pub cb_container_set_content: i32,
+    /// Netz-ID der Komponente `minecraft:custom_name`.
+    pub component_custom_name: i32,
+    /// Netz-ID der Komponente `minecraft:lore`.
+    pub component_lore: i32,
     pub cb_login: i32,
     pub cb_position: i32,
     pub cb_system_chat: i32,
@@ -207,12 +259,24 @@ pub struct Ids {
     pub sb_accept_teleportation: i32,
     pub sb_move: i32,
     pub sb_use_item: i32,
+    pub cb_set_health: i32,
+    pub cb_transfer: i32,
+    pub sb_client_command: i32,
 }
 
 pub static MC_26_1: Ids = Ids {
     name: "26.1",
     modern: true,
     fluid_count: true,
+    team_layout: TeamLayout::VarIntRules,
+    cb_set_objective: 106,
+    cb_set_display_objective: 98,
+    cb_set_player_team: 109,
+    cb_set_score: 110,
+    cb_open_screen: 59,
+    cb_container_set_content: 18,
+    component_custom_name: 6,
+    component_lore: 11,
     cb_login: 49,
     cb_position: 72,
     cb_system_chat: 121,
@@ -226,12 +290,24 @@ pub static MC_26_1: Ids = Ids {
     sb_accept_teleportation: 0,
     sb_move: 31,
     sb_use_item: 67,
+    cb_set_health: 104,
+    cb_transfer: 129,
+    sb_client_command: 12,
 };
 
 pub static MC_1_21_1: Ids = Ids {
     name: "1.21.1",
     modern: false,
     fluid_count: false,
+    team_layout: TeamLayout::Legacy,
+    cb_set_objective: 94,
+    cb_set_display_objective: 87,
+    cb_set_player_team: 96,
+    cb_set_score: 97,
+    cb_open_screen: 51,
+    cb_container_set_content: 19,
+    component_custom_name: 5,
+    component_lore: 7,
     cb_login: 43,
     cb_position: 64,
     cb_system_chat: 108,
@@ -245,6 +321,17 @@ pub static MC_1_21_1: Ids = Ids {
     sb_accept_teleportation: 0,
     sb_move: 27,
     sb_use_item: 57,
+    cb_set_health: 93,
+    cb_transfer: 115,
+    sb_client_command: 9,
+};
+
+/// 26.2 verschiebt keine der hier benutzten IDs gegenüber 26.1 – nur das Team-Paket ist
+/// umgestellt (siehe [`TeamLayout::Reordered`]).
+pub static MC_26_2: Ids = Ids {
+    name: "26.2",
+    team_layout: TeamLayout::Reordered,
+    ..MC_26_1
 };
 
 // ===================== Server =====================
@@ -284,6 +371,14 @@ pub struct Plan {
     pub position: (f64, f64, f64),
     /// Diese Chatzeilen werden nach dem Beitritt geschickt.
     pub chat: Vec<String>,
+    /// Den Spieler nach dem Beitritt sterben lassen (Lebenspunkte 0).
+    pub kill: bool,
+    /// Eine Seitenleiste aufbauen: Ziel, Anzeigebereich, Team mit Präfix/Suffix und eine Punktzahl.
+    pub scoreboard: bool,
+    /// Ein Menü öffnen und seinen Inhalt schicken (ein benannter Gegenstand mit Lore).
+    pub menu: bool,
+    /// Nach dem Beitritt einen Server-Transfer auf diese Adresse anordnen.
+    pub transfer_to: Option<(String, u16)>,
     /// Sekunden, die der Server danach noch offen bleibt.
     pub hold_secs: u64,
 }
@@ -423,6 +518,26 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
         conn.send(&chat);
     }
 
+    if plan.scoreboard {
+        send_scoreboard(conn, ids);
+    }
+    if plan.menu {
+        send_menu(conn, ids);
+    }
+
+    // Tod: Lebenspunkte 0, Nahrung und Sättigung dahinter.
+    if plan.kill {
+        let mut health = Buf::packet(ids.cb_set_health);
+        health.f32(0.0).var_int(20).f32(5.0);
+        conn.send(&health);
+    }
+
+    if let Some((host, port)) = &plan.transfer_to {
+        let mut transfer = Buf::packet(ids.cb_transfer);
+        transfer.string(host).var_int(*port as i32);
+        conn.send(&transfer);
+    }
+
     // Ab hier nur noch mitlesen und am Leben halten.
     let deadline = Instant::now() + Duration::from_secs(plan.hold_secs.max(1));
     let keep_alive_id = ids.cb_keep_alive;
@@ -442,6 +557,12 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
         let _ = write.shutdown(std::net::Shutdown::Both);
     });
 
+    // Der Transfer beendet die Verbindung von unserer Seite – der Client baut dann eine neue auf.
+    if plan.transfer_to.is_some() {
+        thread::sleep(Duration::from_millis(200));
+        return;
+    }
+
     let chat_command = ids.sb_chat_command;
     let chat = ids.sb_chat;
     while let Some((id, payload)) = conn.recv() {
@@ -454,6 +575,107 @@ fn serve(conn: &mut Conn, write: TcpStream, ids: &Ids, plan: &Plan, tx: &Sender<
         } else {
             let _ = tx.send(Note::Packet(id, payload.len()));
         }
+    }
+}
+
+/// Eine Seitenleiste, wie sie ein gewöhnlicher Server aufbaut: Der Eintrag selbst ist ein
+/// unsichtbarer Platzhalter, der sichtbare Text steckt in Präfix und Suffix eines Teams.
+///
+/// Genau das ist die Stelle, an der sich die vier Protokolle dreimal unterscheiden – deshalb wird
+/// hier je nach [`TeamLayout`] eine andere Feldreihenfolge geschrieben.
+fn send_scoreboard(conn: &mut Conn, ids: &Ids) {
+    // Ziel anlegen: Name, Aktion 0 (anlegen), Anzeigename, Punktart, kein Zahlenformat.
+    let mut objective = Buf::packet(ids.cb_set_objective);
+    objective
+        .string("sb")
+        .u8(0)
+        .nbt_text("Testserver")
+        .var_int(0)
+        .bool(false);
+    conn.send(&objective);
+
+    // In die Seitenleiste damit (Bereich 1).
+    let mut display = Buf::packet(ids.cb_set_display_objective);
+    display.var_int(1).string("sb");
+    conn.send(&display);
+
+    // Team anlegen – Präfix und Suffix tragen den sichtbaren Text.
+    let mut team = Buf::packet(ids.cb_set_player_team);
+    team.string("t1").u8(0).nbt_text("Team 1");
+    match ids.team_layout {
+        TeamLayout::Legacy => {
+            team.u8(0) // Flags
+                .string("always") // Sichtbarkeit der Namensschilder
+                .string("always") // Kollisionsregel
+                .var_int(10) // Farbe: green
+                .nbt_text("Rang: ")
+                .nbt_text(" *");
+        }
+        TeamLayout::VarIntRules => {
+            team.u8(0)
+                .var_int(0)
+                .var_int(0)
+                .var_int(10)
+                .nbt_text("Rang: ")
+                .nbt_text(" *");
+        }
+        TeamLayout::Reordered => {
+            team.nbt_text("Rang: ")
+                .nbt_text(" *")
+                .var_int(0)
+                .var_int(0)
+                .bool(true)
+                .var_int(10)
+                .u8(0);
+        }
+    }
+    team.var_int(1).string("hugo"); // ein Mitglied
+    conn.send(&team);
+
+    // Punktzahl: Eintrag, Ziel, Wert, kein eigener Anzeigetext, kein Zahlenformat.
+    let mut score = Buf::packet(ids.cb_set_score);
+    score.string("hugo").string("sb").var_int(5).bool(false).bool(false);
+    conn.send(&score);
+}
+
+/// Ein geöffnetes Menü samt Inhalt: neun Felder, davon eines mit Anzeigename und zwei
+/// Lore-Zeilen. Genau so kommt ein Shop- oder Warp-Menü von einem gewöhnlichen Server.
+fn send_menu(conn: &mut Conn, ids: &Ids) {
+    let mut open = Buf::packet(ids.cb_open_screen);
+    open.var_int(1).var_int(2).nbt_text("Warp-Menü");
+    conn.send(&open);
+
+    let mut content = Buf::packet(ids.cb_container_set_content);
+    // Die Fenster-Nummer steht in 1.21.1 als vorzeichenloses Byte, ab 1.21.11 als VarInt.
+    if ids.modern {
+        content.var_int(1);
+    } else {
+        content.u8(1);
+    }
+    content.var_int(1).var_int(9); // Zustandszähler, Feldanzahl
+    for slot in 0..9 {
+        if slot == 4 {
+            item_with_lore(&mut content, ids, 848, "Zum Spawn", &["Klicken", "kostet nichts"]);
+        } else {
+            content.var_int(0); // leeres Feld
+        }
+    }
+    content.var_int(0); // nichts in der Hand
+    conn.send(&content);
+}
+
+/// Ein Gegenstand mit Anzeigename und Lore – die beiden Komponenten, die der Client wirklich liest.
+fn item_with_lore(buf: &mut Buf, ids: &Ids, id: i32, name: &str, lore: &[&str]) {
+    buf.var_int(1) // Anzahl
+        .var_int(id)
+        .var_int(2) // zwei hinzugefügte Komponenten
+        .var_int(0); // keine entfernten
+    buf.var_int(ids.component_custom_name);
+    buf.nbt_text(name);
+    buf.var_int(ids.component_lore);
+    buf.var_int(lore.len() as i32);
+    for line in lore {
+        buf.nbt_text(line);
     }
 }
 

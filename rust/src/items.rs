@@ -112,10 +112,11 @@ fn read_components(proto: &'static Protocol, r: &mut Reader, item: &mut Item) ->
             continue;
         }
         if id == components.lore as i32 {
-            let count = r.var_int()?;
-            if !(0..=MAX_LIST).contains(&count) {
-                return Ok(false);
-            }
+            let count = list_len(r)?;
+            // Platz auf Verdacht, aber nur für eine plausible Lore: Die Zahl kommt vom Server,
+            // und dahinter muss noch nichts stehen. Was wirklich kommt, lässt den Vektor ohnehin
+            // wachsen.
+            item.lore.reserve(count.min(64) as usize);
             for _ in 0..count {
                 item.lore
                     .push(nbt::render(&nbt::read_network(r)?, Fmt::Legacy));
@@ -258,8 +259,18 @@ fn skip_properties(r: &mut Reader) -> io::Result<()> {
     Ok(())
 }
 
+/// Länge einer Liste innerhalb einer Komponente.
+///
+/// Bewusst ein **Fehler** statt einer stillen Deckelung: Eine Zahl außerhalb des Erwartbaren
+/// heißt, dass der Lesezeiger schon falsch steht. Vorher wurde sie auf [`MAX_LIST`] gestaucht –
+/// der Leser lief dann mit einer erfundenen Länge weiter und meldete den Gegenstand am Ende als
+/// „vollständig gelesen", obwohl ab dort nur noch Zufall herauskam.
 fn list_len(r: &mut Reader) -> io::Result<i32> {
-    Ok(r.var_int()?.clamp(0, MAX_LIST))
+    let len = r.var_int()?;
+    if !(0..=MAX_LIST).contains(&len) {
+        return Err(crate::buf::err("Gegenstands-Liste unplausibel"));
+    }
+    Ok(len)
 }
 
 #[cfg(test)]
@@ -374,6 +385,52 @@ mod tests {
         let item = slot.item.expect("Gegenstand");
         assert!(!item.complete);
         assert_eq!(item.name.as_deref(), Some("§r§fName"));
+    }
+
+    /// Eine unplausible Listenlänge wurde bisher stillschweigend auf 1024 gestaucht. Der Leser
+    /// lief danach mit einer erfundenen Länge weiter und meldete den Gegenstand trotzdem als
+    /// vollständig – aus einem falsch gelesenen Feld wurden so erfundene Inhalte.
+    #[test]
+    fn unplausible_listenlaenge_gilt_nicht_als_gelesen() {
+        let proto = protocol("26.1");
+        let c = &proto.extra.components;
+        let mut w = Writer::default();
+        w.var_int(1); // Anzahl
+        w.var_int(1); // Nummer
+        w.var_int(1); // eine Komponente
+        w.var_int(0); // keine entfernten
+        w.var_int(c.lore as i32);
+        w.var_int(500_000); // so viele Lore-Zeilen gibt es nicht
+        w.raw(&[0; 32]);
+
+        let mut r = Reader::new(&w.data);
+        assert!(read_slot(proto, &mut r).is_err());
+    }
+
+    /// Beliebige Bytes dürfen den Leser weder abstürzen lassen noch aufhängen: Der Inhalt eines
+    /// Menüs kommt vom Server, gelesen wird im Netz-Thread, und der Client läuft mit
+    /// `panic = "abort"` – ein Absturz dort reißt den ganzen Prozess mit.
+    #[test]
+    fn beliebige_bytes_stuerzen_nicht_ab() {
+        let mut seed = 0xC3D2_E1F0_A458_36B9u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..4000 {
+            let len = (random() % 512) as usize;
+            let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            for p in PROTOCOLS {
+                let mut r = Reader::new(&data);
+                if let Ok(slot) = read_slot(p, &mut r) {
+                    if let Some(item) = slot.item {
+                        let _ = item.label();
+                    }
+                }
+            }
+        }
     }
 
     /// Die Tabelle muss zu den Nummern passen, die wir gezielt lesen.

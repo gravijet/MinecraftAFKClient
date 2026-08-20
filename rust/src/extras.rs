@@ -141,9 +141,13 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         #[cfg(not(feature = "pov"))]
         let _ = &data;
 
+        // Beides zugleich kann nicht sein – es ist ein Register je Paket. Das `continue` spart
+        // deshalb nur die Kopie des Namens: `minecraft:item` hat gut anderthalbtausend Einträge,
+        // und die wurden bisher alle doppelt angelegt.
         #[cfg(feature = "items")]
         if wants_items {
-            item_names.push(name.clone());
+            item_names.push(name);
+            continue;
         }
         #[cfg(feature = "pov")]
         if wants_dimensions {
@@ -166,6 +170,10 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
 /// Zusatzpakete auswerten. Alles, was hier ankommt, hat [`crate::proto::Protocol::incoming`]
 /// bereits einer Ausbaustufe zugeordnet.
 pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
+    // Eine Bauform, die nur sendet (`state`, `antiafk`), wertet überhaupt kein Zusatzpaket aus –
+    // dann bleiben beide Parameter ungenutzt.
+    #[cfg(not(any(feature = "board", feature = "menu", feature = "pov")))]
+    let _ = (&shared, &r);
     match kind {
         #[cfg(feature = "board")]
         In::Objective | In::Score | In::ResetScore | In::DisplayObjective | In::Team => {
@@ -197,6 +205,14 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 }
 
 pub fn on_join(shared: &Arc<Shared>) {
+    #[cfg(not(any(
+        feature = "board",
+        feature = "menu",
+        feature = "pov",
+        feature = "state",
+        feature = "antiafk"
+    )))]
+    let _ = &shared;
     // Der alte Stand gilt nicht mehr – der neue Server schickt seinen eigenen.
     #[cfg(feature = "board")]
     shared.extras.board.clear();
@@ -232,59 +248,85 @@ pub fn on_disconnect(shared: &Shared) {
 /// Befehl aus der Eingabeschleife. `true` = erledigt, `false` = nicht meiner (dann bekommt ihn
 /// die Bewegung).
 pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
-    let _ = arg;
-    match verb {
-        #[cfg(feature = "board")]
-        "board" | "tafel" | "scoreboard" => crate::board::print_sidebar(shared),
+    // Ein Zweig je Zusatzfunktion, nicht ein `match` mit lauter `#[cfg]`-Armen: Fällt jede
+    // Funktion weg, bliebe von einem solchen `match` nur der Sammelzweig übrig – und alles
+    // dahinter wäre unerreichbarer Code, über den der Compiler zu Recht klagt.
+    let _ = (shared, verb, arg);
 
-        #[cfg(feature = "menu")]
-        "menu" | "menü" | "container" | "kiste" => crate::menu::print(shared),
-        #[cfg(feature = "menu")]
-        "click" | "klick" | "klicke" => crate::menu::click_command(shared, arg),
-        #[cfg(feature = "menu")]
-        "close" | "schliessen" | "schließen" | "zu" => crate::menu::close_command(shared),
-        #[cfg(feature = "items")]
-        "slot" | "feld" => crate::menu::print_slot(shared, arg),
-        #[cfg(feature = "items")]
-        "inv" | "inventar" | "inventory" => crate::menu::print_inventory(shared),
+    #[cfg(feature = "board")]
+    if matches!(verb, "board" | "tafel" | "scoreboard") {
+        crate::board::print_sidebar(shared);
+        return true;
+    }
 
-        #[cfg(feature = "pov")]
-        "pov" | "sicht" | "ansicht" => crate::pov::command(shared, arg),
+    #[cfg(feature = "menu")]
+    {
+        if matches!(verb, "menu" | "menü" | "container" | "kiste") {
+            crate::menu::print(shared);
+            return true;
+        }
+        if matches!(verb, "click" | "klick" | "klicke") {
+            crate::menu::click_command(shared, arg);
+            return true;
+        }
+        if matches!(verb, "close" | "schliessen" | "schließen" | "zu") {
+            crate::menu::close_command(shared);
+            return true;
+        }
+    }
 
-        #[cfg(feature = "state")]
-        "sneak" | "schleich" | "schleichen" | "ducken" => toggle(
-            shared,
-            arg,
-            &shared.extras.sneaking,
-            "Schleichen",
-            set_sneak,
-        ),
-        #[cfg(feature = "state")]
-        "sprint" | "rennen" | "sprinten" => toggle(
-            shared,
-            arg,
-            &shared.extras.sprinting,
-            "Sprinten",
-            set_sprint,
-        ),
-        #[cfg(feature = "state")]
-        "swing" | "schlag" | "schlage" | "arm" => {
+    #[cfg(feature = "items")]
+    {
+        if matches!(verb, "slot" | "feld") {
+            crate::menu::print_slot(shared, arg);
+            return true;
+        }
+        if matches!(verb, "inv" | "inventar" | "inventory") {
+            crate::menu::print_inventory(shared);
+            return true;
+        }
+    }
+
+    #[cfg(feature = "pov")]
+    if matches!(verb, "pov" | "sicht" | "ansicht") {
+        crate::pov::command(shared, arg);
+        return true;
+    }
+
+    #[cfg(feature = "state")]
+    {
+        if matches!(verb, "sneak" | "schleich" | "schleichen" | "ducken") {
+            toggle(shared, arg, &shared.extras.sneaking, "Schleichen", set_sneak);
+            return true;
+        }
+        if matches!(verb, "sprint" | "rennen" | "sprinten") {
+            toggle(shared, arg, &shared.extras.sprinting, "Sprinten", set_sprint);
+            return true;
+        }
+        if matches!(verb, "swing" | "schlag" | "schlage" | "arm") {
             let mut w = Writer::packet(shared.proto.extra.sb_swing);
             w.var_int(0); // Haupthand
             shared.send(w);
             shared.console.info("Arm geschwungen.");
+            return true;
         }
-        #[cfg(feature = "state")]
-        "use" | "benutze" | "rechtsklick" => use_item(shared),
-        #[cfg(feature = "state")]
-        "hand" | "slot-hotbar" | "hotbar" => hotbar(shared, arg),
-
-        #[cfg(feature = "antiafk")]
-        "antiafk" | "anti-afk" | "zappeln" => crate::antiafk::command(shared, arg),
-
-        _ => return false,
+        if matches!(verb, "use" | "benutze" | "rechtsklick") {
+            use_item(shared);
+            return true;
+        }
+        if matches!(verb, "hand" | "slot-hotbar" | "hotbar") {
+            hotbar(shared, arg);
+            return true;
+        }
     }
-    true
+
+    #[cfg(feature = "antiafk")]
+    if matches!(verb, "antiafk" | "anti-afk" | "zappeln") {
+        crate::antiafk::command(shared, arg);
+        return true;
+    }
+
+    false
 }
 
 /// Zeilen für `:help` – nur die, die dieser Build wirklich hat.

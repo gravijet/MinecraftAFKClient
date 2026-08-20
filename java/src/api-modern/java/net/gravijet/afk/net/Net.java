@@ -111,11 +111,22 @@ final class Net {
      * Cookies merken bzw. auf Anfrage zurückgeben. Die beiden Pakete liegen je nach Fassung in
      * einem anderen Java-Paket, deshalb laufen sie hier durch.
      *
+     * @param maxCookies wie viele verschiedene Cookies höchstens aufgehoben werden
+     * @param maxBytes   wie groß ein einzelnes Cookie höchstens sein darf
      * @return {@code true}, wenn das Paket hier erledigt wurde
      */
-    static boolean cookies(Packet packet, Session session, Map<String, byte[]> cookies) {
+    static boolean cookies(Packet packet, Session session, Map<String, byte[]> cookies,
+                           int maxCookies, int maxBytes) {
         if (packet instanceof ClientboundStoreCookiePacket store) {
-            cookies.put(store.getKey().asString(), store.getPayload());
+            String key = store.getKey().asString();
+            byte[] payload = store.getPayload();
+            // Dieselben Grenzen wie im Vanilla-Client: Ohne sie legte ein Server unter immer
+            // neuen Namen beliebig viele Cookies ab und ließ den Speicher volllaufen. Ein schon
+            // bekanntes Cookie darf sich immer erneuern, nur neue zählen gegen die Anzahl.
+            if (payload != null && payload.length <= maxBytes
+                    && (cookies.size() < maxCookies || cookies.containsKey(key))) {
+                cookies.put(key, payload);
+            }
             return true;
         }
         if (packet instanceof ClientboundCookieRequestPacket request) {

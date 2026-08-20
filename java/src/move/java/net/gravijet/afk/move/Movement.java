@@ -97,15 +97,20 @@ public final class Movement implements Mover {
     }
 
     /**
-     * Einstellungen ändern und speichern. Die abschließende Zuweisung an das {@code volatile}-Feld
-     * macht die Änderung für einen laufenden Bewegungs-Thread sofort sichtbar – ohne sie könnte er
-     * beliebig lange mit den alten Werten weiterrechnen.
+     * Einstellungen ändern und speichern.
+     *
+     * <p>Geändert wird eine <b>Kopie</b>, die erst danach im {@code volatile}-Feld landet. Vorher
+     * wurde das Objekt an Ort und Stelle verändert, das ein laufender Bewegungs-Thread längst in
+     * der Hand hielt: Ein {@code :route clear} während eines Heimlaufs veränderte dessen Liste
+     * mitten im Durchlaufen (ConcurrentModificationException), und die zugleich geschriebenen
+     * {@code double}-Felder darf die JVM ohne Sperre auch halb sichtbar machen. Die Zuweisung des
+     * fertigen Objekts ist dagegen ein einziger, unteilbarer Schritt.
      */
     private void update(Consumer<MoveSettings> change) {
-        MoveSettings current = settings;
-        change.accept(current);
-        current.save();
-        settings = current;
+        MoveSettings next = settings.copy();
+        change.accept(next);
+        next.save();
+        settings = next;
     }
 
     @Override
@@ -174,9 +179,24 @@ public final class Movement implements Mover {
         return "  " + key + " ".repeat(Math.max(1, 15 - key.length())) + text;
     }
 
+    /** {@code :help} – dieselbe Liste, die {@link #helpRows()} liefert. */
+    private void printHelp() {
+        console.print("");
+        console.print(console.color(Console.BOLD,
+                "  Befehle (alles mit ':' vorn, alles andere geht in den Chat)"));
+        for (String line : helpRows()) {
+            console.print("  " + line);
+        }
+        console.print(console.color(Console.GRAY,
+                "    /befehl geht als Serverbefehl raus, alles andere als Chat."));
+    }
+
     @Override
     public boolean command(String verb, String arg) {
         switch (verb) {
+            // `helpRows()` gab es zwar von Anfang an, aber niemand rief es auf: `:help` landete
+            // deshalb im „Unbekannter Befehl"-Zweig, obwohl der Rust-Client die Liste zeigt.
+            case "help", "hilfe", "?" -> printHelp();
             case "go", "geh", "gehe", "lauf", "laufe" -> go(arg);
             case "look", "schau", "dreh", "drehe" -> look(arg);
             case "home", "heim" -> home(arg);
@@ -589,7 +609,9 @@ public final class Movement implements Mover {
             return;
         }
         if (points.isEmpty()) {
-            console.error("Nichts aufgezeichnet – Route unverändert.");
+            // Kein Fehler, nur nichts zu tun – der Rust-Client meldet das an derselben Stelle
+            // ebenfalls als Hinweis.
+            console.warn("Nichts aufgezeichnet – Route unverändert.");
             return;
         }
         double[] here = position();
@@ -655,7 +677,13 @@ public final class Movement implements Mover {
             index = number.intValue() - 1;
         }
         final int target = index;
-        update(s -> s.route.remove(target));
+        // Zwischen dem Zählen oben und dem Ändern hier kann die Route schon kürzer sein (etwa
+        // durch `:route clear`); ohne diese Prüfung flog dann eine IndexOutOfBoundsException.
+        update(s -> {
+            if (target < s.route.size()) {
+                s.route.remove(target);
+            }
+        });
         console.info("Wegpunkt " + (target + 1) + " entfernt.");
     }
 

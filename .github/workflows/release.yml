@@ -38,104 +38,22 @@ jobs:
           # Reste eines abgebrochenen Laufs weg (Entwürfe haben keinen Tag, daher || true).
           gh release delete "$ENTWURF" --yes --cleanup-tag || true
 
-          # Als Datei statt als Argument: so bleibt die Markdown-Formatierung heil.
-          cat > notes.md <<EOF
-          Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7}).
-
-          ## Welche Datei ist welche?
-
-          Die neuen Varianten sind ausschließlich Rust-Clients. Jede Rust-Datei unterstützt
-          Minecraft \`1.21.1\`, \`1.21.11\`, \`26.1\` und \`26.2\`; ausgewählt wird mit
-          \`--mc <version>\`.
-
-          | Windows | Linux | Enthaltene Funktionen |
-          | --- | --- | --- |
-          | \`afk-windows.exe\` | \`afk-linux\` | kleiner Basisclient: Verbindung, Chat, Befehle und Makros |
-          | \`afk-windows-move.exe\` | \`afk-linux-move\` | Basisclient plus manuelle Bewegung, Blickrichtung, Routen und Sprung/Fall |
-          | \`items-afk-windows.exe\` | \`items-afk-linux\` | Basisclient plus Menü-Klicks und sichtbare Menü-/Inventargegenstände mit Anzahl, Name, Farbcodes und Lore |
-          | \`premium-afk-windows.exe\` | \`premium-afk-linux\` | Bewegung, formatiertes Scoreboard, Menü-Klicks, Tastenzustand und Anti-AFK; ohne Gegenstandsdaten und POV-Weltspeicher |
-          | \`premium-items-afk-windows.exe\` | \`premium-items-afk-linux\` | Premium plus sichtbare Menü- und Inventargegenstände mit Namen, Farben und Lore |
-          | \`pov-afk-windows.exe\` | \`pov-afk-linux\` | eigener POV-Client; startet automatisch eine Live-First-Person-Ansicht der geladenen Welt im Terminal |
-          | \`ultra-afk-windows.exe\` | \`ultra-afk-linux\` | alle Rust-Funktionen in einer Datei: Premium, Items und mit \`:pov live\` zuschaltbare POV |
-
-          Die vier Java-Dateien bleiben unverändert getrennt nach Protokollversion:
-          \`afk-1.21.1.jar\`, \`afk-1.21.11.jar\`, \`afk-26.1.jar\` und \`afk-26.2.jar\`.
-          Items-, POV-, Premium-Items- und Ultra-Varianten gibt es bewusst nur für Rust.
-
-          ## Neu in 2.2.0 – Fehlerbehebungen und Tempo (nur Rust-Client)
-
-          **Behobene Fehler**
-
-          - **\`:use\` hat auf 1.21.1 die Verbindung gekostet.** Die Blickrichtung steht erst ab
-            1.21.2 mit im \`ServerboundUseItemPacket\`; der Client hängte sie in allen Versionen an.
-            Auf 1.21.1 kamen dadurch acht Byte zu viel an, der Paket-Decoder des Servers geriet aus
-            dem Tritt und die Sitzung war weg. Jetzt richtet sich das Paket nach der Version – am
-            Socket geprüft (2 gegen 10 Byte Nutzdaten).
-          - **\`--on chat:\` traf Umlaute nicht.** Der Auslöser wurde nur nach ASCII-Regeln
-            kleingeschrieben, die Chat-Zeile dagegen vollständig. \`--on "chat:Du bist ÜBERFÄLLIG=/lobby"\`
-            konnte deshalb nie zutreffen – ausgerechnet auf deutschsprachigen Servern.
-          - **\`@event\`-Zeilen zerbrachen an mehrzeiligen Servermeldungen.** Kick-Gründe sind
-            regelmäßig mehrzeilig, Scoreboard-Zeilen und Lore ebenfalls. Der Umbruch riss die Zeile
-            auseinander, und alles dahinter sah für ein Panel aus wie eine gewöhnliche Statuszeile.
-            Die zugesagte Regel „genau eine Zeile je Ereignis" gilt jetzt wirklich.
-          - **SRV-Auflösung fragte auch nach einer verbindlichen Antwort weiter.** Die meisten
-            Server haben gar keinen SRV-Eintrag; der erste Resolver sagte das auch, gefragt wurden
-            trotzdem alle drei. Bei blockiertem UDP kostete das vor **jedem** Verbindungsversuch
-            4,5 Sekunden. Jetzt endet die Suche mit der ersten gültigen Auskunft; nur eine echte
-            Störung (SERVFAIL, Zeitablauf) geht an den nächsten Resolver weiter.
-          - **Eine einzige unbrauchbare Eingabezeile machte den Client dauerhaft taub.** Ein Signal
-            oder ein Byte, das kein UTF-8 ist, beendete die Eingabeschleife endgültig – der Client
-            nahm danach keine Zeile mehr an, obwohl die Standardeingabe offen war.
-          - **\`:look\` konnte sich endlos drehen.** Setzt der Server die Blickrichtung laufend
-            zurück (Anticheat, Fahrzeug), lief die Drehschleife ohne Zeitlimit mit zwanzig Paketen
-            je Sekunde weiter, ohne je zurückzukommen. Jetzt gilt dieselbe Notbremse wie beim Laufen.
-          - **Reguläre Unterserver-Wechsel wurden irgendwann ausgebremst.** Der Zähler gegen
-            Weiterreich-Schleifen lief über die ganze Laufzeit weiter, statt nur schnell
-            aufeinanderfolgende Transfers zu zählen: ab dem vierten Wechsel gab es eine Warnung
-            und eine wachsende Wartezeit für einen völlig normalen Vorgang.
-          - **Anti-AFK bremste beim Beitritt den Netz-Thread.** Der Start wartete bis zu 200 ms auf
-            einen noch aufräumenden Vorgänger – und zwar im Netz-Thread, der in dieser Zeit keine
-            KeepAlive-Pakete beantwortete. Das Warten läuft jetzt im eigenen Thread.
-          - **Live-Ansicht konnte nach einem Neustart stumm bleiben.** Zwischen dem Ende des
-            Zeichners und dem Freigeben seines Merkers wurde ein neuer Start abgewiesen; die
-            Ansicht galt dann als „live" und zeichnete trotzdem nie wieder.
-          - **Grenzen gegen bösartige oder kaputte Server.** Netzwerk-NBT konnte aus wenigen
-            Megabyte Paketdaten fast ein Gigabyte Speicher machen (eine Liste aus Einzelbytes wird
-            beim Einlesen um das Dreißigfache größer); Cookies wuchsen unbegrenzt weiter. Beides
-            ist jetzt gedeckelt. Eine negative Paket-ID traf außerdem auf die \`-1\`-Einträge der
-            Versionstabelle und wurde als ein Paket verarbeitet, das der Server nie gesendet hat.
-          - **Port 0** wird als Serveradresse jetzt abgewiesen statt an den Netzstapel gereicht.
-
-          **Tempo und Verbrauch**
-
-          - **Live-POV noch einmal 12–14 % schneller.** Der Strahl merkt sich jetzt den
-            16x16x16-Abschnitt statt nur den Chunk: solange er in derselben Höhenscheibe bleibt,
-            entfallen Höhenrechnung, Bereichsprüfung und zwei Zeigerebenen. Gemessen auf demselben
-            Rechner: 2,11 → 1,86 ms je Bild bei 64x32 und 12,70 → 11,09 ms bei 160x80.
-          - **Kein Neuanlegen der Bildpuffer.** Szene, Bildpunkte und Ausgabezeichenkette werden
-            von Bild zu Bild weiterverwendet – bei 160x80 und acht Bildern je Sekunde waren das
-            mehrere Megabyte Allokation je Sekunde, nur um sie sofort wieder wegzuwerfen.
-          - **Chat-Ausgabe ohne Zwischenzeichenketten.** Der Stil jedes Textbausteins wurde als
-            eigene Zeichenkette angelegt und sofort verworfen; jetzt wird direkt in die Zeile
-            geschrieben. Das ist der Dauerbetrieb auch des schlanken Clients.
-          - **Verschlüsselung mit einer 16-Byte-Kopie weniger je Byte** und **wiederverwendete
-            Sendepuffer**: ein Paket legte bisher zwei bis drei kurzlebige Vektoren an.
-
-          **Unverändert**
-
-          - Tablist und Playerlist gibt es in keiner Rust-Variante.
-          - Nach einem Kick oder Verbindungsabbruch verbindet sich der Client nicht automatisch neu,
-            sondern beendet sich mit Fehlerstatus. Nur ein ausdrücklich vom Server angeordneter
-            Transfer auf einen Unterserver wird als Teil derselben Sitzung weiter befolgt.
-          - Das Bildformat der Live-POV ist eine zugesagte Schnittstelle und bleibt, wie es ist.
-          - Die vier Java-Jars sind in diesem Release inhaltlich unverändert.
-
-          Die beigefügte [RELEASE.md](https://github.com/${{ github.repository }}/releases/download/latest/RELEASE.md)
-          enthält die ausführliche Auswahlhilfe, Bedienbefehle und Startbeispiele. Die vollständige
-          Funktionsmatrix steht in [FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md).
-
-          Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`
-          EOF
+          # Der Fließtext steht als gewöhnliche Markdown-Datei im Baum: .github/release-notes.md
+          # In einem Here-Dokument wäre er in YAML in Bash geschachtelt, und jeder Backtick und
+          # jedes Dollarzeichen müsste einzeln escapt werden – ein Fehler dabei fällt erst am
+          # fertigen Release auf. So lässt sich die Datei vor dem Push lesen wie jede andere.
+          {
+            echo "Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7})."
+            echo
+            cat .github/release-notes.md
+            echo
+            echo "Die beigefügte [RELEASE.md](https://github.com/${{ github.repository }}/releases/download/latest/RELEASE.md)"
+            echo "enthält die ausführliche Auswahlhilfe, Bedienbefehle und Startbeispiele. Die"
+            echo "vollständige Funktionsmatrix steht in"
+            echo "[FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md)."
+            echo
+            echo "Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`"
+          } > notes.md
 
           gh release create "$ENTWURF" \
             --draft \

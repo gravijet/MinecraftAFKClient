@@ -20,6 +20,15 @@ use std::time::Duration;
 /// Spiel noch je zu einer Fehlermeldung.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Obergrenze für den Antwortkopf eines HTTP-Proxys.
+///
+/// `read_line` liest ohne Grenze bis zum Zeilenumbruch, und die Kopfschleife lief ohne Grenze
+/// weiter: Ein Proxy, der endlos Kopfzeilen (oder eine einzige endlose Zeile) schickt, ließ den
+/// Speicher des Clients volllaufen, ohne dass je ein Zeitablauf gegriffen hätte – es kamen ja
+/// laufend Daten. Echte Antworten sind ein paar hundert Byte lang.
+const MAX_HEADER_BYTES: u64 = 64 * 1024;
+const MAX_HEADER_LINES: usize = 100;
+
 /// Ein Proxy aus `--proxy`.
 #[derive(Clone)]
 pub struct Proxy {
@@ -246,7 +255,10 @@ impl Proxy {
         // Antwortkopf zeilenweise lesen, bis die Leerzeile kommt. `BufReader` liest womöglich
         // über das Ende hinaus – deshalb ein eigener, der danach wieder verworfen wird und
         // dessen Puffer nur den Kopf enthalten kann (die Gegenstelle schweigt bis dahin).
-        let mut reader = BufReader::new(stream);
+        //
+        // Die Längengrenze steckt im Leser selbst: `read_line` hört am Ende des Kontingents auf,
+        // statt eine beliebig lange Zeile in den Speicher zu ziehen.
+        let mut reader = BufReader::new(stream.take(MAX_HEADER_BYTES));
         let mut status = String::new();
         reader.read_line(&mut status)?;
         // Genau das zweite Feld der Statuszeile ist der Code. `contains(" 200")` ließe sich von
@@ -257,15 +269,19 @@ impl Proxy {
                 status.trim_end().trim()
             )));
         }
-        loop {
-            let mut line = String::new();
+        // Mit Obergrenze: ein Proxy, der endlos Kopfzeilen schickt, hätte diese Schleife sonst
+        // ewig am Laufen gehalten – ein Zeitablauf greift dabei nie, es kommen ja laufend Daten.
+        let mut line = String::new();
+        for _ in 0..MAX_HEADER_LINES {
+            line.clear();
             if reader.read_line(&mut line)? == 0 {
                 return Err(fail("Proxy hat die Verbindung mitten im Kopf beendet"));
             }
-            if line == "\r\n" || line == "\n" {
+            if line.trim_end_matches(['\r', '\n']).is_empty() {
                 return Ok(());
             }
         }
+        Err(fail("Proxy-Antwort hat keinen erkennbaren Kopfabschluss"))
     }
 }
 

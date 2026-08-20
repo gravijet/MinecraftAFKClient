@@ -70,6 +70,23 @@ public class AfkClient {
     private static final int MAX_MESSAGE_CHARS = 256;
     private static final int MAX_COMMAND_CHARS = 32_500;
 
+    /**
+     * So viele Cookies hebt der Client je Verbindung auf, und so groß darf eines höchstens sein.
+     *
+     * <p>Dieselben Grenzen zieht auch der Vanilla-Client. Ohne sie konnte ein Server unter immer
+     * neuen Namen beliebig viele Cookies ablegen und den Speicher damit still volllaufen lassen –
+     * geleert wurde die Ablage nämlich nie, auch nicht beim Verbindungsaufbau.
+     */
+    private static final int MAX_COOKIES = 64;
+    private static final int MAX_COOKIE_BYTES = 5120;
+
+    /**
+     * So viele Zeilen dürfen höchstens auf das Senden warten. Mehr kann bei einem Mindestabstand
+     * von einer Sekunde ohnehin niemand abarbeiten; ohne Grenze ließe eine dauerfeuernde Quelle
+     * den Speicher langsam volllaufen.
+     */
+    private static final int MAX_QUEUE = 64;
+
     private final AuthManager auth;
     private final Options options;
     private final Console console;
@@ -108,7 +125,13 @@ public class AfkClient {
     private volatile boolean inGame = false;
     /** Trennung wurde von uns ausgelöst (Server-Transfer) -> ohne Backoff neu verbinden. */
     private volatile boolean intentionalDisconnect = false;
-    private volatile int reconnectAttempts = 0;
+    /**
+     * Zählt die Fehlversuche in Folge. Atomar, weil daran zwei Threads schreiben: der
+     * Netty-Thread beim Trennen und der Reconnect-Thread, wenn schon der Aufbau scheitert.
+     * Ein verlorenes Inkrement hätte den Backoff zurückgesetzt und den Client im Sekundentakt
+     * gegen einen Server laufen lassen, der ihn gerade nicht will.
+     */
+    private final AtomicInteger reconnectAttempts = new AtomicInteger();
     /**
      * true, sobald auf DIESER TCP-Verbindung schon ein Login-Paket kam. Das erste Login = echter
      * Beitritt zum (Velocity/BungeeCord-)Proxy; jedes weitere Login auf derselben Verbindung ist nur
@@ -160,6 +183,10 @@ public class AfkClient {
     private void doConnect() {
         intentionalDisconnect = false;
         joinedThisConnection = false;
+        // Cookies gehören zur Verbindung, nicht zum Prozess: Ohne dieses Leeren sammelten sich
+        // über Stunden die Cookies jedes besuchten Servers an, und der neue bekam obendrein die
+        // des vorigen zurückgereicht.
+        cookies.clear();
         try {
             Session client = Net.create(host, port, auth.gameProfile(), auth.accessToken(),
                     sessionService, packetExecutor, new Listener());
@@ -185,11 +212,11 @@ public class AfkClient {
         if (!reconnectScheduled.compareAndSet(false, true)) {
             return;
         }
-        reconnectAttempts++;
-        int exp = Math.min(reconnectAttempts - 1, 6);
+        int attempt = reconnectAttempts.incrementAndGet();
+        int exp = Math.min(attempt - 1, 6);
         long delay = Math.min((long) (options.reconnectDelaySeconds * Math.pow(2, exp)), options.maxBackoffSeconds);
         delay = Math.max(1, delay);
-        console.info("Reconnect-Versuch " + reconnectAttempts + " in " + delay + "s ...");
+        console.info("Reconnect-Versuch " + attempt + " in " + delay + "s ...");
         final long millis = delay * 1000L;
         Thread t = new Thread(() -> {
             try {
@@ -208,7 +235,7 @@ public class AfkClient {
     private void switchServer(String host, int port) {
         this.host = host;
         this.port = port;
-        reconnectAttempts = 0;
+        reconnectAttempts.set(0);
         intentionalDisconnect = true;
         Session current = session;
         if (current != null && current.isConnected()) {
@@ -264,6 +291,11 @@ public class AfkClient {
             console.error("Nicht verbunden – Nachricht nicht gesendet.");
             return;
         }
+        // Läuft die Warteschlange über, fällt die älteste Zeile heraus – sie ist die
+        // uninteressanteste, und der Speicher bleibt gedeckelt.
+        while (outgoing.size() >= MAX_QUEUE && outgoing.poll() != null) {
+            console.warn("Sendewarteschlange voll – die älteste Zeile ist herausgefallen.");
+        }
         outgoing.add(input);
     }
 
@@ -314,9 +346,23 @@ public class AfkClient {
         StringBuilder out = new StringBuilder(Math.min(input.length(), limit));
         for (int i = 0; i < input.length() && out.length() < limit; i++) {
             char c = input.charAt(i);
-            if (c != 167 && c >= ' ' && c != 127) {
-                out.append(c);
+            if (c == 167 || c < ' ' || c == 127) {
+                continue;
             }
+            // Ein Emoji besteht aus zwei `char`. Genau zwischen ihnen zu kürzen ergäbe eine
+            // halbe Zeichenfolge, und die weist der Server als ungültige Zeichenkette ab –
+            // statt die Nachricht einfach ein Zeichen kürzer anzunehmen.
+            if (Character.isHighSurrogate(c)) {
+                if (i + 1 >= input.length() || out.length() + 2 > limit) {
+                    break;
+                }
+                out.append(c).append(input.charAt(++i));
+                continue;
+            }
+            if (Character.isLowSurrogate(c)) {
+                continue; // zweite Hälfte ohne erste – die kann nur Müll sein
+            }
+            out.append(c);
         }
         return out.toString().trim();
     }
@@ -384,7 +430,7 @@ public class AfkClient {
                 return;
             }
             // Cookie-Pakete liegen je Minecraft-Version in verschiedenen Java-Paketen.
-            if (Net.cookies(packet, session, cookies)) {
+            if (Net.cookies(packet, session, cookies, MAX_COOKIES, MAX_COOKIE_BYTES)) {
                 return;
             }
             if (packet instanceof ClientboundLoginPacket) {
@@ -469,7 +515,7 @@ public class AfkClient {
         wasDead = false;
         sendClientSettings();
         if (firstJoin) {
-            reconnectAttempts = 0;
+            reconnectAttempts.set(0);
             console.ok("Verbunden und im Spiel als " + auth.username() + ".");
             startCommands();
         } else {
@@ -583,11 +629,14 @@ public class AfkClient {
 
     private void handlePosition(ClientboundPlayerPositionPacket pos) {
         Teleport teleport = Net.teleport(pos, posX, posY, posZ, yaw, pitch);
-        posX = teleport.x();
-        posY = teleport.y();
-        posZ = teleport.z();
-        yaw = teleport.yaw();
-        pitch = teleport.pitch();
+        // Eine unbrauchbare Zahl (kaputtes Plugin, übergelaufener relativer Teleport) bliebe
+        // sonst dauerhaft im Zustand stehen: Jede weitere Rechnung lieferte wieder NaN, das
+        // Bewegungspaket ging so zurück zum Server, und der trennte wegen unmöglicher Bewegung.
+        posX = coordinate(teleport.x(), posX);
+        posY = coordinate(teleport.y(), posY);
+        posZ = coordinate(teleport.z(), posZ);
+        yaw = angle(teleport.yaw(), yaw);
+        pitch = angle(teleport.pitch(), pitch);
         havePosition = true;
         Session current = session;
         if (current == null || !current.isConnected()) {
@@ -597,6 +646,17 @@ public class AfkClient {
         // Position EINMAL zurückspiegeln – KEINE Eigenbewegung, nur die Antwort auf den Teleport.
         current.send(new ServerboundAcceptTeleportationPacket(teleport.id()));
         current.send(Net.move(posX, posY, posZ, yaw, pitch, true));
+    }
+
+    /** Die Weltgrenze von Minecraft – alles darüber hinaus ist keine Position, sondern ein Fehler. */
+    private static final double WORLD_LIMIT = 3.2e7;
+
+    private static double coordinate(double value, double fallback) {
+        return Double.isFinite(value) && Math.abs(value) <= WORLD_LIMIT ? value : fallback;
+    }
+
+    private static float angle(float value, float fallback) {
+        return Float.isFinite(value) ? value : fallback;
     }
 
     private void handleHealth(ClientboundSetHealthPacket hp) {

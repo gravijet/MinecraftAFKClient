@@ -421,8 +421,13 @@ fn request_device_code() -> Res<(String, DeviceCode)> {
 }
 
 /// Wartet, bis der Nutzer im Browser bestätigt hat (max. 5 Minuten).
+///
+/// Der Abstand zwischen zwei Anfragen steigt, sobald Microsoft `slow_down` meldet. Ohne das
+/// wurde weiter im festen Fünf-Sekunden-Takt gefragt – und Microsoft beantwortet das irgendwann
+/// gar nicht mehr, der Login lief dann in den Zeitablauf statt zustande zu kommen.
 fn poll_for_token(device_code: &str) -> Res<(String, String, i64)> {
     let deadline = SystemTime::now() + Duration::from_secs(300);
+    let mut interval = Duration::from_secs(5);
     loop {
         let response = agent().post(TOKEN_URL).send_form(&[
             ("client_id", CLIENT_ID),
@@ -444,10 +449,13 @@ fn poll_for_token(device_code: &str) -> Res<(String, String, i64)> {
                 if error != "authorization_pending" && error != "slow_down" {
                     return Err(format!("Microsoft-Login abgelehnt: {}", error));
                 }
+                if error == "slow_down" {
+                    interval = (interval + Duration::from_secs(5)).min(Duration::from_secs(30));
+                }
                 if SystemTime::now() > deadline {
                     return Err("Zeitüberschreitung beim Microsoft-Login.".to_string());
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(interval);
             }
             Err(e) => return Err(format!("Microsoft-Login fehlgeschlagen: {}", short(e))),
         }

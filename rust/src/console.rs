@@ -71,7 +71,7 @@ impl Console {
     /// Einen im Speicher liegenden `§`-Text anzeigefertig machen. Anzeigetafel und
     /// Gegenstandsnamen werden als `§`-Text gehalten, damit sie unverändert an ein Programm
     /// davor weitergereicht werden können – eingefärbt wird erst hier.
-    #[cfg(any(feature = "board", feature = "items"))]
+    #[cfg(any(feature = "board", feature = "items", feature = "menu"))]
     pub fn text(&self, legacy: &str) -> String {
         if self.is_color() {
             crate::nbt::legacy_to_ansi(legacy)

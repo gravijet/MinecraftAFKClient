@@ -127,12 +127,15 @@ impl<'a> Reader<'a> {
 
     /// Feld überspringen, ohne es zu kopieren. Die Ausbaustufen laufen damit durch Felder, die
     /// sie nicht brauchen (etwa die Höhenkarten eines Chunks).
-    #[cfg(feature = "extras")]
+    ///
+    /// Nur die Bauformen, die wirklich Felder überspringen, kompilieren die beiden mit: eine
+    /// reine Menü-Bauform liest keine Höhenkarten und keine Gegenstands-Komponenten.
+    #[cfg(any(feature = "board", feature = "items", feature = "pov"))]
     pub fn skip(&mut self, n: usize) -> io::Result<()> {
         self.bytes(n).map(|_| ())
     }
 
-    #[cfg(feature = "extras")]
+    #[cfg(any(feature = "board", feature = "items", feature = "pov"))]
     pub fn skip_string(&mut self) -> io::Result<()> {
         let len = self.var_int()?;
         if !(0..=1024 * 1024).contains(&len) {
