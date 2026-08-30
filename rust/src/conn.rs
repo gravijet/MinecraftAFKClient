@@ -424,9 +424,7 @@ mod tests {
     /// über die Registergrenze hinweg (deshalb deutlich mehr als 32 Bytes).
     #[test]
     fn cfb8_stimmt_mit_der_definition_ueberein() {
-        let key = [
-            9u8, 1, 2, 3, 250, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 200,
-        ];
+        let key = [9u8, 1, 2, 3, 250, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 200];
         let plain: Vec<u8> = (0..500u32).map(|i| (i * 37 % 251) as u8).collect();
 
         let mut mine = plain.clone();

@@ -64,6 +64,9 @@ public final class Options {
             java.util.Map.entry("--pov-size", true),
             java.util.Map.entry("--pov-groesse", true),
             java.util.Map.entry("--pov-fps", true),
+            java.util.Map.entry("--pov-web", true),
+            java.util.Map.entry("--pov-resources", true),
+            java.util.Map.entry("--pov-assets", true),
             java.util.Map.entry("--events", false),
             java.util.Map.entry("--sneak", false));
 
@@ -169,12 +172,23 @@ public final class Options {
                 throw new IllegalArgumentException(
                         "Serveradresse ohne schließende Klammer: '" + server + "'");
             }
+            if (server.substring(1, end).isBlank()) {
+                throw new IllegalArgumentException("Serveradresse ohne Namen: '" + server + "'");
+            }
             String rest = server.substring(end + 1);
+            if (!rest.isEmpty() && !rest.startsWith(":")) {
+                throw new IllegalArgumentException(
+                        "Unerlaubter Text hinter der IPv6-Adresse: '" + rest
+                                + "'. Beispiel: [::1]:25565");
+            }
             port = rest.startsWith(":") ? rest.substring(1) : null;
         } else if (server.indexOf(':') != server.lastIndexOf(':')) {
             port = null; // nackte IPv6-Adresse – da ist kein Port dabei
         } else {
             int colon = server.lastIndexOf(':');
+            if (colon == 0) {
+                throw new IllegalArgumentException("Serveradresse ohne Namen: '" + server + "'");
+            }
             port = colon < 0 ? null : server.substring(colon + 1);
         }
         if (port == null) {

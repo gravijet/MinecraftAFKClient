@@ -2,9 +2,11 @@
 //!
 //! Der Server schickt einem Vanilla-Client keine fertigen Bilder, sondern Chunk-Abschnitte mit
 //! kompakten Blockzustands-Paletten sowie einzelne Block- und Entitätsänderungen. Dieses Modul
-//! hält genau diese sichtbare Umgebung im Speicher und zeichnet daraus laufend eine farbige
-//! First-Person-Ansicht im Terminal. Blickrichtung und Kameraposition kommen unmittelbar aus dem
-//! eigenen Positionszustand; die Ansicht folgt daher `:look`, Bewegung und Server-Teleports live.
+//! hält genau diese sichtbare Umgebung im Speicher und zeichnet daraus eine First-Person-Ansicht.
+//! Der neue Browser-Weg liest originale Blockmodelle, PNGs und GUI-Texturen aus der passenden
+//! Client-JAR; die bisherige farbige Terminalansicht bleibt als kompatibler Fallback. Blickrichtung
+//! und Kameraposition kommen unmittelbar aus dem eigenen Positionszustand; die Ansicht folgt daher
+//! `:look`, Bewegung und Server-Teleports live.
 //!
 //! Paketformate sind nicht geschätzt. Die drei tatsächlich verschiedenen Codepfade entsprechen
 //! den mitgelieferten MCProtocolLib-Codecs:
@@ -21,7 +23,7 @@
 //! werden gar nicht erst behalten. Zusammen mit der kleinen angeforderten Sichtweite bleibt die
 //! Live-Ansicht damit im einstelligen MB-Bereich statt im dreistelligen.
 //!
-//! **Ausgabeformat.** Ein Bild besteht aus einer Kopfzeile `POV x=… (:pov stop)` und danach je
+//! **Terminal-Ausgabeformat.** Ein Bild besteht aus einer Kopfzeile `POV x=… (:pov stop)` und danach je
 //! Terminalzeile einer Reihe Halbblöcke `▀` mit Vorder- und Hintergrundfarbe (ein Zeichen = zwei
 //! Bildpunkte). Ohne Farbe kommt stattdessen eine Helligkeitsrampe, eine Zeichenzeile je
 //! Bildzeile. Das Format ist Teil der Schnittstelle nach außen – ein Panel liest es mit –, es
@@ -31,6 +33,7 @@ use crate::buf::{Reader, Writer};
 use crate::client::Shared;
 use crate::nbt::Nbt;
 use crate::options::Options;
+use crate::pov_assets::Assets;
 use crate::proto::In;
 
 use std::collections::HashMap;
@@ -73,6 +76,10 @@ const DEFAULT_FPS: usize = 8;
 /// Auch ein unverändertes Bild wird spätestens so oft wiederholt – ein Programm davor soll an
 /// der Stille nicht ablesen, die Ansicht sei tot.
 const REPEAT_UNCHANGED: Duration = Duration::from_secs(2);
+/// Nahezu gleichzeitige Browser-Anfragen teilen sich denselben teuren Raycast und PNG-Encode.
+/// Der normale Viewer fragt nur alle 200 ms ab; 150 ms Cachezeit veraendern dessen Takt daher
+/// nicht, verhindern aber, dass mehrere Tabs denselben Weltstand parallel neu zeichnen.
+const WEB_FRAME_CACHE: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dimension {
@@ -251,11 +258,7 @@ impl Format {
 
     /// Chunk lesen und dabei die passende Spielart bestimmen. Bevorzugt wird die, die den Puffer
     /// restlos aufgeht **und** die erwartete Zahl Abschnitte liefert.
-    fn probe(
-        preferred: Format,
-        dimension: &Dimension,
-        data: &[u8],
-    ) -> io::Result<(Chunk, Format)> {
+    fn probe(preferred: Format, dimension: &Dimension, data: &[u8]) -> io::Result<(Chunk, Format)> {
         let mut first_error = None;
         let mut fallback: Option<(Chunk, Format)> = None;
         for format in Format::candidates(preferred) {
@@ -356,7 +359,9 @@ impl Chunk {
 
 /// Reihenfolge des Protokolls: `(y << 8) | (z << 4) | x`.
 fn local_index(x: i32, y: i32, z: i32) -> usize {
-    ((y.rem_euclid(16) as usize) << 8) | ((z.rem_euclid(16) as usize) << 4) | x.rem_euclid(16) as usize
+    ((y.rem_euclid(16) as usize) << 8)
+        | ((z.rem_euclid(16) as usize) << 4)
+        | x.rem_euclid(16) as usize
 }
 
 /// Einen Abschnitt lesen. `None` = reine Luft.
@@ -480,6 +485,10 @@ struct Scratch {
     scene: Scene,
     pixels: Vec<Pixel>,
     frame: String,
+    web_rgba: Vec<u8>,
+    web_png: Option<Arc<[u8]>>,
+    web_size: (usize, usize),
+    web_rendered: Option<Instant>,
 }
 
 /// Zugriff auf die Szene, der sich den zuletzt benutzten Chunk **und Abschnitt** merkt.
@@ -569,11 +578,26 @@ pub struct Pov {
     started: Instant,
     /// Puffer, die von Bild zu Bild weiterverwendet werden.
     scratch: Mutex<Scratch>,
+    /// Originale Modelle/Texturen aus der vom Nutzer angegebenen Client-JAR.
+    assets: Option<Arc<Assets>>,
+    asset_error: Option<String>,
+    web_running: AtomicBool,
 }
 
 impl Pov {
     pub fn new(options: &Options) -> Pov {
         let (width, height) = options.pov_size.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
+        let (assets, asset_error) = match (options.pov_web, options.pov_resources.as_deref()) {
+            (Some(_), Some(path)) => match Assets::load(path, options.protocol.name) {
+                Ok(assets) => (Some(Arc::new(assets)), None),
+                Err(error) => (None, Some(error)),
+            },
+            (Some(_), None) => (
+                None,
+                Some("keine Client-JAR angegeben (--pov-resources)".to_string()),
+            ),
+            (None, _) => (None, None),
+        };
         Pov {
             world: Mutex::new(World::default()),
             dimensions: Mutex::new(Vec::new()),
@@ -588,7 +612,18 @@ impl Pov {
             last_frame_ms: AtomicU64::new(0),
             started: Instant::now(),
             scratch: Mutex::new(Scratch::default()),
+            assets,
+            asset_error,
+            web_running: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn assets(&self) -> Option<&Assets> {
+        self.assets.as_deref()
+    }
+
+    pub(crate) fn asset_error(&self) -> Option<&str> {
+        self.asset_error.as_deref()
     }
 
     pub(crate) fn set_dimensions(&self, dimensions: Vec<Dimension>) {
@@ -699,7 +734,9 @@ pub fn on_join(shared: &Arc<Shared>) {
     let autostart = shared
         .options()
         .pov_autostart
-        .unwrap_or(cfg!(feature = "pov-client"));
+        // Mit Browser-Viewer bleibt der teure ANSI-Dauerstrom standardmaessig aus. Wer beides
+        // will, kann ihn weiterhin ausdruecklich mit `--pov an` oder `:pov live` einschalten.
+        .unwrap_or(cfg!(feature = "pov-client") && shared.options().pov_web.is_none());
     if autostart {
         shared.extras.pov.live.store(true, Ordering::SeqCst);
         start_renderer(shared);
@@ -959,10 +996,7 @@ struct RawPalette {
 
 /// Kopf einer Palette lesen: Bitbreite und (bei indirekten Paletten) die Einträge.
 /// Rückgabe: (Bitbreite, Einträge oder `None` für die globale Palette).
-fn palette_head(
-    r: &mut Reader,
-    max_indirect_bits: u8,
-) -> io::Result<(u8, Option<Vec<u32>>)> {
+fn palette_head(r: &mut Reader, max_indirect_bits: u8) -> io::Result<(u8, Option<Vec<u32>>)> {
     let bits = r.u8()?;
     if bits > 32 {
         return Err(crate::buf::err("POV: Palette breiter als 32 Bit"));
@@ -1335,6 +1369,58 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
     }
 }
 
+/// Den optionalen Browser-Viewer genau einmal starten. Er ist von `:pov live` unabhaengig: Das
+/// Terminal kann gestoppt bleiben, waehrend der Browser Frames bei Bedarf abholt.
+pub(crate) fn start_web(shared: &Arc<Shared>) {
+    let Some(address) = shared.options().pov_web else {
+        return;
+    };
+    if shared
+        .extras
+        .pov
+        .web_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    if let Err(error) = crate::pov_web::start(shared, address) {
+        shared.extras.pov.web_running.store(false, Ordering::SeqCst);
+        shared.console.error(&format!("Browser-POV: {}", error));
+    }
+}
+
+pub(crate) fn web_world(shared: &Arc<Shared>) -> serde_json::Value {
+    let world = shared.extras.pov.world.lock().unwrap();
+    let position = shared.position();
+    serde_json::json!({
+        "connected": shared.in_game.load(Ordering::Relaxed),
+        "position": position.map(|value| serde_json::json!({
+            "x": value.0, "y": value.1, "z": value.2,
+            "yaw": value.3, "pitch": value.4
+        })),
+        "dimension": &world.dimension.name,
+        "chunks": world.chunks.len(),
+        "entities": world.entities.len(),
+        "textures": shared.extras.pov.assets.is_some(),
+        "texture_error": shared.extras.pov.asset_error(),
+    })
+}
+
+pub(crate) fn web_asset(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
+    shared.extras.pov.assets()?.raw(path)
+}
+
+#[cfg(feature = "items")]
+pub(crate) fn web_item(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
+    let name = crate::item_names::get(shared.proto.name, id)?;
+    Some(shared.extras.pov.assets()?.item_png(name))
+}
+
+pub(crate) fn web_missing(shared: &Arc<Shared>) -> Option<Vec<u8>> {
+    Some(shared.extras.pov.assets()?.missing_png().to_vec())
+}
+
 fn start_renderer(shared: &Arc<Shared>) {
     if shared
         .extras
@@ -1418,6 +1504,7 @@ fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
         scene,
         pixels,
         frame,
+        ..
     } = &mut *scratch;
     pov.fill_scene(scene);
     render_into(scene, position, width, height, color, pixels, frame);
@@ -1562,6 +1649,123 @@ fn render_into(
     }
 }
 
+/// Hochaufloesender PNG-Frame fuer den Browser-Viewer. Anders als die zugesagte ANSI-Ausgabe
+/// tastet dieser Weg die Originaltexturen ab. Die Szene wird genauso kurz kopiert und danach
+/// ohne Weltsperre gerendert wie beim Terminalbild.
+pub(crate) fn web_frame(
+    shared: &Arc<Shared>,
+    width: usize,
+    height: usize,
+) -> Result<Arc<[u8]>, String> {
+    let position = shared
+        .position()
+        .ok_or_else(|| "Position noch unbekannt".to_string())?;
+    let assets = shared.extras.pov.assets().ok_or_else(|| {
+        shared
+            .extras
+            .pov
+            .asset_error()
+            .unwrap_or("keine Ressourcen")
+            .to_string()
+    })?;
+    let width = width.clamp(160, 640);
+    let height = height.clamp(90, 360);
+    if width.saturating_mul(height) > 640 * 360 {
+        return Err("Bild ist groesser als 640x360".to_string());
+    }
+    let mut scratch = shared.extras.pov.scratch.lock().unwrap();
+    if scratch.web_size == (width, height)
+        && scratch
+            .web_rendered
+            .is_some_and(|at| at.elapsed() < WEB_FRAME_CACHE)
+    {
+        if let Some(bytes) = &scratch.web_png {
+            return Ok(Arc::clone(bytes));
+        }
+    }
+
+    let bytes = {
+        let Scratch {
+            scene,
+            pixels,
+            web_rgba,
+            ..
+        } = &mut *scratch;
+        shared.extras.pov.fill_scene(scene);
+        render_textured(scene, position, width, height, assets, pixels);
+        web_rgba.clear();
+        web_rgba.reserve(width * height * 4);
+        for pixel in pixels {
+            web_rgba.extend_from_slice(&[pixel.rgb.0, pixel.rgb.1, pixel.rgb.2, 255]);
+        }
+        crate::pov_assets::encode_rgba_png(width, height, web_rgba)?
+    };
+    let bytes: Arc<[u8]> = bytes.into();
+    scratch.web_size = (width, height);
+    scratch.web_rendered = Some(Instant::now());
+    scratch.web_png = Some(Arc::clone(&bytes));
+    Ok(bytes)
+}
+
+fn render_textured(
+    scene: &Scene,
+    position: (f64, f64, f64, f32, f32),
+    width: usize,
+    height: usize,
+    assets: &Assets,
+    pixels: &mut Vec<Pixel>,
+) {
+    let origin = (position.0, position.1 + 1.62, position.2);
+    pixels.clear();
+    pixels.reserve(width * height);
+    let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
+    let half_height = half_width * height as f64 / width as f64;
+    let basis = camera_basis(position.3 as f64, position.4 as f64);
+    let mut cursor = Cursor::new(scene);
+
+    for py in 0..height {
+        let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
+        let sky = sky_color(py, height);
+        for px in 0..width {
+            let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
+            let direction = normalize((
+                basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
+                basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
+                basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
+            ));
+            pixels.push(
+                match cast_textured(&mut cursor, origin, direction, assets) {
+                    Some((rgba, distance, face)) => {
+                        let light = match face {
+                            3 => 1.0,
+                            2 => 0.55,
+                            4 | 5 => 0.82,
+                            _ => 0.70,
+                        };
+                        let color = (
+                            (rgba.0 as f64 * light).min(255.0) as u8,
+                            (rgba.1 as f64 * light).min(255.0) as u8,
+                            (rgba.2 as f64 * light).min(255.0) as u8,
+                        );
+                        Pixel {
+                            rgb: fog(color, sky, distance),
+                            depth: distance,
+                        }
+                    }
+                    None => Pixel {
+                        rgb: sky,
+                        depth: MAX_DISTANCE,
+                    },
+                },
+            );
+        }
+    }
+    // Der Browser legt absichtlich keine pinken/tuerkisen Ersatzrechtecke ueber die echten
+    // Texturen. Fuer originalgetreue Entities braeuchte er Entity-Modelle, Metadaten, Ausruestung
+    // und Skins, die dieser schlanke Weltzustand noch nicht fuehrt. Die alte Terminalausgabe
+    // behaelt ihr kompaktes Overlay; die neue Ansicht erfindet an dieser Stelle nichts.
+}
+
 /// `\x1b[38;2;r;g;bm` ohne `format!` – bei 160x80 sind das sonst 12 800 Allokationen je Bild.
 fn push_color(out: &mut String, prefix: &str, rgb: (u8, u8, u8)) {
     out.push_str(prefix);
@@ -1649,6 +1853,60 @@ fn cast(
             return Some((cursor.block(cell.0, cell.1, cell.2), distance, face));
         }
         advance(&mut cell, &mut next, &mut distance, &mut face, step, delta);
+    }
+    None
+}
+
+/// DDA fuer den Textur-Renderer. Der Treffer enthaelt die konkrete Seite und ihre UV-Koordinate;
+/// ein voll transparenter Texel gilt nicht als Treffer. Dadurch werden Alpha-Ausschnitte echter
+/// Vanilla-Texturen nicht wieder zu undurchsichtigen Farbklotzen.
+fn cast_textured(
+    cursor: &mut Cursor,
+    origin: (f64, f64, f64),
+    dir: (f64, f64, f64),
+    assets: &Assets,
+) -> Option<crate::pov_assets::TexturedHit> {
+    let mut cell = (
+        origin.0.floor() as i32,
+        origin.1.floor() as i32,
+        origin.2.floor() as i32,
+    );
+    let step = (sign(dir.0), sign(dir.1), sign(dir.2));
+    let delta = (inv_abs(dir.0), inv_abs(dir.1), inv_abs(dir.2));
+    let mut next = (
+        first_boundary(origin.0, dir.0, cell.0),
+        first_boundary(origin.1, dir.1, cell.1),
+        first_boundary(origin.2, dir.2, cell.2),
+    );
+    let mut distance = 0.0;
+    while distance <= MAX_DISTANCE {
+        if cursor.solid(cell.0, cell.1, cell.2) {
+            let leave = next.0.min(next.1).min(next.2).min(MAX_DISTANCE);
+            if let Some(hit) = assets.hit(
+                cursor.block(cell.0, cell.1, cell.2),
+                cell,
+                origin,
+                dir,
+                distance,
+                leave,
+            ) {
+                return Some(hit);
+            }
+        }
+
+        if next.0 <= next.1 && next.0 <= next.2 {
+            cell.0 += step.0;
+            distance = next.0;
+            next.0 += delta.0;
+        } else if next.1 <= next.2 {
+            cell.1 += step.1;
+            distance = next.1;
+            next.1 += delta.1;
+        } else {
+            cell.2 += step.2;
+            distance = next.2;
+            next.2 += delta.2;
+        }
     }
     None
 }
@@ -1882,7 +2140,14 @@ mod tests {
         for (yaw, pitch) in [(0.0, 0.0), (37.0, -12.0), (-140.0, 25.0)] {
             let basis = camera_basis(yaw, pitch);
             // Bewusst auch die vier Ecken: dort war der Fehler am größten.
-            for (px, py) in [(0usize, 0usize), (63, 0), (0, 31), (63, 31), (32, 16), (10, 25)] {
+            for (px, py) in [
+                (0usize, 0usize),
+                (63, 0),
+                (0, 31),
+                (63, 31),
+                (32, 16),
+                (10, 25),
+            ] {
                 let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
                 let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
                 let dir = normalize((
@@ -2032,7 +2297,10 @@ mod tests {
             write_section(&mut w, format, &[0u32; SECTION_BLOCKS], 0);
             let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
             assert_eq!(chunk.block(0, 0, 0), 0);
-            assert!(chunk.sections[0].is_none(), "reine Luft braucht keinen Platz");
+            assert!(
+                chunk.sections[0].is_none(),
+                "reine Luft braucht keinen Platz"
+            );
         }
     }
 
@@ -2203,14 +2471,7 @@ mod tests {
             if let Some(state) = block {
                 return Some((state, distance, face));
             }
-            advance(
-                &mut cell,
-                &mut next,
-                &mut distance,
-                &mut face,
-                step,
-                delta,
-            );
+            advance(&mut cell, &mut next, &mut distance, &mut face, step, delta);
         }
         None
     }
@@ -2321,13 +2582,29 @@ mod tests {
         for (width, height) in [(64usize, 32usize), (160, 80)] {
             // Einmal warmlaufen, damit die Messung nicht den ersten Zugriff mitzählt.
             pov.fill_scene(&mut scene);
-            render_into(&scene, position, width, height, true, &mut pixels, &mut frame);
+            render_into(
+                &scene,
+                position,
+                width,
+                height,
+                true,
+                &mut pixels,
+                &mut frame,
+            );
 
             let runs = 200;
             let started = Instant::now();
             for _ in 0..runs {
                 pov.fill_scene(&mut scene);
-                render_into(&scene, position, width, height, true, &mut pixels, &mut frame);
+                render_into(
+                    &scene,
+                    position,
+                    width,
+                    height,
+                    true,
+                    &mut pixels,
+                    &mut frame,
+                );
                 std::hint::black_box(&frame);
             }
             let each = started.elapsed() / runs;
@@ -2425,7 +2702,10 @@ mod tests {
             std::hint::black_box(&chunk);
         }
         let each = started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
-        println!("\nChunk einlesen: {:.3} ms je Chunk ({} Runden)\n", each, ROUNDS);
+        println!(
+            "\nChunk einlesen: {:.3} ms je Chunk ({} Runden)\n",
+            each, ROUNDS
+        );
     }
 
     #[test]
@@ -2448,4 +2728,3 @@ mod tests {
         }
     }
 }
-

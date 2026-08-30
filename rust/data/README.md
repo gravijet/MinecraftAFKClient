@@ -17,3 +17,19 @@ sortiert. Verwendete Server-JARs:
 
 Bei einer neuen Protokollversion muss eine neue Liste aus genau deren Server-JAR erzeugt werden;
 IDs aus einer anderen Version dürfen nicht übernommen oder geraten werden.
+
+## Block-State-Tabellen der Browser-POV
+
+`block-states-<version>.txt.gz` ordnet jede globale Netzwerk-State-ID dem Ressourcennamen, den
+Properties und Mojangs `default`-Markierung des Blockzustands zu. Die Quelle sind dieselben vier
+offiziellen Server-JARs und darin `generated/reports/blocks.json`. Der Client braucht diese
+Zuordnung, weil Chunk-Pakete nur die ID, die Client-JAR Modelle und Texturen dagegen nur
+Ressourcennamen enthält. Die Default-Markierung bestimmt insbesondere das Modell eines Blockitems;
+die kleinste State-ID ist bei vielen Blocks nicht der Default-State.
+
+Die Dateien werden mit `generate-block-states.sh` reproduzierbar neu erzeugt. Das Skript lädt die
+zu den Versionsmetadaten gehörenden offiziellen Server-JARs, startet Mojangs Datengenerator und
+sortiert lückenlos nach State-ID und verifiziert vor dem Start den von Mojang veröffentlichten
+SHA-1-Hash der Server-JAR. Benötigt werden `curl`, `jq`, `gzip`, `sha1sum` und ein zur Server-JAR
+passendes Java. Die Texturen selbst sind ausdrücklich nicht enthalten; sie kommen zur Laufzeit
+aus der mit `--pov-resources` angegebenen Client-JAR des Nutzers.

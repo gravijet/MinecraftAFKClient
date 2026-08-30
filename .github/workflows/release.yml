@@ -28,7 +28,7 @@ jobs:
     name: Sammel-Release anlegen
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Entwurf neu anlegen
         env:
@@ -38,28 +38,13 @@ jobs:
           # Reste eines abgebrochenen Laufs weg (Entwürfe haben keinen Tag, daher || true).
           gh release delete "$ENTWURF" --yes --cleanup-tag || true
 
-          # Der Fließtext steht als gewöhnliche Markdown-Datei im Baum: .github/release-notes.md
-          # In einem Here-Dokument wäre er in YAML in Bash geschachtelt, und jeder Backtick und
-          # jedes Dollarzeichen müsste einzeln escapt werden – ein Fehler dabei fällt erst am
-          # fertigen Release auf. So lässt sich die Datei vor dem Push lesen wie jede andere.
-          {
-            echo "Automatisch gebaut aus \`$GITHUB_REF_NAME\` (${GITHUB_SHA:0:7})."
-            echo
-            cat .github/release-notes.md
-            echo
-            echo "Die beigefügte [RELEASE.md](https://github.com/${{ github.repository }}/releases/download/latest/RELEASE.md)"
-            echo "enthält die ausführliche Auswahlhilfe, Bedienbefehle und Startbeispiele. Die"
-            echo "vollständige Funktionsmatrix steht in"
-            echo "[FEATURES.md](https://github.com/${{ github.repository }}/blob/main/FEATURES.md)."
-            echo
-            echo "Hilfe: \`afk-windows.exe --help\` bzw. \`java -jar afk-26.1.jar --help\`"
-          } > notes.md
-
+          # Diese Datei ist zugleich der zusammengefuehrte Changelog. Keine automatisch
+          # erzeugte Kopf-/Fusszeile: Der Release-Text muss bytegenau diesem Stand entsprechen.
           gh release create "$ENTWURF" \
             --draft \
             --target "$GITHUB_SHA" \
             --title "AFKSystems – latest" \
-            --notes-file notes.md
+            --notes-file .github/release-notes.md
           gh release upload "$ENTWURF" RELEASE.md --clobber
 
   java:
@@ -67,9 +52,9 @@ jobs:
     needs: vorbereiten
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '21'
@@ -79,7 +64,7 @@ jobs:
         run: |
           chmod +x gradlew
           for v in 1.21.1 1.21.11 26.1 26.2; do
-            ./gradlew :java:shadowJar -Pmc=$v --console=plain
+            ./gradlew :java:clean :java:test :java:shadowJar -Pmc=$v --console=plain --warning-mode all
           done
 
       - name: Hochladen
@@ -107,9 +92,11 @@ jobs:
             ext: .exe
             platform: windows
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -119,19 +106,23 @@ jobs:
         working-directory: rust
         shell: bash
         run: |
-          cargo build --release
-          cargo build --release --features movement --target-dir target/movement
-          cargo build --release --features items --target-dir target/items
-          cargo build --release --features premium --target-dir target/premium
-          cargo build --release --features premium,items --target-dir target/premium-items
-          cargo build --release --features pov-client --target-dir target/pov
-          cargo build --release --features ultra --target-dir target/ultra
+          if [ '${{ matrix.platform }}' = linux ]; then
+            cargo fmt --all --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+          fi
+          cargo build --locked --release
+          cargo build --locked --release --features movement --target-dir target/movement
+          cargo build --locked --release --features items --target-dir target/items
+          cargo build --locked --release --features premium --target-dir target/premium
+          cargo build --locked --release --features premium,items --target-dir target/premium-items
+          cargo build --locked --release --features pov-client --target-dir target/pov
+          cargo build --locked --release --features ultra --target-dir target/ultra
 
       - name: Tests
         working-directory: rust
         run: |
-          cargo test --release
-          cargo test --release --all-features --target-dir target/tests
+          cargo test --locked --release
+          cargo test --locked --release --all-features --target-dir target/tests
 
       - name: Hochladen
         shell: bash

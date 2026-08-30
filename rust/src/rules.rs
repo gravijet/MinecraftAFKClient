@@ -99,9 +99,9 @@ impl Rules {
                 // beim ersten Betreten nicht leer ausgehen.
                 (Trigger::World, Event::World | Event::Join) => true,
                 (Trigger::Death, Event::Death) => true,
-                (Trigger::Chat(needle), Event::Chat(_)) => {
-                    haystack.as_deref().is_some_and(|text| text.contains(needle))
-                }
+                (Trigger::Chat(needle), Event::Chat(_)) => haystack
+                    .as_deref()
+                    .is_some_and(|text| text.contains(needle)),
                 _ => false,
             };
             if !hit {
@@ -225,7 +225,11 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[91mrot\x1b[0m"), "rot");
         assert_eq!(strip_ansi("ohne codes"), "ohne codes");
         let r = rules(vec![(Trigger::Chat("bist afk".into()), "/lobby")], 0);
-        assert_eq!(r.fire(&Event::Chat("\x1b[93mDu \x1b[1mbist AFK\x1b[0m")).len(), 1);
+        assert_eq!(
+            r.fire(&Event::Chat("\x1b[93mDu \x1b[1mbist AFK\x1b[0m"))
+                .len(),
+            1
+        );
     }
 
     #[test]

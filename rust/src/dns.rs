@@ -115,7 +115,11 @@ fn parse_answer(msg: &[u8], id: [u8; 2]) -> Reply {
     let questions = u16::from_be_bytes([msg[4], msg[5]]);
     let answers = u16::from_be_bytes([msg[6], msg[7]]);
     if answers == 0 {
-        return if truncated { Reply::Unusable } else { Reply::Empty };
+        return if truncated {
+            Reply::Unusable
+        } else {
+            Reply::Empty
+        };
     }
 
     let mut pos = 12;
@@ -265,8 +269,14 @@ mod tests {
     #[test]
     fn kleinste_prioritaet_gewinnt() {
         for order in [
-            vec![(30u16, 1u16, &["c", "example", "net"][..]), (5, 2, &["a", "example", "net"][..])],
-            vec![(5, 2, &["a", "example", "net"][..]), (30, 1, &["c", "example", "net"][..])],
+            vec![
+                (30u16, 1u16, &["c", "example", "net"][..]),
+                (5, 2, &["a", "example", "net"][..]),
+            ],
+            vec![
+                (5, 2, &["a", "example", "net"][..]),
+                (30, 1, &["c", "example", "net"][..]),
+            ],
         ] {
             let msg = response(0, 0, &order);
             match parse_answer(&msg, ID) {
@@ -284,9 +294,15 @@ mod tests {
     /// **jedem** Verbindungsversuch.
     #[test]
     fn verbindliche_auskunft_beendet_die_suche() {
-        assert!(matches!(parse_answer(&response(0, 0, &[]), ID), Reply::Empty));
-        assert!(matches!(parse_answer(&response(3, 0, &[]), ID), Reply::Empty)); // NXDOMAIN
-        // Nur A-Records, kein SRV: ebenfalls eine gültige Auskunft.
+        assert!(matches!(
+            parse_answer(&response(0, 0, &[]), ID),
+            Reply::Empty
+        ));
+        assert!(matches!(
+            parse_answer(&response(3, 0, &[]), ID),
+            Reply::Empty
+        )); // NXDOMAIN
+            // Nur A-Records, kein SRV: ebenfalls eine gültige Auskunft.
         let mut msg = response(0, 0, &[(1, 25565, &["mc", "example", "net"])]);
         msg[response(0, 0, &[]).len() + 2] = 0; // Typ des Antworteintrags auf A (1) ...
         msg[response(0, 0, &[]).len() + 3] = 1;
@@ -296,12 +312,24 @@ mod tests {
     /// Eine Störung dieses Resolvers ist keine Auskunft – dann darf der nächste ran.
     #[test]
     fn stoerungen_gehen_an_den_naechsten_resolver() {
-        assert!(matches!(parse_answer(&response(2, 0, &[]), ID), Reply::Unusable)); // SERVFAIL
-        assert!(matches!(parse_answer(&response(5, 0, &[]), ID), Reply::Unusable)); // REFUSED
-        // Abgeschnitten: das „keine Antworten" könnte am Kürzen liegen.
-        assert!(matches!(parse_answer(&response(0, 0x02, &[]), ID), Reply::Unusable));
+        assert!(matches!(
+            parse_answer(&response(2, 0, &[]), ID),
+            Reply::Unusable
+        )); // SERVFAIL
+        assert!(matches!(
+            parse_answer(&response(5, 0, &[]), ID),
+            Reply::Unusable
+        )); // REFUSED
+            // Abgeschnitten: das „keine Antworten" könnte am Kürzen liegen.
+        assert!(matches!(
+            parse_answer(&response(0, 0x02, &[]), ID),
+            Reply::Unusable
+        ));
         // Falsche Transaktions-ID (untergeschobene Antwort) und Müll.
-        assert!(matches!(parse_answer(&response(0, 0, &[]), [9, 9]), Reply::Unusable));
+        assert!(matches!(
+            parse_answer(&response(0, 0, &[]), [9, 9]),
+            Reply::Unusable
+        ));
         assert!(matches!(parse_answer(&[], ID), Reply::Unusable));
     }
 

@@ -56,6 +56,7 @@ val minecraftAuthVersion: String by project
 val adventureVersion: String by project
 val gsonVersion: String by project
 val slf4jVersion: String by project
+val junitVersion: String by project
 
 repositories {
     mavenCentral()
@@ -90,6 +91,10 @@ dependencies {
 
     implementation("com.google.code.gson:gson:$gsonVersion")
     implementation("org.slf4j:slf4j-simple:$slf4jVersion")
+
+    testImplementation(platform("org.junit:junit-bom:$junitVersion"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 // Snapshots dürfen nicht tagelang aus dem Cache kommen – sonst baut die CI gegen einen alten
@@ -108,6 +113,11 @@ java {
 // JVM – unter Windows ist das windows-1252, und der Build bricht ab.
 tasks.withType<JavaCompile>().configureEach {
     options.encoding = "UTF-8"
+    options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 application {

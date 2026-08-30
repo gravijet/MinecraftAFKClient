@@ -70,10 +70,7 @@ impl Proxy {
         let (user, address) = match rest.rsplit_once('@') {
             Some((credentials, address)) => {
                 let (name, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-                (
-                    Some((name.to_string(), password.to_string())),
-                    address,
-                )
+                (Some((name.to_string(), password.to_string())), address)
             }
             None => (None, rest),
         };
@@ -215,7 +212,9 @@ impl Proxy {
     /// Benutzername/Passwort nach RFC 1929.
     fn socks5_login(&self, mut stream: &TcpStream) -> io::Result<()> {
         let Some((name, password)) = &self.user else {
-            return Err(fail("Proxy verlangt eine Anmeldung, es ist aber keine hinterlegt"));
+            return Err(fail(
+                "Proxy verlangt eine Anmeldung, es ist aber keine hinterlegt",
+            ));
         };
         if name.len() > 255 || password.len() > 255 {
             return Err(fail("Proxy-Zugangsdaten zu lang"));
@@ -382,9 +381,18 @@ mod tests {
     /// „200" irgendwo im Ablehnungsgrund darf nicht als Erfolg durchgehen.
     #[test]
     fn nur_der_echte_statuscode_zaehlt() {
-        assert_eq!(status_code("HTTP/1.1 200 Connection established\r\n"), Some(200));
-        assert_eq!(status_code("HTTP/1.1 403 Forbidden (rule 200)\r\n"), Some(403));
-        assert_eq!(status_code("HTTP/1.1 407 Proxy Authentication Required"), Some(407));
+        assert_eq!(
+            status_code("HTTP/1.1 200 Connection established\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            status_code("HTTP/1.1 403 Forbidden (rule 200)\r\n"),
+            Some(403)
+        );
+        assert_eq!(
+            status_code("HTTP/1.1 407 Proxy Authentication Required"),
+            Some(407)
+        );
         assert_eq!(status_code(""), None);
     }
 }

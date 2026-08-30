@@ -160,6 +160,9 @@ impl Client {
             last_chat_ms: AtomicI64::new(0),
         });
 
+        #[cfg(feature = "pov")]
+        crate::pov::start_web(&shared);
+
         for (name, task) in [("afk-net", true), ("afk-sender", false)] {
             let owned = Arc::clone(&shared);
             let started = thread::Builder::new().name(name.into()).spawn(move || {
@@ -172,9 +175,10 @@ impl Client {
             // Ohne diese beiden Threads gibt es keinen Client. Ein `expect` hätte hier mit
             // `panic = "abort"` nur einen Abbruch ohne lesbare Ursache hinterlassen.
             if let Err(e) = started {
-                shared
-                    .console
-                    .error(&format!("Thread '{}' liess sich nicht starten: {}", name, e));
+                shared.console.error(&format!(
+                    "Thread '{}' liess sich nicht starten: {}",
+                    name, e
+                ));
                 shared.console.flush(Duration::from_secs(1));
                 std::process::exit(1);
             }
@@ -1299,7 +1303,8 @@ fn parse_chat_body(format: nbt::Fmt, r: &mut Reader) -> Option<String> {
     // chatType: 0 = eingebettete Definition, sonst Registry-ID + 1.
     if r.var_int().ok()? == 0 {
         for _ in 0..2 {
-            r.string().ok()?; // translationKey
+            // translationKey
+            r.string().ok()?;
             // Eine Chat-Verzierung kennt drei mögliche Parameter. Eine andere Zahl heißt, dass
             // der Lesezeiger schon falsch steht – dann lieber keine Zeile als eine erfundene.
             // (Vorher wurde die Zahl auf 16 gestaucht und einfach weitergelesen.)
@@ -1380,7 +1385,11 @@ fn store_cookie(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     let key = r.string().map_err(|e| e.to_string())?;
     let payload = r.byte_array().map_err(|e| e.to_string())?;
     if payload.len() > MAX_COOKIE_BYTES {
-        return Err(format!("Cookie '{}' ist zu groß ({} Byte)", key, payload.len()));
+        return Err(format!(
+            "Cookie '{}' ist zu groß ({} Byte)",
+            key,
+            payload.len()
+        ));
     }
     let mut cookies = shared.cookies.lock().unwrap();
     // Ein bereits bekanntes Cookie darf immer aktualisiert werden; nur neue zählen gegen die Zahl.
@@ -1410,8 +1419,8 @@ fn transfer(shared: &Arc<Shared>, r: &mut Reader) -> Result<bool, String> {
     // `as u16` hätte einen unsinnigen Port stillschweigend beschnitten – und wir wären dann
     // auf irgendeinen Port gelaufen, statt den Fehler zu nennen.
     let raw = r.var_int().map_err(|e| e.to_string())?;
-    let port = u16::try_from(raw)
-        .map_err(|_| format!("Server-Transfer mit unmöglichem Port: {}", raw))?;
+    let port =
+        u16::try_from(raw).map_err(|_| format!("Server-Transfer mit unmöglichem Port: {}", raw))?;
     if host.trim().is_empty() {
         return Err("Server-Transfer ohne Zieladresse".to_string());
     }
@@ -1493,7 +1502,10 @@ mod tests {
             ("\u{1F389}".repeat(400), "nur Emoji"),
             ("ä".repeat(400), "Umlaute"),
             ("a".repeat(400), "ASCII"),
-            (format!("{}{}", "\u{1F389}".repeat(200), "a".repeat(200)), "gemischt"),
+            (
+                format!("{}{}", "\u{1F389}".repeat(200), "a".repeat(200)),
+                "gemischt",
+            ),
         ] {
             let out = sanitize(&text, MAX_MESSAGE_CHARS);
             let units: usize = out.chars().map(char::len_utf16).sum();
@@ -1506,7 +1518,11 @@ mod tests {
                 out.len()
             );
             // Ein Emoji darf dabei nicht in der Mitte zerschnitten werden.
-            assert!(out.chars().all(|c| c != char::REPLACEMENT_CHARACTER), "{}", name);
+            assert!(
+                out.chars().all(|c| c != char::REPLACEMENT_CHARACTER),
+                "{}",
+                name
+            );
         }
         // Die Grenze wird auch wirklich ausgeschöpft, nicht vorsichtshalber unterboten.
         let voll = sanitize(&"\u{1F389}".repeat(400), MAX_MESSAGE_CHARS);
@@ -1541,7 +1557,10 @@ mod tests {
     #[test]
     fn unmoegliche_positionen_werden_abgefangen() {
         let alt = (10.0, 64.0, -20.0, 90.0, 0.0);
-        assert_eq!(sane((1.0, 2.0, 3.0, 4.0, 5.0), alt), (1.0, 2.0, 3.0, 4.0, 5.0));
+        assert_eq!(
+            sane((1.0, 2.0, 3.0, 4.0, 5.0), alt),
+            (1.0, 2.0, 3.0, 4.0, 5.0)
+        );
         assert_eq!(sane((f64::NAN, 2.0, 3.0, 4.0, 5.0), alt).0, alt.0);
         assert_eq!(sane((1.0, f64::INFINITY, 3.0, 4.0, 5.0), alt).1, alt.1);
         assert_eq!(sane((1.0, 2.0, 1e300, 4.0, 5.0), alt).2, alt.2);
@@ -1566,7 +1585,13 @@ mod tests {
     ///
     /// `filter` ist die Filterangabe des Servers: 0 = ungefiltert, 1 = ganz gefiltert,
     /// 2 = teilweise – und nur bei 2 folgt ein Bitfeld.
-    fn player_chat(modern: bool, content: &str, sender: &str, filter: i32, signed: bool) -> Vec<u8> {
+    fn player_chat(
+        modern: bool,
+        content: &str,
+        sender: &str,
+        filter: i32,
+        signed: bool,
+    ) -> Vec<u8> {
         let mut w = Writer::default();
         if modern {
             w.var_int(7); // globalIndex (erst ab 1.21.11)
@@ -1600,7 +1625,12 @@ mod tests {
             let mut r = Reader::new(&data);
             let chat = parse_player_chat(modern, nbt::Fmt::Plain, &mut r);
             assert!(chat.signature.is_none(), "unsigniert, modern={}", modern);
-            assert_eq!(chat.line.as_deref(), Some("<Hugo> Hallo Welt"), "modern={}", modern);
+            assert_eq!(
+                chat.line.as_deref(),
+                Some("<Hugo> Hallo Welt"),
+                "modern={}",
+                modern
+            );
         }
     }
 
@@ -1613,7 +1643,9 @@ mod tests {
             let data = player_chat(true, "Hallo", "Hugo", filter, false);
             let mut r = Reader::new(&data);
             assert_eq!(
-                parse_player_chat(true, nbt::Fmt::Plain, &mut r).line.as_deref(),
+                parse_player_chat(true, nbt::Fmt::Plain, &mut r)
+                    .line
+                    .as_deref(),
                 Some("<Hugo> Hallo"),
                 "Filter {}",
                 filter
@@ -1642,7 +1674,11 @@ mod tests {
         for kurz in 0..voll.len() - 1 {
             let mut r = Reader::new(&voll[..kurz]);
             let chat = parse_player_chat(true, nbt::Fmt::Plain, &mut r);
-            assert!(chat.line.is_none(), "abgeschnitten bei {} ergab eine Zeile", kurz);
+            assert!(
+                chat.line.is_none(),
+                "abgeschnitten bei {} ergab eine Zeile",
+                kurz
+            );
         }
 
         let mut seed = 0x1234_5678_9ABC_DEF0u64;
@@ -1690,6 +1726,7 @@ mod tests {
             #[cfg(feature = "extras")]
             {
                 let e = &p.extra;
+                let _ = e;
                 #[cfg(feature = "menu")]
                 ids.extend_from_slice(&[
                     e.cb_container_close,

@@ -1606,10 +1606,26 @@ mod tests {
         };
         settings.normalize();
         for point in settings.route.iter().chain(settings.home.iter()) {
-            assert!(point.x.is_finite() && point.x.abs() <= WORLD_LIMIT, "{}", point.x);
-            assert!(point.y.is_finite() && point.y.abs() <= WORLD_LIMIT, "{}", point.y);
-            assert!(point.z.is_finite() && point.z.abs() <= WORLD_LIMIT, "{}", point.z);
-            assert!(point.yaw.is_finite() && point.yaw.abs() <= 180.0, "{}", point.yaw);
+            assert!(
+                point.x.is_finite() && point.x.abs() <= WORLD_LIMIT,
+                "{}",
+                point.x
+            );
+            assert!(
+                point.y.is_finite() && point.y.abs() <= WORLD_LIMIT,
+                "{}",
+                point.y
+            );
+            assert!(
+                point.z.is_finite() && point.z.abs() <= WORLD_LIMIT,
+                "{}",
+                point.z
+            );
+            assert!(
+                point.yaw.is_finite() && point.yaw.abs() <= 180.0,
+                "{}",
+                point.yaw
+            );
             assert!((-90.0..=90.0).contains(&point.pitch), "{}", point.pitch);
         }
     }

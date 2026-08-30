@@ -60,7 +60,7 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         }
         "off" | "aus" | "0" => 0,
         text => match text.parse::<u64>() {
-            Ok(value) => value.max(MIN_SECONDS).min(MAX_SECONDS),
+            Ok(value) => value.clamp(MIN_SECONDS, MAX_SECONDS),
             Err(_) => {
                 return console
                     .error("Nutzung: :antiafk   ·   :antiafk on|off   ·   :antiafk <sekunden>")
@@ -158,8 +158,10 @@ mod tests {
     /// Zu häufiges Zappeln fällt mehr auf als Stillstehen – die Untergrenze muss greifen.
     #[test]
     fn untergrenze_gilt_auch_zur_laufzeit() {
-        let parse =
-            |text: &str| text.parse::<u64>().map(|v| v.max(MIN_SECONDS).min(MAX_SECONDS));
+        let parse = |text: &str| {
+            text.parse::<u64>()
+                .map(|value| value.clamp(MIN_SECONDS, MAX_SECONDS))
+        };
         assert_eq!(parse("1").unwrap(), MIN_SECONDS);
         assert_eq!(parse("120").unwrap(), 120);
         assert!(parse("x").is_err());

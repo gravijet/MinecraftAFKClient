@@ -311,11 +311,12 @@ impl Conn {
             if uncompressed == 0 {
                 self.buffer[c.pos..].to_vec()
             } else {
-                let mut out = Vec::with_capacity(uncompressed as usize);
+                let expected = usize::try_from(uncompressed).ok()?;
+                let mut out = Vec::with_capacity(expected);
                 ZlibDecoder::new(&self.buffer[c.pos..])
                     .read_to_end(&mut out)
                     .ok()?;
-                assert_eq!(out.len(), uncompressed as i32 as usize, "entpackte Laenge");
+                assert_eq!(out.len(), expected, "entpackte Laenge");
                 out
             }
         };
@@ -729,7 +730,12 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
         conn.send(&chat);
     }
     for line in &plan.player_chat {
-        conn.send(&player_chat_packet(ids, "Hugo", line, plan.player_chat_filter));
+        conn.send(&player_chat_packet(
+            ids,
+            "Hugo",
+            line,
+            plan.player_chat_filter,
+        ));
     }
 
     // Auflegen, sobald der Chat draußen ist: Der Client muss die Zeilen dann trotzdem noch
@@ -802,7 +808,11 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
                 break;
             }
         }
-        let _ = out.lock().unwrap().stream.shutdown(std::net::Shutdown::Both);
+        let _ = out
+            .lock()
+            .unwrap()
+            .stream
+            .shutdown(std::net::Shutdown::Both);
     });
 
     // Der Transfer beendet die Verbindung von unserer Seite – der Client baut dann eine neue auf.
@@ -955,7 +965,12 @@ fn send_scoreboard(conn: &mut Conn, ids: &Ids) {
 
     // Punktzahl: Eintrag, Ziel, Wert, kein eigener Anzeigetext, kein Zahlenformat.
     let mut score = Buf::packet(ids.cb_set_score);
-    score.string("hugo").string("sb").var_int(5).bool(false).bool(false);
+    score
+        .string("hugo")
+        .string("sb")
+        .var_int(5)
+        .bool(false)
+        .bool(false);
     conn.send(&score);
 }
 
@@ -976,7 +991,13 @@ fn send_menu(conn: &mut Conn, ids: &Ids) {
     content.var_int(1).var_int(9); // Zustandszähler, Feldanzahl
     for slot in 0..9 {
         if slot == 4 {
-            item_with_lore(&mut content, ids, 848, "Zum Spawn", &["Klicken", "kostet nichts"]);
+            item_with_lore(
+                &mut content,
+                ids,
+                848,
+                "Zum Spawn",
+                &["Klicken", "kostet nichts"],
+            );
         } else {
             content.var_int(0); // leeres Feld
         }

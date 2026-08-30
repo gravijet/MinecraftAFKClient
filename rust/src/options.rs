@@ -5,6 +5,7 @@
 use crate::proto::{Protocol, DEFAULT};
 use crate::proxy::Proxy;
 use crate::rules::{Spec, Trigger};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Untergrenze für Wiederholungen: schneller löst nur der Spam-Schutz des Servers aus.
@@ -176,6 +177,11 @@ pub struct Options {
     /// dass eine Bauform ohne Live-Ansicht die Angabe gar nicht umsetzen kann. Vorher stand hier
     /// eine feste 8, und `--pov-fps` verpuffte im schlanken Client wortlos.
     pub pov_fps: Option<usize>,
+    /// Lokaler HTTP-Viewer fuer die texturierte Browser-POV.
+    pub pov_web: Option<SocketAddr>,
+    /// Originale Minecraft-Client-JAR, aus der Modelle, Texturen und GUI gelesen werden. Die
+    /// Dateien werden nie kopiert oder ins Binary eingebettet.
+    pub pov_resources: Option<PathBuf>,
 
     /// Optionen, die dieser Client angenommen, aber nicht umgesetzt hat (weil es sie nur im
     /// Java-Client gibt). Wird beim Start einmal genannt.
@@ -209,6 +215,8 @@ impl Default for Options {
             pov_autostart: None,
             pov_size: None,
             pov_fps: None,
+            pov_web: None,
+            pov_resources: None,
             ignored: Vec::new(),
         }
     }
@@ -274,16 +282,37 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                     "an" | "on" | "live" | "ein" | "1" => Some(true),
                     "aus" | "off" | "0" => Some(false),
                     other => {
-                        return Err(format!(
-                            "--pov nimmt 'an' oder 'aus', nicht '{}'.",
-                            other
-                        ))
+                        return Err(format!("--pov nimmt 'an' oder 'aus', nicht '{}'.", other))
                     }
                 };
             }
             "--pov-size" | "--pov-groesse" => o.pov_size = Some(parse_size(&value("--pov-size")?)?),
             "--pov-fps" => {
                 o.pov_fps = Some(number(&value("--pov-fps")?, "--pov-fps")?.clamp(1, 20) as usize)
+            }
+            "--pov-web" => {
+                let input = value("--pov-web")?;
+                let address = if input.bytes().all(|byte| byte.is_ascii_digit()) {
+                    format!("127.0.0.1:{}", input)
+                } else {
+                    input.clone()
+                };
+                let parsed = address.parse::<SocketAddr>().map_err(|_| {
+                    format!(
+                        "--pov-web braucht <port> oder <ip:port>, z. B. 8765 oder 127.0.0.1:8765. Bekommen: '{}'.",
+                        input
+                    )
+                })?;
+                if parsed.port() == 0 {
+                    return Err(
+                        "--pov-web: Port 0 ist nicht nutzbar; bitte 1 bis 65535 angeben."
+                            .to_string(),
+                    );
+                }
+                o.pov_web = Some(parsed);
+            }
+            "--pov-resources" | "--pov-assets" => {
+                o.pov_resources = Some(PathBuf::from(value("--pov-resources")?));
             }
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
@@ -348,8 +377,22 @@ fn check_server(server: &str) -> Result<(), String> {
             Some((host, _)) if host.trim().is_empty() => {
                 return Err(format!("Serveradresse ohne Namen: '{}'", server))
             }
-            Some((_, rest)) => rest.strip_prefix(':'),
-            None => return Err(format!("Serveradresse ohne schließende Klammer: '{}'", server)),
+            Some((_, "")) => None,
+            Some((_, rest)) => match rest.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => {
+                    return Err(format!(
+                        "Unerlaubter Text hinter der IPv6-Adresse: '{}'. Beispiel: [::1]:25565",
+                        rest
+                    ))
+                }
+            },
+            None => {
+                return Err(format!(
+                    "Serveradresse ohne schließende Klammer: '{}'",
+                    server
+                ))
+            }
         }
     } else if server.matches(':').count() > 1 {
         None // nackte IPv6-Adresse – da ist kein Port dabei
@@ -386,7 +429,12 @@ fn parse_size(input: &str) -> Result<(usize, usize), String> {
     let (width, height) = text
         .split_once(['x', '*', ':'])
         .or_else(|| text.split_once(char::is_whitespace))
-        .ok_or_else(|| format!("--pov-size braucht <breite>x<hoehe>, z. B. 160x80. Bekommen: '{}'", input))?;
+        .ok_or_else(|| {
+            format!(
+                "--pov-size braucht <breite>x<hoehe>, z. B. 160x80. Bekommen: '{}'",
+                input
+            )
+        })?;
     let parse = |part: &str, what: &str, range: std::ops::RangeInclusive<usize>| {
         let value = part
             .trim()
@@ -592,6 +640,8 @@ mod tests {
         assert!(parse_args(&["[]"]).is_err());
         assert!(parse_args(&["[]:25565"]).is_err());
         assert!(parse_args(&[":25565"]).is_err());
+        assert!(parse_args(&["[::1]rest"]).is_err());
+        assert!(parse_args(&["[::1]rest:25565"]).is_err());
         // Gültige Schreibweisen bleiben gültig – auch nackte IPv6-Adressen.
         assert!(parse_args(&["::1"]).is_ok());
         assert!(parse_args(&["[::1]:25566"]).is_ok());
@@ -741,7 +791,10 @@ mod tests {
             "--max-backoff",
             "60",
         ]);
-        assert_eq!(o.ignored, vec!["--no-reconnect", "--reconnect-delay", "--max-backoff"]);
+        assert_eq!(
+            o.ignored,
+            vec!["--no-reconnect", "--reconnect-delay", "--max-backoff"]
+        );
         assert_eq!(o.server, "x");
         // Ein echter Tippfehler bleibt ein Fehler.
         assert!(parse_args(&["x", "--kein-schalter"]).is_err());
@@ -753,7 +806,13 @@ mod tests {
     #[test]
     fn zeitangaben_haben_eine_obergrenze() {
         let riesig = "000000000000000000"; // u64::MAX – parst, überläuft aber jede Addition
-        let o = options(&["x", "--join-delay", riesig, "-c", &format!("{}:/afk", riesig)]);
+        let o = options(&[
+            "x",
+            "--join-delay",
+            riesig,
+            "-c",
+            &format!("{}:/afk", riesig),
+        ]);
         assert_eq!(o.commands[0].delay_seconds, MAX_SECONDS);
         assert_eq!(o.commands[0].repeat_seconds, MAX_SECONDS);
         // Und die Summe, an der es hing, bleibt bildbar.
@@ -761,8 +820,14 @@ mod tests {
         let repeat = std::time::Duration::from_secs(o.commands[0].repeat_seconds);
         assert!(at.checked_add(repeat).is_some());
 
-        assert_eq!(options(&["x", "--antiafk", riesig]).antiafk_seconds, MAX_SECONDS);
-        assert_eq!(options(&["x", "--on-cooldown", riesig]).rule_cooldown_seconds, MAX_SECONDS);
+        assert_eq!(
+            options(&["x", "--antiafk", riesig]).antiafk_seconds,
+            MAX_SECONDS
+        );
+        assert_eq!(
+            options(&["x", "--on-cooldown", riesig]).rule_cooldown_seconds,
+            MAX_SECONDS
+        );
         assert_eq!(
             options(&["x", "--chat-delay", riesig]).chat_min_delay_ms,
             MAX_SECONDS * 1000
@@ -782,8 +847,14 @@ mod tests {
 
     #[test]
     fn pov_groesse_und_takt() {
-        assert_eq!(options(&["x", "--pov-size", "160x80"]).pov_size, Some((160, 80)));
-        assert_eq!(options(&["x", "--pov-size", "80*40"]).pov_size, Some((80, 40)));
+        assert_eq!(
+            options(&["x", "--pov-size", "160x80"]).pov_size,
+            Some((160, 80))
+        );
+        assert_eq!(
+            options(&["x", "--pov-size", "80*40"]).pov_size,
+            Some((80, 40))
+        );
         assert_eq!(options(&["x", "--pov-fps", "99"]).pov_fps, Some(20));
         assert_eq!(options(&["x", "--pov-fps", "4"]).pov_fps, Some(4));
         // Ohne Angabe entscheidet die Bauform – daran hängt auch die Warnung beim Start.
@@ -794,6 +865,17 @@ mod tests {
         assert_eq!(options(&["x", "--pov", "aus"]).pov_autostart, Some(false));
         assert!(parse_args(&["x", "--pov-size", "gross"]).is_err());
         assert!(parse_args(&["x", "--pov", "vielleicht"]).is_err());
+        let web = options(&[
+            "x",
+            "--pov-web",
+            "8765",
+            "--pov-resources",
+            "/tmp/client.jar",
+        ]);
+        assert_eq!(web.pov_web.unwrap().to_string(), "127.0.0.1:8765");
+        assert_eq!(web.pov_resources, Some(PathBuf::from("/tmp/client.jar")));
+        assert!(parse_args(&["x", "--pov-web", "localhost:8765"]).is_err());
+        assert!(parse_args(&["x", "--pov-web", "0"]).is_err());
     }
 
     /// Eine unmögliche Bildgröße wurde bisher stillschweigend auf das Erlaubte gestaucht – wer
@@ -805,8 +887,14 @@ mod tests {
         assert!(parse_args(&["x", "--pov-size", "23x40"]).is_err());
         assert!(parse_args(&["x", "--pov-size", "64x81"]).is_err());
         // Genau auf den Grenzen bleibt es gültig.
-        assert_eq!(options(&["x", "--pov-size", "24x12"]).pov_size, Some((24, 12)));
-        assert_eq!(options(&["x", "--pov-size", "160x80"]).pov_size, Some((160, 80)));
+        assert_eq!(
+            options(&["x", "--pov-size", "24x12"]).pov_size,
+            Some((24, 12))
+        );
+        assert_eq!(
+            options(&["x", "--pov-size", "160x80"]).pov_size,
+            Some((160, 80))
+        );
     }
 
     /// Der Klammer-Zweig hat einen leeren Namen bisher durchgelassen.

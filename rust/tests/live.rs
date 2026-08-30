@@ -7,6 +7,8 @@
 mod common;
 
 use common::{Note, Plan};
+#[cfg(feature = "pov")]
+use std::io::Read;
 use std::io::Write;
 use std::time::Duration;
 
@@ -62,9 +64,11 @@ fn beitritt_chat_und_befehl() {
     let (chat, seen) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
     assert!(chat, "Chat kam nicht an. Ausgabe:\n{}", seen);
 
-    let got_command = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Command(c) if c == "afk")
-    });
+    let got_command = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Command(c) if c == "afk"),
+    );
     assert!(got_command, "--cmd hat den Befehl nicht geschickt");
 
     let _ = child.kill();
@@ -94,7 +98,11 @@ fn beitritt_und_chat_mit_verschluesselung() {
 
         // Ein Warten auf die zuletzt geschickte Zeile – siehe `beitritt_und_chat_mit_kompression`.
         let (lang, log) = common::wait_for(&out, TIMEOUT, &"V".repeat(600));
-        assert!(lang, "{:?}: die lange Zeile fehlt. Ausgabe:\n{}", compression, log);
+        assert!(
+            lang,
+            "{:?}: die lange Zeile fehlt. Ausgabe:\n{}",
+            compression, log
+        );
         assert!(
             log.contains("Willkommen auf dem Testserver"),
             "{:?}: die kurze Zeile fehlt. Ausgabe:\n{}",
@@ -105,9 +113,11 @@ fn beitritt_und_chat_mit_verschluesselung() {
         // Und in die Gegenrichtung – dort verschlüsselt der Client selbst.
         let _ = writeln!(stdin, "/{}", "y".repeat(600));
         let _ = stdin.flush();
-        let angekommen = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Command(text) if text.len() == 600)
-        });
+        let angekommen = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Command(text) if text.len() == 600),
+        );
         assert!(angekommen, "{:?}: der Befehl kam nicht an", compression);
         let _ = child.kill();
     }
@@ -137,7 +147,11 @@ fn beitritt_und_chat_mit_kompression() {
         // gibt es zurück. Zwei Aufrufe nacheinander gingen schief – der erste nimmt beide Zeilen
         // mit und der zweite fängt mit leerem Puffer an.
         let (lang, log) = common::wait_for(&out, TIMEOUT, &"L".repeat(600));
-        assert!(lang, "Schwelle {}: die lange Zeile fehlt. Ausgabe:\n{}", threshold, log);
+        assert!(
+            lang,
+            "Schwelle {}: die lange Zeile fehlt. Ausgabe:\n{}",
+            threshold, log
+        );
         assert!(
             log.contains("Willkommen auf dem Testserver"),
             "Schwelle {}: die kurze Zeile fehlt. Ausgabe:\n{}",
@@ -149,10 +163,16 @@ fn beitritt_und_chat_mit_kompression() {
         let befehl = format!("/{}", "x".repeat(600));
         let _ = writeln!(stdin, "{}", befehl);
         let _ = stdin.flush();
-        let angekommen = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Command(text) if text.len() == 600)
-        });
-        assert!(angekommen, "Schwelle {}: der lange Befehl kam nicht an", threshold);
+        let angekommen = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Command(text) if text.len() == 600),
+        );
+        assert!(
+            angekommen,
+            "Schwelle {}: der lange Befehl kam nicht an",
+            threshold
+        );
         let _ = child.kill();
     }
 }
@@ -291,14 +311,18 @@ fn tod_loest_respawn_und_regel_aus() {
     );
     let err = common::collect(child.stderr.take().unwrap());
 
-    let respawned = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_client_command)
-    });
+    let respawned = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_client_command),
+    );
     assert!(respawned, "der Client hat nicht von selbst respawnt");
 
-    let fired = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Command(c) if c == "spawn")
-    });
+    let fired = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Command(c) if c == "spawn"),
+    );
     let (_, log) = common::wait_for(&err, Duration::from_millis(300), "@event death");
     assert!(fired, "--on death hat nicht ausgeloest. Ausgabe:\n{}", log);
     let _ = child.kill();
@@ -319,9 +343,7 @@ fn server_transfer_wird_befolgt() {
     let mut child = common::spawn_client(start.port, "26.1", &["--no-color", "--events"]);
     let err = common::collect(child.stderr.take().unwrap());
 
-    let angekommen = common::wait_note(&ziel.notes, TIMEOUT, |note| {
-        matches!(note, Note::Joined)
-    });
+    let angekommen = common::wait_note(&ziel.notes, TIMEOUT, |note| matches!(note, Note::Joined));
     let (_, log) = common::wait_for(&err, Duration::from_millis(300), "Server-Transfer");
     assert!(
         angekommen,
@@ -340,7 +362,10 @@ fn server_transfer_wird_befolgt() {
 fn verbindung_ueber_proxy() {
     for (name, login) in [
         ("socks5 ohne Anmeldung", None),
-        ("socks5 mit Anmeldung", Some(("hugo".to_string(), "geheim".to_string()))),
+        (
+            "socks5 mit Anmeldung",
+            Some(("hugo".to_string(), "geheim".to_string())),
+        ),
         ("http-connect", None),
     ] {
         let server = common::start(&common::MC_26_1, plan_with_ground());
@@ -360,11 +385,19 @@ fn verbindung_ueber_proxy() {
         assert_ne!(proxy_port, server.port);
 
         // Die Zieladresse löst der Proxy auf – deshalb ein Name statt 127.0.0.1.
-        let mut child =
-            common::spawn_client_at("localhost", server.port, "26.1", &["--no-color", "--proxy", &url]);
+        let mut child = common::spawn_client_at(
+            "localhost",
+            server.port,
+            "26.1",
+            &["--no-color", "--proxy", &url],
+        );
         let out = common::collect(child.stdout.take().unwrap());
         let (found, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
-        assert!(found, "{}: kein Beitritt über den Proxy. Ausgabe:\n{}", name, log);
+        assert!(
+            found,
+            "{}: kein Beitritt über den Proxy. Ausgabe:\n{}",
+            name, log
+        );
         let _ = child.kill();
     }
 }
@@ -388,9 +421,11 @@ fn cookies_ueberleben_den_transfer() {
     let start = common::start(&common::MC_26_1, plan);
 
     let mut child = common::spawn_client(start.port, "26.1", &["--no-color"]);
-    let angekommen = common::wait_note(&ziel.notes, TIMEOUT, |note| {
-        matches!(note, Note::Cookie(key, Some(value)) if key == "afk:test" && value == b"geheim")
-    });
+    let angekommen = common::wait_note(
+        &ziel.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Cookie(key, Some(value)) if key == "afk:test" && value == b"geheim"),
+    );
     assert!(angekommen, "das Cookie kam beim Transferziel nicht an");
     let _ = child.kill();
 }
@@ -449,7 +484,11 @@ fn menue_inhalt_auf_beiden_komponententabellen() {
         let err = common::collect(child.stderr.take().unwrap());
 
         let (opened, log) = common::wait_for(&err, TIMEOUT, "Menü geöffnet: Warp-Menü");
-        assert!(opened, "{}: kein Menü gemeldet. Ausgabe:\n{}", ids.name, log);
+        assert!(
+            opened,
+            "{}: kein Menü gemeldet. Ausgabe:\n{}",
+            ids.name, log
+        );
 
         let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":menu", "Zum Spawn");
         assert!(
@@ -464,7 +503,8 @@ fn menue_inhalt_auf_beiden_komponententabellen() {
             log
         );
 
-        let (lore, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":slot 4", "kostet nichts");
+        let (lore, log) =
+            common::poll_command(&mut stdin, &err, TIMEOUT, ":slot 4", "kostet nichts");
         assert!(lore, "{}: die Lore fehlt. Ausgabe:\n{}", ids.name, log);
         let _ = child.kill();
     }
@@ -494,9 +534,11 @@ fn voller_ausgabepuffer_blockiert_den_netz_thread_nicht() {
     let ids = &common::MC_26_1;
     let mut antworten = 0;
     while antworten < 3 {
-        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
-        });
+        let ok = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8),
+        );
         assert!(
             ok,
             "der Client hat aufgehört, KeepAlive zu beantworten – er steckt im Schreiben fest"
@@ -545,9 +587,11 @@ fn volle_fehlerausgabe_blockiert_den_netz_thread_nicht() {
 
     let ids = &common::MC_26_1;
     for _ in 0..3 {
-        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
-        });
+        let ok = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8),
+        );
         assert!(
             ok,
             "der Client hat aufgehört, KeepAlive zu beantworten – er steckt im Schreiben auf die \
@@ -566,9 +610,11 @@ fn volle_fehlerausgabe_blockiert_den_netz_thread_nicht() {
 fn teleport_wird_bestaetigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
-    let accepted = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation)
-    });
+    let accepted = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation),
+    );
     assert!(accepted, "Teleport wurde nicht bestätigt");
     let _ = child.kill();
 }
@@ -577,16 +623,19 @@ fn teleport_wird_bestaetigt() {
 #[test]
 fn eingabe_geht_in_den_chat() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
-    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--chat-delay", "200"]);
+    let mut child =
+        common::spawn_client(server.port, "26.1", &["--no-color", "--chat-delay", "200"]);
     let mut stdin = child.stdin.take().unwrap();
     let err = common::collect(child.stderr.take().unwrap());
     let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
     assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
 
     let _ = writeln!(stdin, "hallo welt");
-    let arrived = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Chat(text) if text == "hallo welt")
-    });
+    let arrived = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Chat(text) if text == "hallo welt"),
+    );
     assert!(arrived, "die Chatzeile kam nicht beim Server an");
     let _ = child.kill();
 }
@@ -611,9 +660,11 @@ fn use_item_paket_passt_zur_version() {
         let _ = writeln!(stdin, ":use");
 
         let id = ids.sb_use_item;
-        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Packet(got, len) if *got == id && *len == expected)
-        });
+        let ok = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(got, len) if *got == id && *len == expected),
+        );
         assert!(
             ok,
             "{}: ServerboundUseItem kam nicht mit {} Byte Nutzdaten an",
@@ -657,9 +708,11 @@ fn chat_paket_passt_zur_version() {
         let _ = stdin.flush();
 
         let sb_chat = ids.sb_chat;
-        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Packet(id, len) if *id == sb_chat && *len == expected)
-        });
+        let ok = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(id, len) if *id == sb_chat && *len == expected),
+        );
         if !ok {
             // Nur im Fehlerfall noch einmal mitlesen, um die Meldung des Clients zu zeigen.
             let (_, log) = common::wait_for(&err, Duration::from_millis(200), "kommt nie");
@@ -759,9 +812,11 @@ fn pov_zeigt_den_boden() {
 fn chunk_stapel_wird_bestaetigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
-    let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_chunk_batch_received)
-    });
+    let ok = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_chunk_batch_received),
+    );
     assert!(ok, "ServerboundChunkBatchReceived kam nie an");
     let _ = child.kill();
 }
@@ -789,7 +844,8 @@ fn pov_liest_alle_chunks() {
 
         // Nachfragen statt einmal raten: `:pov info` beantwortet den Stand von jetzt, und der
         // Client kann die Chunks noch einlesen.
-        let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 Chunks");
+        let (found, log) =
+            common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 Chunks");
         assert!(
             found,
             "{}: die 25 Chunks wurden nicht gelesen. Ausgabe:\n{}",
@@ -898,7 +954,151 @@ fn povdatei_startet_von_selbst_und_laesst_sich_abschalten() {
     let (joined, _) = common::wait_for(&err, TIMEOUT, "im Spiel");
     assert!(joined, "kein Beitritt");
     let (found, log) = common::wait_for(&err, Duration::from_secs(3), "(:pov stop)");
-    assert!(!found, "--pov aus hat die Ansicht nicht verhindert:\n{}", log);
+    assert!(
+        !found,
+        "--pov aus hat die Ansicht nicht verhindert:\n{}",
+        log
+    );
+}
+
+/// Der neue Viewer ist eine echte HTTP-Schnittstelle, nicht nur eine im Unit-Test gerenderte
+/// Zeichenkette. Token, HTML und Live-Zustand werden gegen das gebaute Binary am Socket geprueft.
+#[cfg(feature = "pov")]
+#[test]
+fn browser_pov_liefert_seite_und_live_zustand() {
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").expect("freien Port suchen");
+    let web_port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let web_port_text = web_port.to_string();
+
+    let server = common::start(&common::MC_26_2, plan_with_ground());
+    let mut extra = vec![
+        "--no-color".to_string(),
+        "--pov-web".to_string(),
+        web_port_text,
+        "--pov".to_string(),
+        "aus".to_string(),
+    ];
+    let original = std::env::var("AFK_POV_RESOURCES").ok();
+    if let Some(path) = &original {
+        extra.extend(["--pov-resources".to_string(), path.clone()]);
+    }
+    let references: Vec<&str> = extra.iter().map(String::as_str).collect();
+    let mut child = common::spawn_client(server.port, "26.2", &references);
+    let err = common::collect(child.stderr.take().unwrap());
+    let (found, log) = common::wait_for(&err, TIMEOUT, "Browser-POV: http://");
+    assert!(found, "Viewer-URL fehlt. Ausgabe:\n{}", log);
+    let token = log
+        .lines()
+        .find_map(|line| line.split("?token=").nth(1))
+        .and_then(|value| value.split_whitespace().next())
+        .expect("Token in Viewer-URL");
+    assert_eq!(token.len(), 32, "Viewer-Token hat nicht 128 Bit");
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    fn get(port: u16, path: &str) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("Viewer offen");
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        )
+        .unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).unwrap();
+        answer
+    }
+
+    let page = String::from_utf8(get(web_port, &format!("/?token={}", token))).unwrap();
+    assert!(page.starts_with("HTTP/1.1 200"), "{}", page);
+    assert!(page.contains("AFKSystems – Live-POV"), "HTML fehlt");
+
+    let state =
+        String::from_utf8(get(web_port, &format!("/api/state.json?token={}", token))).unwrap();
+    assert!(state.starts_with("HTTP/1.1 200"), "{}", state);
+    assert!(
+        state.contains("\"dimension\":\"minecraft:overworld\""),
+        "{}",
+        state
+    );
+
+    let forbidden = String::from_utf8(get(web_port, "/api/state.json")).unwrap();
+    assert!(forbidden.starts_with("HTTP/1.1 403"), "{}", forbidden);
+    let asset_forbidden = String::from_utf8(get(
+        web_port,
+        "/assets/minecraft/textures/gui/sprites/hud/crosshair.png",
+    ))
+    .unwrap();
+    assert!(
+        asset_forbidden.starts_with("HTTP/1.1 403"),
+        "JAR-Ressource war ohne Token erreichbar: {}",
+        asset_forbidden
+    );
+
+    let asset = get(
+        web_port,
+        &format!(
+            "/assets/minecraft/textures/gui/sprites/hud/crosshair.png?token={}",
+            token
+        ),
+    );
+    let asset_header_end = asset
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .expect("Header der JAR-Ressource")
+        + 4;
+    let asset_header = String::from_utf8_lossy(&asset[..asset_header_end]);
+    if original.is_some() {
+        assert!(asset.starts_with(b"HTTP/1.1 200"), "{}", asset_header);
+        assert!(
+            asset_header.contains("Cache-Control: private, max-age=31536000, immutable"),
+            "JAR-Ressource wurde nicht dauerhaft gecacht: {}",
+            asset_header
+        );
+    } else {
+        assert!(asset.starts_with(b"HTTP/1.1 503"), "{}", asset_header);
+    }
+
+    if original.is_some() {
+        let (joined, output) = common::wait_for(&err, TIMEOUT, "im Spiel");
+        assert!(joined, "Texturtest trat nicht bei: {}", output);
+        let frame = get(
+            web_port,
+            &format!("/api/frame.png?token={}&w=426&h=240", token),
+        );
+        let split = frame
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert!(
+            frame.starts_with(b"HTTP/1.1 200"),
+            "PNG-Antwort war kein 200"
+        );
+        assert_eq!(&frame[split..split + 8], b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&frame[split..]));
+        let mut reader = decoder.read_info().expect("Browser-PNG lesbar");
+        let mut rgba = vec![0; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut rgba)
+            .expect("Browser-PNG decodieren");
+        let rgba = &rgba[..info.buffer_size()];
+        assert!(
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != rgba[..3]),
+            "Texturframe bestand nur aus einer einzigen Farbe"
+        );
+        let missing = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[0] > 220 && pixel[1] < 30 && pixel[2] > 220)
+            .count();
+        assert_eq!(missing, 0, "Stone wurde als lila Fehlertextur gerendert");
+    }
+    let _ = child.kill();
 }
 
 /// Ultra wartet umgekehrt auf `:pov live` – `--pov an` muss die Ansicht trotzdem von Anfang an
@@ -1012,30 +1212,96 @@ fn alle_oertlichen_befehle_ueberstehen_auch_unsinn() {
 
     for line in [
         // Alles, was es gibt ...
-        ":help", ":pos", ":board", ":menu", ":inv", ":slot 4", ":click 4", ":click 4 rechts",
-        ":click 4 shift", ":close", ":pov info", ":pov frame", ":pov size 24 12", ":pov fps 3",
-        ":pov live", ":pov stop", ":sneak on", ":sneak off", ":sneak", ":sprint an", ":swing",
-        ":use", ":hand 3", ":antiafk 20", ":antiafk off", ":look nord", ":look 90 -10",
-        ":look links 30", ":go vor 1", ":stop", ":fall on", ":fall 2", ":home", ":home set",
-        ":home delay 1", ":home speed 4", ":home off", ":home clear", ":route", ":route rec",
-        ":route add", ":route stop", ":route del", ":route clear",
+        ":help",
+        ":pos",
+        ":board",
+        ":menu",
+        ":inv",
+        ":slot 4",
+        ":click 4",
+        ":click 4 rechts",
+        ":click 4 shift",
+        ":close",
+        ":pov info",
+        ":pov frame",
+        ":pov size 24 12",
+        ":pov fps 3",
+        ":pov live",
+        ":pov stop",
+        ":sneak on",
+        ":sneak off",
+        ":sneak",
+        ":sprint an",
+        ":swing",
+        ":use",
+        ":hand 3",
+        ":antiafk 20",
+        ":antiafk off",
+        ":look nord",
+        ":look 90 -10",
+        ":look links 30",
+        ":go vor 1",
+        ":stop",
+        ":fall on",
+        ":fall 2",
+        ":home",
+        ":home set",
+        ":home delay 1",
+        ":home speed 4",
+        ":home off",
+        ":home clear",
+        ":route",
+        ":route rec",
+        ":route add",
+        ":route stop",
+        ":route del",
+        ":route clear",
         // ... und alles, womit niemand rechnet.
-        ":", ":go", ":go rueckwaerts abc", ":go vor -5", ":go vor 99999", ":look", ":look xyz",
-        ":click", ":click abc", ":click -1", ":click 999999999999999999999", ":slot",
-        ":slot xyz", ":slot 99999", ":hand 0", ":hand 99", ":hand x", ":pov size 9999 9999",
-        ":pov fps 0", ":pov unsinn", ":antiafk 000000000000000000", ":home delay -3",
-        ":home speed x", ":route del 99", ":sneak vielleicht", ":unbekannt", ":HELP", ":Pos",
+        ":",
+        ":go",
+        ":go rueckwaerts abc",
+        ":go vor -5",
+        ":go vor 99999",
+        ":look",
+        ":look xyz",
+        ":click",
+        ":click abc",
+        ":click -1",
+        ":click 999999999999999999999",
+        ":slot",
+        ":slot xyz",
+        ":slot 99999",
+        ":hand 0",
+        ":hand 99",
+        ":hand x",
+        ":pov size 9999 9999",
+        ":pov fps 0",
+        ":pov unsinn",
+        ":antiafk 000000000000000000",
+        ":home delay -3",
+        ":home speed x",
+        ":route del 99",
+        ":sneak vielleicht",
+        ":unbekannt",
+        ":HELP",
+        ":Pos",
     ] {
-        assert!(writeln!(stdin, "{}", line).is_ok(), "Eingabe '{}' abgewiesen", line);
+        assert!(
+            writeln!(stdin, "{}", line).is_ok(),
+            "Eingabe '{}' abgewiesen",
+            line
+        );
     }
     let _ = stdin.flush();
 
     // Der Client muss danach noch da sein **und** weiter antworten.
     let ids = &common::MC_26_1;
     for _ in 0..2 {
-        let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-            matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8)
-        });
+        let ok = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(id, len) if *id == ids.sb_keep_alive && *len == 8),
+        );
         assert!(ok, "nach den Befehlen kommt kein KeepAlive mehr");
     }
     assert!(
@@ -1052,9 +1318,11 @@ fn sichtweite_passt_zur_bauform() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
     let expected: u8 = if cfg!(feature = "pov") { 6 } else { 2 };
-    let ok = common::wait_note(&server.notes, TIMEOUT, |note| {
-        matches!(note, Note::ViewDistance(v) if *v == expected)
-    });
+    let ok = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::ViewDistance(v) if *v == expected),
+    );
     assert!(ok, "Sichtweite {} kam nicht an", expected);
     drop(child.kill());
 

@@ -507,7 +507,10 @@ mod tests {
     /// stünde die zweite Hälfte für ein Programm davor da wie eine gewöhnliche Statuszeile.
     #[test]
     fn ereigniszeile_bleibt_eine_zeile() {
-        assert_eq!(one_line("Du wurdest\ngekickt:\r\nSpam"), "Du wurdest gekickt:  Spam");
+        assert_eq!(
+            one_line("Du wurdest\ngekickt:\r\nSpam"),
+            "Du wurdest gekickt:  Spam"
+        );
         assert_eq!(one_line("mit\tTabulator"), "mit Tabulator");
         // Ohne Steuerzeichen wird nichts kopiert.
         assert!(matches!(
@@ -526,7 +529,13 @@ mod tests {
         let console = Console::new(false, false, true);
         let inner = &console.inner;
         // Von Hand gefüllt: Der Test soll nichts wirklich hinausschreiben.
-        inner.out.waiting.lock().unwrap().lines.push_back("chat".into());
+        inner
+            .out
+            .waiting
+            .lock()
+            .unwrap()
+            .lines
+            .push_back("chat".into());
         assert_eq!(inner.out.waiting.lock().unwrap().lines.len(), 1);
         assert_eq!(inner.err.waiting.lock().unwrap().lines.len(), 0);
         assert!(!inner.channel(Stream::Out).waiting.lock().unwrap().idle());

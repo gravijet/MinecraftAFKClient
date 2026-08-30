@@ -1,0 +1,8 @@
+[advisories]
+# RUSTSEC-2023-0071 betrifft ausschließlich zeitabhängige RSA-PKCS#1-v1.5-Entschlüsselung.
+# Das ausgelieferte Programm besitzt keinen privaten RSA-Schlüssel und verwendet `rsa` nur, um
+# den AES-Sitzungsschlüssel mit dem öffentlichen Schlüssel des Minecraft-Servers zu verschlüsseln.
+# Private RSA-Operationen existieren allein im an localhost gebundenen Testserver. Für `rsa 0.9`
+# gibt es keinen korrigierten Upstream-Release; dieser eng begrenzte Ausschluss verhindert, dass
+# künftige, tatsächlich einschlägige Advisories im Audit untergehen.
+ignore = ["RUSTSEC-2023-0071"]

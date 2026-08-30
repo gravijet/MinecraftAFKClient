@@ -64,6 +64,8 @@ function Get-GradleJdk {
 if ($Only -in @('java', 'both')) {
     $env:JAVA_HOME = Get-GradleJdk $JavaHome
     Write-Host "Java-Build mit $env:JAVA_HOME" -ForegroundColor Cyan
+    # Keine JAR aus einem frueheren -Move-Lauf versehentlich in das neue Paket uebernehmen.
+    Remove-Item "$root\java\build\libs\afk-*.jar", "$dist\afk-*.jar" -Force -ErrorAction SilentlyContinue
     foreach ($v in $versions) {
         Write-Host "  afk-$v.jar ..." -ForegroundColor Gray
         Invoke-Native { & "$root\gradlew.bat" :java:shadowJar "-Pmc=$v" --console=plain -q } "Java-Build fuer $v"
@@ -80,7 +82,7 @@ if ($Only -in @('rust', 'both')) {
     Write-Host "Rust-Build ..." -ForegroundColor Cyan
     Push-Location "$root\rust"
     try {
-        Invoke-Native { & cargo build --release } "Rust-Build"
+        Invoke-Native { & cargo build --locked --release } "Rust-Build"
         Copy-Item 'target\release\afk.exe' (Join-Path $dist 'afk-windows.exe') -Force
 
         $variants = @(
@@ -94,7 +96,7 @@ if ($Only -in @('rust', 'both')) {
         foreach ($variant in $variants) {
             # Eigene Zielverzeichnisse verhindern, dass eine Bauform eine andere ueberschreibt.
             Invoke-Native {
-                & cargo build --release --features $variant.Features --target-dir "target\$($variant.Target)"
+                & cargo build --locked --release --features $variant.Features --target-dir "target\$($variant.Target)"
             } "Rust-Build $($variant.Label)"
             Copy-Item "target\$($variant.Target)\release\afk.exe" (Join-Path $dist $variant.File) -Force
         }

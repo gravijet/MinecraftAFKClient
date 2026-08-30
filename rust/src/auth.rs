@@ -103,7 +103,6 @@ pub fn migrate_legacy(base: &Path) -> Option<String> {
     Some(name)
 }
 
-
 fn account_file(base: &Path, name: &str) -> PathBuf {
     accounts_dir(base).join(format!("{}.json", name))
 }
@@ -243,10 +242,10 @@ fn md5(input: &[u8]) -> [u8; 16] {
     data.extend_from_slice(&bit_length.to_le_bytes());
 
     let mut state: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            m[i] = u32::from_le_bytes(word.try_into().unwrap());
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            m[i] = u32::from_le_bytes(*word);
         }
 
         let [mut a, mut b, mut c, mut d] = state;
@@ -301,7 +300,8 @@ impl Account {
         }
         let token = self.token()?.to_string();
         let profile = hex(&self.profile_id);
-        let response = agent().post("https://sessionserver.mojang.com/session/minecraft/join")
+        let response = agent()
+            .post("https://sessionserver.mojang.com/session/minecraft/join")
             .send_json(json!({
                 "accessToken": token,
                 "selectedProfile": profile,
@@ -357,7 +357,8 @@ impl Account {
             .ok_or("Konto hat kein refreshToken – bitte neu anmelden.")?
             .to_string();
 
-        let (msa_access, msa_refresh, msa_expires) = msa_refresh(&client_id, &scope, &refresh_token)?;
+        let (msa_access, msa_refresh, msa_expires) =
+            msa_refresh(&client_id, &scope, &refresh_token)?;
         let (xbl_token, _) = xbl_user_token(&msa_access, &client_id)?;
         let (xsts_token, user_hash) = xsts_token(&xbl_token)?;
         let (mc_token, mc_expires) = minecraft_token(&user_hash, &xsts_token)?;
@@ -404,7 +405,8 @@ impl Account {
 // ===================== Microsoft / Xbox / Minecraft =====================
 
 fn request_device_code() -> Res<(String, DeviceCode)> {
-    let response = agent().post(DEVICE_CODE_URL)
+    let response = agent()
+        .post(DEVICE_CODE_URL)
         .send_form(&[
             ("client_id", CLIENT_ID),
             ("scope", SCOPE),
@@ -475,7 +477,8 @@ fn poll_for_token(device_code: &str, code: &DeviceCode) -> Res<(String, String, 
 }
 
 fn msa_refresh(client_id: &str, scope: &str, refresh_token: &str) -> Res<(String, String, i64)> {
-    let json: Value = agent().post(TOKEN_URL)
+    let json: Value = agent()
+        .post(TOKEN_URL)
         .send_form(&[
             ("client_id", client_id),
             ("scope", scope),
@@ -504,7 +507,8 @@ fn xbl_user_token(msa_access: &str, client_id: &str) -> Res<(String, String)> {
     } else {
         "t="
     };
-    let json: Value = agent().post("https://user.auth.xboxlive.com/user/authenticate")
+    let json: Value = agent()
+        .post("https://user.auth.xboxlive.com/user/authenticate")
         .set("x-xbl-contract-version", "1")
         .set("Accept", "application/json")
         .send_json(json!({
@@ -524,7 +528,8 @@ fn xbl_user_token(msa_access: &str, client_id: &str) -> Res<(String, String)> {
 }
 
 fn xsts_token(xbl_token: &str) -> Res<(String, String)> {
-    let response = agent().post("https://xsts.auth.xboxlive.com/xsts/authorize")
+    let response = agent()
+        .post("https://xsts.auth.xboxlive.com/xsts/authorize")
         .set("x-xbl-contract-version", "1")
         .set("Accept", "application/json")
         .send_json(json!({
@@ -559,7 +564,8 @@ fn user_hash(json: &Value) -> Res<String> {
 }
 
 fn minecraft_token(user_hash: &str, xsts: &str) -> Res<(String, i64)> {
-    let json: Value = agent().post("https://api.minecraftservices.com/authentication/login_with_xbox")
+    let json: Value = agent()
+        .post("https://api.minecraftservices.com/authentication/login_with_xbox")
         .send_json(json!({ "identityToken": format!("XBL3.0 x={};{}", user_hash, xsts) }))
         .map_err(|e| format!("Minecraft-Login fehlgeschlagen: {}", short(e)))?
         .into_json()
@@ -572,7 +578,8 @@ fn minecraft_token(user_hash: &str, xsts: &str) -> Res<(String, i64)> {
 }
 
 fn minecraft_profile(token: &str) -> Res<([u8; 16], String)> {
-    let response = agent().get("https://api.minecraftservices.com/minecraft/profile")
+    let response = agent()
+        .get("https://api.minecraftservices.com/minecraft/profile")
         .set("Authorization", &format!("Bearer {}", token))
         .call();
 

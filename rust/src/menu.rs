@@ -28,11 +28,54 @@ use crate::items::{self, Item};
 /// Mehr Felder hat kein Fenster (Doppelkiste 90, Spielerinventar 46).
 const MAX_SLOTS: usize = 200;
 
+/// `minecraft:menu` ist in allen vier unterstuetzten offiziellen Server-Reports identisch. Die
+/// Reihenfolge wurde zusammen mit den Block-State-Tabellen geprueft; die Nummer aus OpenScreen
+/// wird dadurch im Browser nicht mehr als generische Kiste missverstanden.
+#[cfg(feature = "pov")]
+const MENU_TYPES: [&str; 25] = [
+    "generic_9x1",
+    "generic_9x2",
+    "generic_9x3",
+    "generic_9x4",
+    "generic_9x5",
+    "generic_9x6",
+    "generic_3x3",
+    "crafter_3x3",
+    "anvil",
+    "beacon",
+    "blast_furnace",
+    "brewing_stand",
+    "crafting",
+    "enchantment",
+    "furnace",
+    "grindstone",
+    "hopper",
+    "lectern",
+    "loom",
+    "merchant",
+    "shulker_box",
+    "smithing",
+    "smoker",
+    "cartography_table",
+    "stonecutter",
+];
+
+#[cfg(feature = "pov")]
+fn menu_type(kind: i32) -> &'static str {
+    usize::try_from(kind)
+        .ok()
+        .and_then(|index| MENU_TYPES.get(index).copied())
+        .unwrap_or("unknown")
+}
+
 /// Ein geöffnetes Fenster.
 struct Open {
     /// Fenster-Nummer des Servers. Vanilla vergibt 1..100 – klein genug, dass VarInt und
     /// vorzeichenloses Byte dasselbe Byte ergeben (1.21.1 sendet ein Byte, ab 1.21.11 VarInt).
     id: i32,
+    /// Vanilla-Menue-Typ aus `OpenScreen`; der Browser waehlt damit den passenden Hintergrund.
+    #[cfg(feature = "pov")]
+    kind: i32,
     /// Überschrift als `§`-Text (siehe [`crate::nbt::Fmt::Legacy`]).
     title: String,
     /// Zustandszähler. Der Server erhöht ihn bei jeder Änderung; unser Klick muss den zuletzt
@@ -82,7 +125,9 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         // Fenster-Nummer, Typ, Überschrift.
         In::OpenScreen => {
             let id = r.var_int()?;
-            r.var_int()?; // Fenstertyp – für uns nur eine Zahl ohne Aussage
+            let kind = r.var_int()?;
+            #[cfg(not(feature = "pov"))]
+            let _ = kind;
             let title = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
             shared.console.info(&format!(
                 "Menü geöffnet: {} (:menu, :click <feld>)",
@@ -93,6 +138,8 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 .event("menu", &format!("open id={} {}", id, title));
             *shared.extras.menu.open.lock().unwrap() = Some(Open {
                 id,
+                #[cfg(feature = "pov")]
+                kind,
                 title,
                 state: 0,
                 slots: 0,
@@ -279,9 +326,7 @@ fn read_item_slot_with(
             item.name = usize::try_from(item.id)
                 .ok()
                 .and_then(|id| names.get(id).cloned())
-                .or_else(|| {
-                    crate::item_names::get(shared.proto.name, item.id).map(str::to_string)
-                });
+                .or_else(|| crate::item_names::get(shared.proto.name, item.id).map(str::to_string));
         }
     }
     Ok(slot)
@@ -294,6 +339,8 @@ fn read_item_slot_with(
 /// Netz-Thread mit an – kein KeepAlive mehr, also `disconnect.timeout` wegen einer Anzeige.
 struct Snapshot {
     id: i32,
+    #[cfg(feature = "pov")]
+    kind: i32,
     title: String,
     slots: usize,
     #[cfg(feature = "items")]
@@ -307,6 +354,8 @@ fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
     let current = open.as_ref()?;
     Some(Snapshot {
         id: current.id,
+        #[cfg(feature = "pov")]
+        kind: current.kind,
         title: current.title.clone(),
         slots: current.slots,
         #[cfg(feature = "items")]
@@ -314,6 +363,58 @@ fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
         #[cfg(feature = "items")]
         unknown_from: current.unknown_from,
     })
+}
+
+/// JSON-Abzug fuer die Browser-POV. Unter der Menuesperre wird nur kopiert; PNG-Ausgabe und
+/// Socket-Schreiben passieren danach und koennen den Netzwerkthread daher nie festhalten.
+#[cfg(all(feature = "items", feature = "pov"))]
+pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
+    let open = snapshot(shared);
+    let inventory = shared.extras.menu.inventory.lock().unwrap().clone();
+
+    let item_json = |item: &Option<Item>| match item {
+        Some(item) => serde_json::json!({
+            "id": item.id,
+            "count": item.count,
+            "name": crate::nbt::strip_legacy(&item.label()),
+            "lore": item.lore.iter().map(|line| crate::nbt::strip_legacy(line)).collect::<Vec<_>>(),
+        }),
+        None => serde_json::Value::Null,
+    };
+
+    match open {
+        Some(open) => serde_json::json!({
+            "open": true,
+            "id": open.id,
+            "kind": open.kind,
+            "type": menu_type(open.kind),
+            "title": crate::nbt::strip_legacy(&open.title),
+            "slots": open.slots,
+            "items": open.items.iter().map(item_json).collect::<Vec<_>>(),
+            "inventory": inventory.iter().map(item_json).collect::<Vec<_>>(),
+        }),
+        None => serde_json::json!({
+            "open": false,
+            "inventory": inventory.iter().map(item_json).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+#[cfg(all(not(feature = "items"), feature = "pov"))]
+pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
+    match snapshot(shared) {
+        Some(open) => serde_json::json!({
+            "open": true,
+            "id": open.id,
+            "kind": open.kind,
+            "type": menu_type(open.kind),
+            "title": crate::nbt::strip_legacy(&open.title),
+            "slots": open.slots,
+            "items": [],
+            "inventory": [],
+        }),
+        None => serde_json::json!({"open": false, "inventory": []}),
+    }
 }
 
 /// `:menu` – was gerade offen ist (mit `items` samt Inhalt).
@@ -406,13 +507,10 @@ pub fn print_slot(shared: &Arc<Shared>, arg: &str) {
     // Nur das eine Feld unter der Sperre abschreiben; ausgegeben wird danach (siehe [`Snapshot`]).
     let found: Option<Result<Option<Item>, usize>> = {
         let open = shared.extras.menu.open.lock().unwrap();
-        match open.as_ref() {
-            Some(current) => Some(match current.items.get(index) {
-                Some(slot) => Ok(slot.clone()),
-                None => Err(current.slots),
-            }),
-            None => None,
-        }
+        open.as_ref().map(|current| match current.items.get(index) {
+            Some(slot) => Ok(slot.clone()),
+            None => Err(current.slots),
+        })
     };
     match found {
         None => console.error("Gerade ist kein Menü offen (:menu)."),
@@ -474,21 +572,23 @@ fn print_item(shared: &Arc<Shared>, index: usize, item: &Item) {
 }
 
 /// `:click <feld> [rechts|shift]`
-pub fn click_command(shared: &Arc<Shared>, arg: &str) {
+pub fn click_command(shared: &Arc<Shared>, arg: &str) -> bool {
     let mut parts = arg.split_whitespace();
     let Some(slot) = parts.next().and_then(|text| text.parse::<i32>().ok()) else {
-        return shared
+        shared
             .console
             .error("Nutzung: :click <feld> [rechts|shift]   z. B.  :click 13");
+        return false;
     };
     let (button, mode) = match parts.next().unwrap_or("").to_lowercase().as_str() {
         "" | "links" | "left" | "l" => (0u8, values::click::NORMAL),
         "rechts" | "right" | "r" => (1u8, values::click::NORMAL),
         "shift" | "umschalt" | "s" => (0u8, values::click::SHIFT),
         other => {
-            return shared
+            shared
                 .console
-                .error(&format!("Unbekannt: '{}'. Möglich: rechts, shift", other))
+                .error(&format!("Unbekannt: '{}'. Möglich: rechts, shift", other));
+            return false;
         }
     };
 
@@ -500,9 +600,10 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
     // treffen. Auffallen konnte das nur, solange der Server den Fensterinhalt noch nicht
     // geschickt hat: vorher greift die Feldanzahl-Prüfung weiter unten gar nicht.
     if slot < 0 || i16::try_from(slot).is_err() {
-        return shared
+        shared
             .console
             .error(&format!("Feld {} gibt es in keinem Menü.", slot));
+        return false;
     }
 
     // Fenster-Nummer, Zustandszähler und Feldanzahl unter der Sperre holen und sie dann sofort
@@ -511,19 +612,22 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
     // nicht dazu, ein KeepAlive zu beantworten.
     let Some((id, state, slots)) = ({
         let open = shared.extras.menu.open.lock().unwrap();
-        open.as_ref().map(|current| (current.id, current.state, current.slots))
+        open.as_ref()
+            .map(|current| (current.id, current.state, current.slots))
     }) else {
-        return shared.console.error("Gerade ist kein Menü offen (:menu).");
+        shared.console.error("Gerade ist kein Menü offen (:menu).");
+        return false;
     };
     // Feldanzahl kennen wir erst, wenn der Server den Inhalt geschickt hat – vorher wird nicht
     // geprüft, sondern dem Nutzer geglaubt.
     if slots > 0 && !(0..slots as i32).contains(&slot) {
-        return shared.console.error(&format!(
+        shared.console.error(&format!(
             "Feld {} gibt es nicht – das Menü hat {} Felder (0 bis {}).",
             slot,
             slots,
             slots - 1
         ));
+        return false;
     }
 
     let mut w = Writer::packet(shared.proto.extra.sb_container_click);
@@ -536,10 +640,11 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) {
     w.u8(0); // nichts in der Hand
     shared.send(w);
     shared.console.info(&format!("Feld {} angeklickt.", slot));
+    true
 }
 
 /// `:close` – Fenster schließen (der Server erwartet das, sonst bleibt es für ihn offen).
-pub fn close_command(shared: &Arc<Shared>) {
+pub fn close_command(shared: &Arc<Shared>) -> bool {
     // Fenster erst aus dem Zustand nehmen, Sperre loslassen, dann senden (siehe `click_command`).
     let Some(id) = shared
         .extras
@@ -550,16 +655,20 @@ pub fn close_command(shared: &Arc<Shared>) {
         .take()
         .map(|current| current.id)
     else {
-        return shared.console.error("Gerade ist kein Menü offen.");
+        shared.console.error("Gerade ist kein Menü offen.");
+        return false;
     };
     let mut w = Writer::packet(shared.proto.extra.sb_container_close);
     write_container_id(shared, &mut w, id);
     shared.send(w);
     shared.console.info("Menü geschlossen.");
+    true
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "pov")]
+    use super::menu_type;
     use crate::proto::values;
 
     /// Klickarten dürfen sich nicht überschneiden – sonst würde ein Linksklick als
@@ -580,5 +689,14 @@ mod tests {
         varint.var_int(200);
         assert_eq!(byte.data, vec![200]);
         assert_eq!(varint.data, vec![200, 1]);
+    }
+
+    #[test]
+    #[cfg(feature = "pov")]
+    fn browser_fenstertypen_folgen_der_offiziellen_registry() {
+        assert_eq!(menu_type(0), "generic_9x1");
+        assert_eq!(menu_type(8), "anvil");
+        assert_eq!(menu_type(24), "stonecutter");
+        assert_eq!(menu_type(25), "unknown");
     }
 }

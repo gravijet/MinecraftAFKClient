@@ -489,12 +489,24 @@ mod tests {
         }
         let expected = vec![(9, "alpha"), (3, "aaa"), (3, "bbb"), (3, "ccc"), (1, "zzz")];
         assert_eq!(
-            sort(vec![(3, "ccc"), (1, "zzz"), (3, "aaa"), (9, "alpha"), (3, "bbb")]),
+            sort(vec![
+                (3, "ccc"),
+                (1, "zzz"),
+                (3, "aaa"),
+                (9, "alpha"),
+                (3, "bbb")
+            ]),
             expected
         );
         // Dieselbe Menge in anderer Ausgangsreihenfolge muss dasselbe Bild ergeben.
         assert_eq!(
-            sort(vec![(3, "bbb"), (9, "alpha"), (3, "aaa"), (3, "ccc"), (1, "zzz")]),
+            sort(vec![
+                (3, "bbb"),
+                (9, "alpha"),
+                (3, "aaa"),
+                (3, "ccc"),
+                (1, "zzz")
+            ]),
             expected
         );
     }

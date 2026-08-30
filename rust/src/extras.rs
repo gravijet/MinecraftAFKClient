@@ -27,6 +27,8 @@ use std::sync::Mutex;
 use crate::buf::Writer;
 #[cfg(feature = "state")]
 use crate::proto::values;
+#[cfg(all(feature = "state", feature = "pov"))]
+use std::sync::atomic::AtomicUsize;
 #[cfg(any(feature = "state", feature = "antiafk"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -60,6 +62,8 @@ pub struct Extras {
     sneaking: AtomicBool,
     #[cfg(feature = "state")]
     sprinting: AtomicBool,
+    #[cfg(all(feature = "state", feature = "pov"))]
+    pub(crate) selected_hotbar: AtomicUsize,
 }
 
 impl Extras {
@@ -84,6 +88,8 @@ impl Extras {
             sneaking: AtomicBool::new(false),
             #[cfg(feature = "state")]
             sprinting: AtomicBool::new(false),
+            #[cfg(all(feature = "state", feature = "pov"))]
+            selected_hotbar: AtomicUsize::new(0),
         }
     }
 }
@@ -225,6 +231,8 @@ pub fn on_join(shared: &Arc<Shared>) {
     {
         shared.extras.sneaking.store(false, Ordering::Relaxed);
         shared.extras.sprinting.store(false, Ordering::Relaxed);
+        #[cfg(feature = "pov")]
+        shared.extras.selected_hotbar.store(0, Ordering::Relaxed);
         if shared.extras.sneak_on_join {
             set_sneak(shared, true);
         }
@@ -266,11 +274,11 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
             return true;
         }
         if matches!(verb, "click" | "klick" | "klicke") {
-            crate::menu::click_command(shared, arg);
+            let _ = crate::menu::click_command(shared, arg);
             return true;
         }
         if matches!(verb, "close" | "schliessen" | "schließen" | "zu") {
-            crate::menu::close_command(shared);
+            let _ = crate::menu::close_command(shared);
             return true;
         }
     }
@@ -296,11 +304,23 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
     #[cfg(feature = "state")]
     {
         if matches!(verb, "sneak" | "schleich" | "schleichen" | "ducken") {
-            toggle(shared, arg, &shared.extras.sneaking, "Schleichen", set_sneak);
+            toggle(
+                shared,
+                arg,
+                &shared.extras.sneaking,
+                "Schleichen",
+                set_sneak,
+            );
             return true;
         }
         if matches!(verb, "sprint" | "rennen" | "sprinten") {
-            toggle(shared, arg, &shared.extras.sprinting, "Sprinten", set_sprint);
+            toggle(
+                shared,
+                arg,
+                &shared.extras.sprinting,
+                "Sprinten",
+                set_sprint,
+            );
             return true;
         }
         if matches!(verb, "swing" | "schlag" | "schlage" | "arm") {
@@ -456,12 +476,29 @@ fn hotbar(shared: &Arc<Shared>, arg: &str) {
             let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
             w.u16(slot as u16 - 1); // übertragen wird 0..8
             shared.send(w);
+            #[cfg(feature = "pov")]
+            shared
+                .extras
+                .selected_hotbar
+                .store(slot as usize - 1, Ordering::Relaxed);
             shared
                 .console
                 .info(&format!("Schnellleiste: Feld {}.", slot));
         }
         _ => shared.console.error("Nutzung: :hand <1-9>"),
     }
+}
+
+#[cfg(all(feature = "state", feature = "pov"))]
+pub(crate) fn web_hotbar(shared: &Arc<Shared>, slot: usize) -> bool {
+    if slot >= 9 {
+        return false;
+    }
+    let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
+    w.u16(slot as u16);
+    shared.send(w);
+    shared.extras.selected_hotbar.store(slot, Ordering::Relaxed);
+    true
 }
 
 #[cfg(test)]

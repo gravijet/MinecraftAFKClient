@@ -13,7 +13,7 @@ gebaut; der Java-Code bleibt davon unberührt.
 | Items | `items-afk-windows.exe`, `items-afk-linux` | `items` | Menüs, Klicks, Inventar-/Menügegenstände |
 | Premium | `premium-afk-windows.exe`, `premium-afk-linux` | `premium` | Bewegung, Scoreboard, Menü-Klicks, Tastenzustand, Anti-AFK |
 | Premium + Items | `premium-items-afk-windows.exe`, `premium-items-afk-linux` | `premium,items` | Premium plus sichtbare Gegenstände |
-| POV | `pov-afk-windows.exe`, `pov-afk-linux` | `pov-client` | automatisch gestartete Live-POV |
+| POV | `pov-afk-windows.exe`, `pov-afk-linux` | `pov-client` | Live-POV, Browser-HUD, Menüs und Gegenstände |
 | Ultra | `ultra-afk-windows.exe`, `ultra-afk-linux` | `ultra` | Premium + Items + zuschaltbare POV |
 
 Alle Varianten entstehen aus derselben Quelle. Ein nicht aktiviertes Feature wird nicht nur
@@ -118,16 +118,16 @@ nur, solange tatsächlich eine Bewegung läuft.
 
 ## Menüs und sichtbare Gegenstände
 
-Menü-Klicks sind in Items, Premium, Premium + Items und Ultra enthalten. Premium ohne Items kennt
+Menü-Klicks sind in Items, Premium, Premium + Items, POV und Ultra enthalten. Premium ohne Items kennt
 Fensternummer, Titel, Zustandszähler und Feldanzahl, hält aber bewusst keine Gegenstandsdaten.
 
-| Befehl | Items | Premium | Premium + Items | Ultra |
-| --- | ---: | ---: | ---: | ---: |
-| `:menu` | Inhalt | Metadaten | Inhalt | Inhalt |
-| `:click <feld> [rechts\|shift]` | ja | ja | ja | ja |
-| `:close` | ja | ja | ja | ja |
-| `:slot <feld>` | ja | nein | ja | ja |
-| `:inv` | ja | nein | ja | ja |
+| Befehl | Items | Premium | Premium + Items | POV | Ultra |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `:menu` | Inhalt | Metadaten | Inhalt | Inhalt | Inhalt |
+| `:click <feld> [rechts\|shift]` | ja | ja | ja | ja | ja |
+| `:close` | ja | ja | ja | ja | ja |
+| `:slot <feld>` | ja | nein | ja | ja | ja |
+| `:inv` | ja | nein | ja | ja | ja |
 
 Die Gegenstandsvarianten lesen pro Slot:
 
@@ -171,6 +171,36 @@ POV und Ultra enthalten einen echten Weltzustand. Der POV-Client startet das Ren
 Beitritt automatisch; Ultra startet erst nach `:pov live`, damit ein normaler Ultra-Prozess nicht
 ungefragt das Terminal übernimmt. Beides lässt sich mit `--pov an|aus` umdrehen.
 
+### Texturierte Browser-POV
+
+Mit `--pov-web <port>` und `--pov-resources <client.jar>` startet zusätzlich ein lokaler Viewer.
+Er liest aus der zur gewählten `--mc`-Version passenden Original-Client-JAR:
+
+- Blockstates und vererbte Blockmodelle, einschließlich Varianten, Multipart-Teilen,
+  Modellelementen und deren Drehungen;
+- echte Block-PNGs samt Alphakanal und `tintindex`;
+- Crosshair, Hotbar, Auswahlrahmen und Container-Hintergründe aus `textures/gui`;
+- Item-/Blockicons für Inventar und Menüfelder.
+
+Der Browser zeigt die POV pixelgenau skaliert, das eigene Inventar in der Hotbar und ein geöffnetes
+Vanilla-Menü über der Welt. Links-, Rechts- und Shift-Klick werden als echte Containerklicks an den
+Server gesendet; ein Klick außerhalb schließt das Fenster. Der Viewer benutzt kein CDN und keine
+kopierten Texturdateien. Die beim Start ausgegebene URL enthält einen zufälligen Zugriffstoken.
+
+```bash
+pov-afk-linux mc.example.net --mc 26.2 \
+  --pov-web 8765 \
+  --pov-resources "$HOME/.minecraft/versions/26.2/26.2.jar"
+```
+
+Nur eine Portnummer bindet an `127.0.0.1`; für einen bewusst extern erreichbaren Viewer kann eine
+IP mitgegeben werden. Ist `--pov-web` gesetzt, bleibt der alte ANSI-Dauerstrom standardmäßig aus,
+damit nicht zwei Renderer parallel arbeiten. `--pov an` bzw. `:pov live` schaltet ihn bei Bedarf
+zusätzlich ein. Die Binary enthält keine Minecraft-PNGs. Die komprimierte State-ID-Zuordnung stammt
+aus Mojangs offiziellen Server-Reports; Herkunft und Regeneration stehen in `rust/data/README.md`.
+
+### Terminal-Fallback
+
 | Befehl | Wirkung |
 | --- | --- |
 | `:pov live` | laufendes Bild starten |
@@ -193,11 +223,10 @@ Die POV liest tatsächlich die Serverpakete:
 - Spawn, Bewegung, Teleport und Entfernen von Entities;
 - aktuelle eigene Kameraposition, Yaw und Pitch.
 
-Das Bild entsteht über Voxel-Raycasts aus der First-Person-Kamera, mit Tiefenverdeckung,
-Entitäts-Overlays, Flächenlicht und Distanznebel. Es folgt Server-Teleports sowie `:look` und
-`:go` live. Minecraft schickt einem headless Protokollclient keine fertigen Frames und keine
-Blocktexturen; die POV ist deshalb eine farbige Terminal-Voxelansicht der wirklichen Geometrie,
-kein abgegriffenes Bild aus dem offiziellen Spielrenderer.
+Das Bild entsteht über Raycasts aus der First-Person-Kamera, mit Tiefenverdeckung, Flächenlicht und
+Distanznebel. Es folgt Server-Teleports sowie `:look` und `:go` live. Minecraft schickt einem
+headless Protokollclient keine fertigen Frames. Der Terminal-Fallback bleibt deshalb eine farbige
+Voxelansicht; der Browser ergänzt die fehlenden Modelle und Texturen aus der Original-Client-JAR.
 
 ### Bildformat der Live-POV
 
@@ -300,7 +329,7 @@ local
    ├─ board
    ├─ menu ── items
    ├─ state
-   └─ pov ── pov-client
+   └─ pov ── pov-client (= pov + items + state)
 
 antiafk = movement + state
 premium = movement + board + menu + state + antiafk

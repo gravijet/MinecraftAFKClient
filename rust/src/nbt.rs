@@ -452,7 +452,12 @@ fn push_legacy_hex(out: &mut String, chars: &mut std::str::Chars) -> bool {
         };
         value = (value << 4) | digit;
     }
-    push_true_color(out, ((value >> 16) & 0xFF) as u8, ((value >> 8) & 0xFF) as u8, (value & 0xFF) as u8);
+    push_true_color(
+        out,
+        ((value >> 16) & 0xFF) as u8,
+        ((value >> 8) & 0xFF) as u8,
+        (value & 0xFF) as u8,
+    );
     true
 }
 
@@ -707,7 +712,14 @@ mod tests {
     /// Prozess. Sie muss stattdessen einfach ungefärbt durchgehen.
     #[test]
     fn kaputte_farbangabe_stuerzt_nicht_ab() {
-        for farbe in ["#a\u{20ac}bc", "#\u{e4}\u{f6}\u{fc}", "#zzzzzz", "#12345", "#", "unsinn"] {
+        for farbe in [
+            "#a\u{20ac}bc",
+            "#\u{e4}\u{f6}\u{fc}",
+            "#zzzzzz",
+            "#12345",
+            "#",
+            "unsinn",
+        ] {
             let tag = compound(vec![("text", text("Hi")), ("color", text(farbe))]);
             assert_eq!(render(&tag, Fmt::Plain), "Hi");
             assert!(render(&tag, Fmt::Ansi).contains("Hi"));
@@ -765,7 +777,10 @@ mod tests {
         // Nullzeichen steht als C0 80 statt als Nullbyte.
         assert_eq!(decode_modified_utf8(&[b'a', 0xC0, 0x80, b'b']), "a\u{0}b");
         // Alles Normale bleibt unverändert – und ist der schnelle Weg ohne Kopie je Zeichen.
-        assert_eq!(decode_modified_utf8("Grün §6Gold".as_bytes()), "Grün §6Gold");
+        assert_eq!(
+            decode_modified_utf8("Grün §6Gold".as_bytes()),
+            "Grün §6Gold"
+        );
         assert_eq!(decode_modified_utf8(&[]), "");
     }
 
@@ -774,13 +789,13 @@ mod tests {
     #[test]
     fn kaputte_folgen_stuerzen_nicht_ab() {
         for raw in [
-            vec![0xED, 0xA0, 0xBD],             // hohe Hälfte ohne tiefe
-            vec![0xED, 0xB8, 0x89],             // tiefe Hälfte ohne hohe
-            vec![0xE0],                         // abgeschnitten
-            vec![0xC2],                         // abgeschnitten
-            vec![0x80, 0x80, 0x80],             // nur Fortsetzungsbytes
-            vec![0xED, 0xA0, 0xBD, 0x41],       // hohe Hälfte, dann ASCII
-            vec![0xFF, 0xFE, 0xFD],             // gibt es in keinem UTF-8
+            vec![0xED, 0xA0, 0xBD],       // hohe Hälfte ohne tiefe
+            vec![0xED, 0xB8, 0x89],       // tiefe Hälfte ohne hohe
+            vec![0xE0],                   // abgeschnitten
+            vec![0xC2],                   // abgeschnitten
+            vec![0x80, 0x80, 0x80],       // nur Fortsetzungsbytes
+            vec![0xED, 0xA0, 0xBD, 0x41], // hohe Hälfte, dann ASCII
+            vec![0xFF, 0xFE, 0xFD],       // gibt es in keinem UTF-8
         ] {
             let text = decode_modified_utf8(&raw);
             assert!(text.chars().count() <= raw.len(), "{:?} -> {:?}", raw, text);
@@ -821,7 +836,10 @@ mod tests {
             "Du bist gesperrt."
         );
         assert_eq!(
-            render_json(r#"{"text":"a","extra":[{"text":"b","bold":true}]}"#, Fmt::Legacy),
+            render_json(
+                r#"{"text":"a","extra":[{"text":"b","bold":true}]}"#,
+                Fmt::Legacy
+            ),
             "§ra§r§lb"
         );
         // Eine nackte Zeichenkette ist ebenfalls eine gültige Komponente.

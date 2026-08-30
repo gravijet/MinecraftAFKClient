@@ -32,6 +32,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case "$only" in
+    java|rust|both) ;;
+    *) echo "Ungültiger Wert für --only: $only (erwartet: java, rust oder both)" >&2; exit 2 ;;
+esac
+
 dist="$root/dist"
 mkdir -p "$dist"
 
@@ -39,6 +44,8 @@ mkdir -p "$dist"
 
 if [ "$only" = java ] || [ "$only" = both ]; then
     echo "Java-Build ..."
+    # Keine JAR aus einem früheren --move-Lauf versehentlich in das neue Paket übernehmen.
+    rm -f "$root"/java/build/libs/afk-*.jar "$dist"/afk-*.jar
     for v in "${versions[@]}"; do
         echo "  afk-$v.jar ..."
         ./gradlew :java:shadowJar "-Pmc=$v" --console=plain -q
@@ -55,20 +62,20 @@ if [ "$only" = rust ] || [ "$only" = both ]; then
     echo "Rust-Build ..."
     (
         cd rust
-        cargo build --release
+        cargo build --locked --release
         cp target/release/afk "$dist/afk-linux"
         # Eigene Zielverzeichnisse verhindern, dass eine Bauform eine andere überschreibt.
-        cargo build --release --features movement --target-dir target/movement
+        cargo build --locked --release --features movement --target-dir target/movement
         cp target/movement/release/afk "$dist/afk-linux-move"
-        cargo build --release --features items --target-dir target/items
+        cargo build --locked --release --features items --target-dir target/items
         cp target/items/release/afk "$dist/items-afk-linux"
-        cargo build --release --features premium --target-dir target/premium
+        cargo build --locked --release --features premium --target-dir target/premium
         cp target/premium/release/afk "$dist/premium-afk-linux"
-        cargo build --release --features premium,items --target-dir target/premium-items
+        cargo build --locked --release --features premium,items --target-dir target/premium-items
         cp target/premium-items/release/afk "$dist/premium-items-afk-linux"
-        cargo build --release --features pov-client --target-dir target/pov
+        cargo build --locked --release --features pov-client --target-dir target/pov
         cp target/pov/release/afk "$dist/pov-afk-linux"
-        cargo build --release --features ultra --target-dir target/ultra
+        cargo build --locked --release --features ultra --target-dir target/ultra
         cp target/ultra/release/afk "$dist/ultra-afk-linux"
     )
 fi

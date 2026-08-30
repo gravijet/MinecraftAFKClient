@@ -102,6 +102,8 @@ public class AfkClient {
     /** Ausgehende Nachrichten/Befehle, rate-limitiert von einem einzigen Sender-Thread gesendet. */
     private final LinkedBlockingQueue<String> outgoing = new LinkedBlockingQueue<>();
     private final Thread senderThread;
+    /** Verhindert doppeltes Starten, falls ein Einbetter {@link #connect} mehrmals aufruft. */
+    private final AtomicBoolean started = new AtomicBoolean(false);
 
     /** Server-Cookies (für Transfers / Netzwerk-Auth) merken und auf Anfrage zurückgeben. */
     private final Map<String, byte[]> cookies = new ConcurrentHashMap<>();
@@ -155,8 +157,6 @@ public class AfkClient {
         this.minecraftVersion = minecraftVersion;
         this.senderThread = new Thread(this::runSender, "afk-sender");
         this.senderThread.setDaemon(true);
-        this.senderThread.start();
-        this.mover.attach(this, console);
     }
 
     /** Bewegung dieses Builds (siehe {@link Mover}). */
@@ -175,18 +175,27 @@ public class AfkClient {
     // ===================== Verbindung =====================
 
     public void connect(String host, int port) {
+        // Erst nach der Rückkehr aus dem Konstruktor darf `this` an die optionale Bewegung oder
+        // einen Thread gelangen. Andernfalls könnte ein Bewegungs-Befehl eine nur teilweise
+        // initialisierte Clientinstanz sehen.
+        if (started.compareAndSet(false, true)) {
+            mover.attach(this, console);
+            senderThread.start();
+        }
         this.host = host;
         this.port = port;
-        doConnect();
+        doConnect(false);
     }
 
-    private void doConnect() {
+    private void doConnect(boolean preserveCookies) {
         intentionalDisconnect = false;
         joinedThisConnection = false;
-        // Cookies gehören zur Verbindung, nicht zum Prozess: Ohne dieses Leeren sammelten sich
-        // über Stunden die Cookies jedes besuchten Servers an, und der neue bekam obendrein die
-        // des vorigen zurückgereicht.
-        cookies.clear();
+        // Ein normaler Neuaufbau beginnt mit leerer Cookie-Ablage. Bei einem vom Server
+        // angeordneten Transfer müssen sie dagegen genau über diese TCP-Grenze hinweg erhalten
+        // bleiben: Zielserver nutzen sie für Anmeldung und Warteschlangenübergabe.
+        if (!preserveCookies) {
+            cookies.clear();
+        }
         try {
             Session client = Net.create(host, port, auth.gameProfile(), auth.accessToken(),
                     sessionService, packetExecutor, new Listener());
@@ -197,11 +206,11 @@ public class AfkClient {
             Net.start(client);
         } catch (Exception e) {
             console.error("Verbindung fehlgeschlagen: " + e.getMessage());
-            scheduleReconnect();
+            scheduleReconnect(preserveCookies);
         }
     }
 
-    private void scheduleReconnect() {
+    private void scheduleReconnect(boolean preserveCookies) {
         if (!options.autoReconnect) {
             // Ohne Reconnect gibt es nichts mehr zu tun. Der Hauptthread wartet womöglich
             // blockierend auf eine Eingabe, die nie kommt – also beenden, damit ein Dienst
@@ -225,7 +234,7 @@ public class AfkClient {
                 return;
             }
             reconnectScheduled.set(false);
-            doConnect();
+            doConnect(preserveCookies);
         }, "afk-reconnect");
         t.setDaemon(true);
         t.start();
@@ -241,7 +250,7 @@ public class AfkClient {
         if (current != null && current.isConnected()) {
             current.disconnect(Component.text("Serverwechsel"));
         } else {
-            doConnect();
+            doConnect(true);
         }
     }
 
@@ -342,7 +351,7 @@ public class AfkClient {
      * Zeichen entfernen, die der Server verbietet (§, Steuerzeichen, DEL), und auf die erlaubte
      * Länge kürzen. Ohne das trennt er mit {@code illegal_chat_characters}.
      */
-    private static String sanitize(String input, int limit) {
+    static String sanitize(String input, int limit) {
         StringBuilder out = new StringBuilder(Math.min(input.length(), limit));
         for (int i = 0; i < input.length() && out.length() < limit; i++) {
             char c = input.charAt(i);
@@ -353,10 +362,18 @@ public class AfkClient {
             // halbe Zeichenfolge, und die weist der Server als ungültige Zeichenkette ab –
             // statt die Nachricht einfach ein Zeichen kürzer anzunehmen.
             if (Character.isHighSurrogate(c)) {
-                if (i + 1 >= input.length() || out.length() + 2 > limit) {
+                if (i + 1 >= input.length()) {
                     break;
                 }
-                out.append(c).append(input.charAt(++i));
+                char low = input.charAt(i + 1);
+                if (!Character.isLowSurrogate(low)) {
+                    continue;
+                }
+                if (out.length() + 2 > limit) {
+                    break;
+                }
+                out.append(c).append(low);
+                i++;
                 continue;
             }
             if (Character.isLowSurrogate(c)) {
@@ -480,7 +497,7 @@ public class AfkClient {
                 reconnectImmediately();
             } else {
                 // Unbeabsichtigt (Kick/Timeout/Netzfehler): mit Backoff neu verbinden.
-                scheduleReconnect();
+                scheduleReconnect(false);
             }
         }
     }
@@ -492,7 +509,7 @@ public class AfkClient {
         }
         Thread t = new Thread(() -> {
             reconnectScheduled.set(false);
-            doConnect();
+            doConnect(true);
         }, "afk-reconnect");
         t.setDaemon(true);
         t.start();

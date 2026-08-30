@@ -13,8 +13,8 @@ mit `--mc <version>` gewählt. Windows-Dateien enden auf `.exe`, Linux-Dateien h
 | `items-afk-windows.exe` | `items-afk-linux` | normal plus Menü-Klicks sowie Menü- und Inventargegenstände mit Anzahl, Name, Farbcodes und Lore | schlanker Client, bei dem Inventarinhalte sichtbar sein müssen |
 | `premium-afk-windows.exe` | `premium-afk-linux` | Bewegung, farbiges Scoreboard, Menü-Klicks, Schleichen/Sprinten, Benutzen/Handwechsel, Anti-AFK | vollständige AFK-Steuerung ohne Gegenstandsdaten und POV-Weltspeicher |
 | `premium-items-afk-windows.exe` | `premium-items-afk-linux` | Premium plus Menü- und Inventargegenstände mit Namen, Farben und Lore | Premium-Steuerung mit sichtbaren Gegenständen |
-| `pov-afk-windows.exe` | `pov-afk-linux` | eigene Live-POV-Datei; lädt Chunk-, Block- und Entity-Daten und startet nach dem Beitritt automatisch die First-Person-Terminalansicht | beobachten, was der angemeldete Spieler aktuell sieht |
-| `ultra-afk-windows.exe` | `ultra-afk-linux` | alles aus Premium + Gegenstände + POV; POV wird mit `:pov live` zugeschaltet | eine Datei mit allen Rust-Funktionen |
+| `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV, Browser-HUD, Menüs und Gegenstände; Terminalansicht ohne Browser automatisch | beobachten und im Browser Menüs/Hotbar bedienen |
+| `ultra-afk-windows.exe` | `ultra-afk-linux` | alles aus Premium + Gegenstände + Terminal- und Browser-POV | eine Datei mit allen Rust-Funktionen |
 
 Keine dieser Rust-Dateien enthält eine Tablist oder Playerlist. Nach einem Kick wird **nicht**
 automatisch neu verbunden; der Prozess beendet sich mit Fehlerstatus. Ein vom Server ausdrücklich
@@ -31,6 +31,8 @@ lassen sich beim Start umstellen:
 | `--pov an` / `--pov aus` | Ansicht gleich nach dem Beitritt starten bzw. eben nicht |
 | `--pov-size 160x80` | Bildgröße von Anfang an, ohne den Umweg über `:pov size` |
 | `--pov-fps 4` | Bilder je Sekunde (1–20, Standard 8) |
+| `--pov-web 8765` | token-geschützten Browser-Viewer auf `127.0.0.1:8765` starten |
+| `--pov-resources <client.jar>` | versionsgleiche Original-Client-JAR für Modelle, Texturen, HUD und Menüs |
 
 Örtliche Befehle im laufenden Client:
 
@@ -48,8 +50,11 @@ Die Bilder gehen auf die **Standardfehlerausgabe**; das genaue Format steht in
 
 Die Ansicht ist kein Textdump von Koordinaten: Der Client decodiert die tatsächlich geladenen
 Chunk-Paletten, hält Blockänderungen und Entities live nach und raycastet das Bild aus der aktuellen
-Kameraposition und Blickrichtung. Minecraft überträgt dabei keine fertigen Bildschirmbilder oder
-Blocktexturen; deshalb rendert diese headless Datei eine farbige Voxelansicht im Terminal.
+Kameraposition und Blickrichtung. Die Terminalausgabe bleibt eine farbige Voxelansicht. Der
+Browser-Viewer liest zusätzlich echte Blockmodelle, PNGs, HUD- und Containertexturen aus der vom
+Nutzer angegebenen Original-Client-JAR; die Release-Dateien selbst enthalten keine Minecraft-PNGs.
+Die beim Start ausgegebene URL enthält einen zufälligen 128-Bit-Token. Ohne ihn sind auch
+JAR-Ressourcen und Lese-Endpunkte nicht erreichbar.
 
 ## Gegenstände und Scoreboard
 

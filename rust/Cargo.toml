@@ -1,6 +1,6 @@
 [package]
 name = "afk"
-version = "2.4.0"
+version = "2.5.0"
 edition = "2021"
 description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.21.11, 26.1 und 26.2"
 
@@ -16,7 +16,7 @@ path = "src/main.rs"
 #   (ohne)              schlanker AFK-Client – kein Byte darüber hinaus
 #   --features movement   zusätzlich :go/:look/:home/:route
 #   --features items      zusätzlich Menüs samt Feldinhalten (Name, Farben, Lore)
-#   --features pov-client eigene Live-Ansicht, startet beim Beitritt automatisch
+#   --features pov-client Live-Ansicht samt Browser-HUD, Menues und Gegenstaenden
 #   --features premium    zusätzlich Anzeigetafel, Menüs, Anti-AFK, Schleichen
 #   --features premium,items   Premium plus Feldinhalte
 #   --features ultra      alles zusammen
@@ -40,10 +40,10 @@ state = ["extras"]
 # Automatische kleine Bewegung – braucht sb_swing (state) und das Bewegungspaket.
 antiafk = ["movement", "state"]
 # Live-Ansicht: Chunks lesen und als Bild zeichnen.
-pov = ["extras"]
+pov = ["extras", "dep:png", "dep:zip"]
 # Eigene POV-Datei: startet die Ansicht nach dem Beitritt automatisch. Ultra enthält zwar den
 # POV-Code, startet ihn aber nur auf Wunsch mit `:pov live`.
-pov-client = ["pov"]
+pov-client = ["pov", "items", "state"]
 
 # --- Fertige Bauformen ---------------------------------------------------------------------
 premium = ["movement", "board", "menu", "state", "antiafk"]
@@ -68,6 +68,11 @@ rand = "0.8"
 base64 = "0.22"
 # Nur um beim Anlegen eines NEUEN Kontos ein deviceKeyPair zu erzeugen, das der Java-Client lesen kann.
 p256 = { version = "0.13", features = ["pkcs8"] }
+# Die Browser-POV decodiert die PNGs aus der Original-Client-JAR und schreibt ihre Frames als
+# PNG. Beides bleibt auf POV/Ultra beschraenkt; die schlanke Binary zieht die Abhaengigkeiten
+# nicht mit.
+png = { version = "0.17", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # TLS über SChannel (im System vorhanden) – spart den Wurzelzertifikat-Speicher im Binary.

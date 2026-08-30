@@ -333,8 +333,7 @@ impl Protocol {
         // Zusatzpaket – dann bleiben beide hier ungenutzt.
         #[allow(unused_variables)]
         let e = &self.extra;
-        #[allow(unused_variables)]
-        let id = id;
+        let _ = (e, id);
 
         // Welt- und Entitätspakete kommen im Sekundentakt – die stehen deshalb vorn.
         #[cfg(feature = "pov")]

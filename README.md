@@ -78,6 +78,8 @@ Java-Client schluckt `--offline`, `--proxy`, `--pov …`, der Rust-Client `--no-
 | `--pov <an\|aus>` | **V** Live-Ansicht gleich nach dem Beitritt starten. Standard: POV-Datei `an`, Ultra `aus`. |
 | `--pov-size <b>x<h>` | **V** Auflösung der Live-Ansicht, 24–160 × 12–80 (Standard 64x32). Trennzeichen `x`, `*`, `:` oder Leerzeichen; auch `--pov-groesse`. |
 | `--pov-fps <n>` | **V** Bilder je Sekunde, 1–20 (Standard 8) |
+| `--pov-web <port\|ip:port>` | **V** texturierten, token-geschützten Browser-Viewer starten; nur eine Portnummer bindet an `127.0.0.1` |
+| `--pov-resources <client.jar>` | **V** versionsgleiche Original-Client-JAR für Blockmodelle, Texturen, HUD und Menüs |
 | `--login` | Microsoft-Konto anmelden und beenden |
 | `--accounts` | gespeicherte Konten auflisten und beenden |
 | `-h`, `--help` | Hilfe |

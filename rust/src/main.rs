@@ -39,6 +39,10 @@ mod nbt;
 mod options;
 #[cfg(feature = "pov")]
 mod pov;
+#[cfg(feature = "pov")]
+mod pov_assets;
+#[cfg(feature = "pov")]
+mod pov_web;
 mod proto;
 mod proxy;
 mod rules;
@@ -165,11 +169,17 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
         if options.pov_size.is_some()
             || options.pov_autostart.is_some()
             || options.pov_fps.is_some()
+            || options.pov_web.is_some()
+            || options.pov_resources.is_some()
         {
             console.warn(
-                "--pov/--pov-size/--pov-fps brauchen die POV- oder Ultra-Datei; wird ignoriert.",
+                "--pov/--pov-size/--pov-fps/--pov-web/--pov-resources brauchen die POV- oder Ultra-Datei; wird ignoriert.",
             );
         }
+    }
+    #[cfg(feature = "pov")]
+    if options.pov_resources.is_some() && options.pov_web.is_none() {
+        console.warn("--pov-resources wird ohne --pov-web nicht geladen.");
     }
     #[cfg(all(feature = "state", feature = "pov"))]
     let _ = console;
@@ -338,7 +348,9 @@ fn print_usage() {
             "\nLive-Ansicht:\n\
              \x20     --pov an|aus            Ansicht beim Beitritt starten (POV an, Ultra aus)\n\
              \x20     --pov-size <b>x<h>      Bildgroesse in Pixeln, z. B. 160x80 (Standard 64x32)\n\
-             \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n"
+             \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n\
+             \x20     --pov-web <port|ip:port> texturierten Browser-Viewer starten\n\
+             \x20     --pov-resources <jar>   passende Original-Minecraft-Client-JAR\n"
         } else {
             ""
         },

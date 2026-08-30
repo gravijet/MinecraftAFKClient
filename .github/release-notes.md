@@ -10,7 +10,7 @@ Die Zusatzvarianten sind ausschließlich Rust-Clients. Jede Rust-Datei unterstü
 | `items-afk-windows.exe` | `items-afk-linux` | Basisclient plus Menü-Klicks und sichtbare Menü-/Inventargegenstände mit Anzahl, Name, Farbcodes und Lore |
 | `premium-afk-windows.exe` | `premium-afk-linux` | Bewegung, formatiertes Scoreboard, Menü-Klicks, Tastenzustand und Anti-AFK; ohne Gegenstandsdaten und POV-Weltspeicher |
 | `premium-items-afk-windows.exe` | `premium-items-afk-linux` | Premium plus sichtbare Menü- und Inventargegenstände mit Namen, Farben und Lore |
-| `pov-afk-windows.exe` | `pov-afk-linux` | eigener POV-Client; startet automatisch eine Live-First-Person-Ansicht der geladenen Welt im Terminal |
+| `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV mit Terminal-Fallback, texturiertem Browser-HUD, Menüs und Gegenständen |
 | `ultra-afk-windows.exe` | `ultra-afk-linux` | alle Rust-Funktionen in einer Datei: Premium, Items und mit `:pov live` zuschaltbare POV |
 
 Die vier Java-Dateien bleiben getrennt nach Protokollversion: `afk-1.21.1.jar`,
@@ -19,14 +19,368 @@ Ultra-Varianten gibt es bewusst nur für Rust.
 
 ---
 
-# Was sich seit dem 16. August geändert hat
+# Rust-Client 2.5.0 – texturierte Live-POV und Projekt-Audit
+
+Stand: 30. August 2026
+
+## Ergebnis
+
+Die Live-POV hat jetzt zusätzlich zur bisherigen Terminalausgabe einen eigenen lokalen
+Browser-Viewer. Dieser Viewer verwendet keine Hash-/Kontrastfarben und keine generierten
+Ersatzbilder. Blocktexturen, Blockmodelle, HUD-Elemente, Container-Hintergründe und direkte
+Itemtexturen werden unverändert aus einer echten Minecraft-Client-JAR gelesen.
+
+Die alte ANSI-POV bleibt absichtlich erhalten, weil bestehende Panels ihr festes Ausgabeformat
+einlesen. Sobald `--pov-web` verwendet wird, läuft sie nicht mehr automatisch parallel. Der
+Browser holt nur dann Frames, wenn er geöffnet ist.
+
+## Schnellstart
+
+Voraussetzungen:
+
+1. `pov-afk-*` oder `ultra-afk-*` aus diesem Stand verwenden.
+2. Im offiziellen Minecraft-Launcher genau die mit `--mc` gewählte Version einmal installieren.
+3. Den Pfad zu deren Client-JAR an `--pov-resources` übergeben.
+
+Linux:
+
+```bash
+./pov-afk-linux mc.example.net --mc 26.2 \
+  --pov-web 8765 \
+  --pov-resources "$HOME/.minecraft/versions/26.2/26.2.jar"
+```
+
+Windows PowerShell:
+
+```powershell
+.\pov-afk-windows.exe mc.example.net --mc 26.2 `
+  --pov-web 8765 `
+  --pov-resources "$env:APPDATA\.minecraft\versions\26.2\26.2.jar"
+```
+
+Beim Start erscheint zum Beispiel:
+
+```text
+Browser-POV: http://127.0.0.1:8765/?token=4f4d9b2a6c6e6f18a71c0841346ea6c0
+```
+
+Diese vollständige URL im Browser öffnen. Der Token wird bei jedem Start zufällig erzeugt. Ohne
+ihn können andere lokale Webseiten weder den Weltzustand lesen noch Menü-/Hotbar-Klicks senden.
+
+Für `1.21.1`, `1.21.11` oder `26.1` müssen `--mc`, Versionsordner und JAR-Dateiname entsprechend
+zusammenpassen. Eine 26.2-JAR zu `--mc 1.21.1` ist keine unterstützte Mischung: Modelle können
+sich geändert haben, auch wenn einzelne Texturen zufällig gleich heißen. Bei einer offiziellen
+Client-JAR wird die ID aus `version.json` geprüft und eine Abweichung mit einer klaren Meldung
+abgelehnt.
+
+## Neue Startoptionen
+
+| Option | Bedeutung |
+| --- | --- |
+| `--pov-web 8765` | bindet den Viewer an `127.0.0.1:8765` |
+| `--pov-web 127.0.0.1:8765` | dasselbe mit vollständiger Adresse |
+| `--pov-web 0.0.0.0:8765` | macht den Viewer bewusst im Netzwerk erreichbar; Token geheim halten |
+| `--pov-resources <client.jar>` | passende Original-Client-JAR mit Modellen, Texturen und GUI |
+| `--pov an` | startet zusätzlich den alten ANSI-Dauerstrom |
+| `--pov aus` | lässt den ANSI-Dauerstrom aus; der Browser funktioniert trotzdem |
+
+`--pov-size` und `--pov-fps` betreffen weiterhin die Terminal-POV. Die mitgelieferte Browserseite
+fordert 426×240 Pixel an und skaliert sie mit `image-rendering: pixelated` auf die Fenstergröße.
+Die HTTP-Schnittstelle akzeptiert 160–640 × 90–360 Pixel, höchstens 230.400 Pixel je Frame.
+
+## Bedienung im Browser
+
+- Das Fadenkreuz, die Hotbar, der Auswahlrahmen und die Menü-Hintergründe kommen aus der
+  angegebenen Minecraft-JAR.
+- Die Hotbar zeigt die Felder 36–44 des eigenen Inventars. Ein Klick wählt das Feld beim Server.
+- Öffnet der Server ein Menü, erscheint der zur `minecraft:menu`-ID passende Vanilla-Hintergrund.
+- Linksklick auf einen Slot sendet einen normalen Containerklick.
+- Rechtsklick sendet einen rechten Containerklick; das Browser-Kontextmenü wird dabei unterdrückt.
+- Umschalt+Linksklick sendet einen Shift-Klick.
+- Ein Klick in den abgedunkelten Bereich außerhalb des Fensters sendet `ContainerClose`.
+- Namen, Anzahl und Lore kommen aus den echten Container-/Item-Paketen. Tooltips werden als Text
+  gezeigt; Serverfarben bleiben in der Terminal-/Event-Schnittstelle weiterhin vollständig
+  erhalten.
+
+Unterstützte Vanilla-Hintergründe bzw. Layouts sind generische 9×N-Container, 3×3-Container,
+Crafter, Amboss, Leuchtfeuer, Ofen, Schmelzofen, Räucherofen, Braustand, Werkbank,
+Verzauberungstisch, Schleifstein, Trichter, Webstuhl, Händler, Shulkerkiste, Schmiedetisch,
+Kartentisch und Steinsäge. Die Zuordnung verwendet die versionsgeprüfte `minecraft:menu`-Registry,
+nicht die Anzahl der Slots als geratenen Fenstertyp.
+
+## Was am Weltbild geändert wurde
+
+### Versionsgenaue Block-State-Zuordnung
+
+Chunk-Pakete enthalten nur globale numerische State-IDs. Die Client-JAR enthält dagegen JSONs und
+PNGs unter Ressourcennamen. Neu eingebunden sind deshalb vier komprimierte Tabellen:
+
+| Version | State-IDs |
+| --- | ---: |
+| 1.21.1 | 26.684 |
+| 1.21.11 | 29.671 |
+| 26.1 | 29.873 |
+| 26.2 | 32.366 |
+
+Sie wurden mit `rust/data/generate-block-states.sh` aus `generated/reports/blocks.json` der
+offiziellen Mojang-Server-JAR der jeweiligen Version erzeugt. IDs sind lückenlos sortiert; jede
+Zeile enthält außerdem Mojangs `default`-Markierung. Dadurch verwenden Blockitems den wirklichen
+Default-State und nicht fälschlich die kleinste State-ID – bei 544 bis 661 Blocks je nach Version
+ist das nicht dasselbe. Es gibt keine von Hand gepflegte oder geschätzte ID-Liste. Die vier
+komprimierten Dateien benötigen zusammen rund 640 KB statt etwa 10 MB Rohtext.
+
+### Originale Resource-Dateien
+
+Der neue Lader verarbeitet:
+
+- `assets/<namespace>/blockstates/*.json`;
+- `variants` und bedingte `multipart`-Modelle;
+- Model-Arrays deterministisch mit der ersten Vanilla-Variante;
+- rekursive `parent`-Vererbung und Texture-Variablen wie `#all`, `#side` oder `#cross`;
+- `elements`, `from`/`to`, Elementrotationen sowie Blockstate-X/Y-Rotationen;
+- explizite und automatisch abgeleitete UV-Koordinaten;
+- Face-UV-Rotationen;
+- PNGs als RGB, RGBA, Graustufen oder Palette;
+- Alphatest: vollständig transparente Texel blockieren den Strahl nicht;
+- `tintindex` mit einem neutralen Overworld-Grün;
+- den ersten Frame senkrecht gestapelter animierter Texturen.
+
+Damit belegen Slabs, Treppen, Zaunteile und gedrehte Pflanzenkreuze im Browser nicht mehr pauschal
+einen ganzen Farbwürfel. Der Raycast trifft die tatsächlichen Modellelemente und tastet am
+Trefferpunkt die echte Textur ab.
+
+### Itemicons
+
+Direkte `textures/item/*.png` werden unverändert ausgeliefert. Blockitems ohne flache Item-PNG
+werden aus den echten Modellelementen und Blocktexturen als transparentes 16×16-GUI-Modell
+gerastert. Fertige Icons liegen in einem kleinen Laufzeitcache; ein unverändertes Menü rendert sie
+nicht bei jeder Zustandsabfrage neu.
+
+### Himmel, Nebel und Flächenlicht
+
+Die Zentralprojektion, Tiefenverdeckung und der vorhandene Distanznebel bleiben erhalten. Das
+Flächenlicht wird nicht mehr auf Hashfarben, sondern auf die abgetasteten Texturpixel angewendet.
+Die Browseransicht zeichnet absichtlich keine pinken oder türkisen Entity-Rechtecke mehr.
+
+## Interne HTTP-Schnittstelle
+
+Die mitgelieferte Seite verwendet folgende Endpunkte. Ausnahmslos jeder Aufruf – einschließlich
+der PNGs unter `/assets/` – braucht den Token aus der Start-URL.
+
+| Endpunkt | Zweck |
+| --- | --- |
+| `GET /?token=…` | vollständige lokale Viewer-Seite |
+| `GET /api/state.json?token=…` | Position, Dimension, Chunkzahl, Menü, Inventar, Hotbar |
+| `GET /api/frame.png?token=…&w=426&h=240` | aktueller texturierter POV-Frame |
+| `GET /api/item.png?token=…&id=N` | Item-/Blockicon zur Registry-ID |
+| `POST /api/click?token=…&slot=N&action=left\|right\|shift` | Menüklick |
+| `POST /api/close?token=…` | offenes Menü schließen |
+| `POST /api/hotbar?token=…&slot=0..8` | Hotbarfeld wählen |
+| `GET /assets/...?token=…` | unveränderte PNG aus der angegebenen Client-JAR |
+
+Es gibt kein CDN, keine Webfonts, keine Analytics und keine Verbindung zu einem fremden
+Webdienst. HTML, CSS und JavaScript sind in der Binary enthalten. HTTP-Antworten verwenden unter
+anderem eine enge `Content-Security-Policy`, `nosniff`, `DENY`, `no-referrer` und
+`Connection: close`. Seite, Zustand und Frames sind `no-store`; unveränderliche JAR-PNGs und
+gerenderte Itemicons dürfen der Browser dagegen privat und dauerhaft cachen. Ressourcenpfade mit
+`..` oder Backslashes werden abgelehnt.
+
+## Korrekturen aus dem Veröffentlichungs-Audit
+
+Die neue POV wurde nicht isoliert veröffentlicht. Der gesamte Rust- und Java-Bestand, sämtliche
+Feature-Kombinationen, Abhängigkeiten, Generatoren und Release-Schritte wurden erneut geprüft.
+
+### Sicherheit und Robustheit
+
+- JAR-Ressourcen waren in einem frühen Stand ohne Token abrufbar. Die Prüfung liegt jetzt vor
+  sämtlichen Routen; der zufällige Token umfasst 128 statt 64 Bit.
+- Der kleine HTTP-Server verarbeitet Anfragen in vier festen Arbeitern mit einer begrenzten
+  Warteschlange. Langsame oder absichtlich offene Verbindungen können weder den Viewer seriell
+  blockieren noch unbegrenzt neue Threads erzeugen. Lese- und Schreibzeitlimits, maximal 16 KiB
+  Anfragekopf und HTTP-1.0/1.1-Prüfung begrenzen den Eingang; Überlast antwortet mit HTTP 503.
+- JAR-Einträge sind beim Lesen auf 4 MiB für JSON und 32 MiB für Assets begrenzt. PNGs dürfen
+  höchstens 4096×4096 bzw. 16.777.216 Pixel und 64 MiB decodierte Daten belegen; Größenrechnungen
+  werden vor der Allokation auf Überlauf geprüft.
+- Eine vorhandene `version.json` in der Client-JAR muss zu `--mc` passen. Damit wird eine falsche
+  offizielle Versions-JAR nicht mehr mit zufällig passenden, aber semantisch anderen Modellen
+  weiterverwendet.
+- Ungültige Menüklicks, Hotbarfelder und Schließversuche liefern nicht mehr irreführend HTTP 204,
+  sondern HTTP 400. Ohne geladene JAR liefern Asset-/Icon-Endpunkte HTTP 503 statt eines leeren
+  Bildes.
+- Serveradressen mit Port 0, leerem Host, unlesbarem Port oder unerlaubtem Text hinter einer
+  geklammerten IPv6-Adresse werden in Rust und Java beim Start klar abgelehnt.
+
+### Tempo und Leerlauflast
+
+- Unveränderte Hotbar- und Menüzustände bauen ihre DOM-Knoten nicht mehr viermal pro Sekunde neu
+  auf. JAR-PNGs und Itemicons werden nicht bei jedem Poll erneut übertragen.
+- Der Browser fragt Frames mit fünf statt acht Bildern pro Sekunde ab; versteckte Tabs fallen auf
+  einen Abruf pro Sekunde zurück. Nahezu gleichzeitige Anfragen mehrerer Tabs teilen sich für
+  150 ms denselben Raycast und PNG-Encode. Der RGBA-Puffer wird zwischen Frames wiederverwendet.
+- `--pov-resources` ohne `--pov-web` lädt die große JAR nicht mehr nutzlos und meldet die ignorierte
+  Angabe. Browser und ANSI-Renderer teilen ihre vorhandenen Szenen-/Pixelpuffer und blockieren den
+  Netzwerkthread beim Zeichnen nicht.
+
+### Java-Client und Abhängigkeiten
+
+- Der Java-Client startete Senderthread und Bewegungsadapter aus seinem Konstruktor; damit konnte
+  die noch nicht fertig initialisierte Instanz entkommen. Beides beginnt jetzt beim ersten
+  `connect`, genau einmal.
+- Java löschte Transfer-Cookies unmittelbar vor dem Zielserver. Normale Reconnects beginnen
+  weiterhin sauber, ein vom Server angeordneter Transfer und dessen Wiederholungen bewahren die
+  Cookies jetzt wie der Rust-Client.
+- Der Java-Chatfilter akzeptierte einen hohen UTF-16-Surrogate vor einem beliebigen Zeichen als
+  Paar. Kaputte Hälften werden verworfen; Emoji bleiben innerhalb der Servergrenze vollständig.
+- Der Java-Parser akzeptiert die neuen Rust-Schalter `--pov-web` und `--pov-resources` für
+  gemeinsame Panel-Befehlszeilen. Neue JUnit-Tests decken Optionen, Ports und Chat-Sanitizing ab;
+  `javac -Xlint:all -Werror` macht neue Compilerwarnungen zum Buildfehler.
+- Direkte Java-Abhängigkeiten wurden auf MinecraftAuth 5.0.2, Adventure 4.26.1, Gson 2.14.0 und
+  SLF4J 2.0.18 aktualisiert. Der Rust-Lockstand wurde auf alle kompatiblen aktuellen Versionen
+  gebracht; `cargo machete` meldet keine unbenutzte Abhängigkeit.
+- Die Release-CI verwendet die aktuellen offiziellen Hauptversionen `actions/checkout@v7` und
+  `actions/setup-java@v6`. Lokale Buildskripte entfernen vor dem Java-Build gezielt alte
+  `afk-*.jar`, damit ein früherer Bewegungs-Build keine veraltete JAR ins neue Paket schmuggelt.
+- `cargo audit` ist bis auf `RUSTSEC-2023-0071` sauber. Dieses Advisory betrifft zeitabhängige
+  private RSA-PKCS#1-v1.5-Entschlüsselung und hat upstream für `rsa 0.9` keinen Fix. Das
+  ausgelieferte Programm besitzt keinen privaten RSA-Schlüssel und verwendet RSA ausschließlich
+  zur Verschlüsselung mit dem öffentlichen Serverschlüssel; private RSA-Operationen existieren nur
+  im an localhost gebundenen Testserver. Genau dieser Fall ist mit Begründung ausgenommen, damit
+  alle künftigen Advisories weiterhin fehlschlagen.
+
+## Kompatibilität
+
+- Das bisher dokumentierte ANSI-Frameformat auf stderr wurde nicht geändert.
+- `:pov live|stop|frame|size|fps|info` funktioniert weiter.
+- Ohne `--pov-web` startet die POV-Datei den Terminalrenderer wie bisher automatisch.
+- Mit `--pov-web` bleibt der Terminalrenderer standardmäßig aus. Das verhindert doppelte CPU- und
+  Ausgabelast; `--pov an` schaltet ihn ausdrücklich wieder dazu.
+- Ultra startet die Terminal-POV weiterhin nur ausdrücklich. Der Browser startet, sobald
+  `--pov-web` angegeben wurde.
+- Die POV-Bauform enthält jetzt `items`, `menu` und `state`, damit Hotbar und echte Menüs nicht nur
+  gemalt, sondern auch mit dem Server synchronisiert und bedient werden können.
+- Schlanke, Movement-, Items- und Premium-Binaries ziehen `png`/`zip`, Assettabellen und
+  HTTP-Viewer nicht mit hinein. Die Abhängigkeiten hängen am Cargo-Feature `pov`.
+
+## Fehlerbilder
+
+### `Browser-POV startet ohne Texturen`
+
+Der Pfad fehlt, zeigt nicht auf eine ZIP/JAR oder die Datei ist nicht lesbar. `--pov-resources`
+auf die echte Client-JAR der gewählten Version setzen. Der Viewer bleibt erreichbar und zeigt den
+genauen Fehler in Rot; `/api/frame.png` antwortet bis zur Korrektur mit HTTP 503.
+
+### Lila-schwarzes Icon oder Modell
+
+Die referenzierte Texture/Modelldatei fehlt in der JAR. Zuerst prüfen, ob JAR und `--mc` exakt
+zusammenpassen. Die Fehlertextur ist absichtlich deutlich: Fehlende Ressourcen werden nicht durch
+eine zufällige Farbe kaschiert.
+
+### Port kann nicht geöffnet werden
+
+Ein anderer Prozess verwendet ihn bereits oder die Adresse ist auf dem Rechner nicht vorhanden.
+Einen anderen Port wählen, zum Beispiel `--pov-web 8766`. Port 0 wird bereits beim Parsen
+abgelehnt.
+
+### Von einem anderen Rechner nicht erreichbar
+
+Eine nackte Portnummer bindet aus Sicherheitsgründen nur an localhost. Für LAN-Zugriff bewusst
+zum Beispiel `--pov-web 0.0.0.0:8765` verwenden und die ausgegebene URL auf die Server-IP ändern.
+Der Token bleibt Pflicht. Für öffentliches Internet gehört weiterhin ein TLS-Reverse-Proxy mit
+zusätzlicher Anmeldung davor; der eingebaute Server spricht absichtlich nur einfaches HTTP.
+
+## Ehrliche Grenzen
+
+Die verwendeten Block-/GUI-PNGs und JSON-Modelle sind die Originaldateien. Das Ergebnis ist
+trotzdem kein abgegriffener Frame des offiziellen Minecraft-Renderers:
+
+- Der Protokollclient behält derzeit keine Blocklicht-, Himmelslicht- und Biome-Paletten. Licht,
+  Gras-/Laubtönung, Himmel und Nebel sind deshalb angenähert.
+- Animierte Blocktexturen zeigen derzeit ihren ersten Frame.
+- Zufallsarrays in Blockstates verwenden deterministisch die erste Variante.
+- Flüssigkeitsoberflächen, Transparenzsortierung und Minecrafts Render-Layer sind vereinfacht.
+- Entity-Modelle, Entity-Metadaten, Ausrüstung und Spielerskins werden noch nicht geführt. Der
+  Browser lässt Entities deshalb weg, statt wieder auffällige Ersatzrechtecke zu zeichnen.
+- Direkte Item-PNGs und Blockitem-Modelle sind vorhanden; komplexe bedingte Itemmodelle (z. B.
+  zustandsabhängige Bögen/Uhren) werden nicht vollständig ausgewertet.
+- Menühintergründe und Slots sind original. Dynamische Balken, Rezeptlisten, Händlerangebote und
+  Spezialbuttons brauchen zusätzliche Container-Property-/Recipe-Pakete und sind noch statisch.
+- Die Minecraft-Bitmap-Schrift wird nicht in einen Webfont umgewandelt; Titel/Tooltips verwenden
+  die lokale Monospace-Schrift des Browsers.
+- Vom Server angebotene Resourcepacks bestätigt der AFK-Client weiterhin nur. Sie werden nicht
+  automatisch heruntergeladen oder über die Client-JAR gelegt.
+
+Diese Grenzen sind bewusst dokumentiert. Es werden keine AI-Bilder, keine erfundenen Texturen und
+keine scheinbar „passenden“ Zufallsfarben benutzt, um fehlende Protokolldaten zu verstecken.
+
+## Bauen und prüfen
+
+Alle Features bauen:
+
+```bash
+cd rust
+cargo build --release --features pov-client --target-dir target/pov
+cargo build --release --features ultra --target-dir target/ultra
+```
+
+Gesamter Testlauf:
+
+```bash
+cd rust
+cargo test --locked --release --all-features
+```
+
+Zusätzlicher Asset-Test gegen eine echte 26.2-Client-JAR:
+
+```bash
+cd rust
+AFK_POV_RESOURCES="$HOME/.minecraft/versions/26.2/26.2.jar" \
+  cargo test --release --features pov-client originale_client_jar -- --ignored --nocapture
+```
+
+Der HTTP-Ablauftest `browser_pov_liefert_seite_und_live_zustand` startet das gebaute Binary gegen
+den eingebauten Minecraft-Testserver und prüft Viewer-URL, Tokenpflicht, HTML und Live-JSON. Wenn
+`AFK_POV_RESOURCES` gesetzt ist, prüft er zusätzlich einen echten texturierten PNG-Frame, decodiert
+ihn und stellt sicher, dass Stone nicht als Fehlertextur erscheint.
+
+Im finalen Stand bestehen 134 Rust-Modultests (vier explizite Mess-/Originaldatenläufe bleiben
+standardmäßig ignoriert) und 30 Socket-Ablauftests (zwei Messläufe ignoriert). Die 14 sinnvollen
+Rust-Feature-Zusammenstellungen bauen warnungsfrei; Clippy läuft für alle Targets und Features mit
+`-D warnings`. Der Original-JAR-Test läuft zusätzlich gegen die SHA-1-geprüfte offizielle
+26.2-Client-JAR. Java besteht Tests, Warnungsprüfung und Kompilierung jeweils für 1.21.1, 1.21.11,
+26.1 und 26.2, sowohl mit als auch ohne Bewegungsquellen.
+
+## Geänderte und neue Dateien
+
+| Datei | Änderung |
+| --- | --- |
+| `rust/src/pov_assets.rs` | State-Tabelle, JAR-/PNG-/Model-Lader, Model-Raycasts, Itemicon-Renderer |
+| `rust/src/pov_web.rs` | token-geschützter HTTP-Server und lokale Viewer-Oberfläche |
+| `rust/src/pov.rs` | texturierter PNG-Pfad, Browser-Lebenszyklus, Asset-Zugriffe |
+| `rust/src/menu.rs` | Fenstertyp behalten, Browser-Snapshot für Menü und Inventar |
+| `rust/src/extras.rs` | ausgewähltes Hotbarfeld und Browser-Hotbaraktion |
+| `rust/src/options.rs` | `--pov-web`, `--pov-resources`, Validierung und Tests |
+| `rust/src/client.rs` | Browser-Viewer beim Clientstart initialisieren |
+| `rust/Cargo.toml` / `Cargo.lock` | `png` und `zip` nur im POV-Feature; POV-Bauform enthält Menü/Items/State |
+| `rust/data/block-states-*.txt.gz` | vier offizielle, komprimierte State-ID-Tabellen |
+| `rust/data/generate-block-states.sh` | reproduzierbarer Maintainer-Generator |
+| `rust/tests/live.rs` | HTTP-, Token- und optionaler Originaltextur-PNG-Ablauftest |
+| `java/src/main/.../Options.java`, `AfkClient.java` | gemeinsame POV-Schalter, Transfer-Cookies, Lifecycle, Unicode und Adressprüfung |
+| `java/src/test/...` | JUnit-Regressionstests für Optionen und Chat-Sanitizing |
+| `gradle.properties`, `java/build.gradle.kts` | aktualisierte Abhängigkeiten, JUnit und warnungsfreier Compilerlauf |
+| `rust/.cargo/audit.toml` | eng begründete Ausnahme für das nicht einschlägige, upstream ungefixte RSA-Advisory |
+| `build-all.sh`, `build-all.ps1`, `.github/workflows/release.yml` | ausführbare, reproduzierbare Locked-Builds ohne Alt-JARs, aktuelle CI-Actions/-Tests und bytegenauer Release-Changelog |
+| `README.md`, `FEATURES.md` | neue Optionen, Bauform und Browser-Nutzung |
+
+---
+
+# Frühere Änderungen: Rust-Client 2.1.0 bis 2.4.0
 
 Stand davor war der Commit, mit dem POV-, Items- und Ultra-Variante dazukamen. Seitdem gab es
-vier Runden: **2.1.0**, **2.2.0**, **2.3.0** und jetzt **2.4.0**. Der Java-Client bekam in 2.1.0
+darauf vier Runden: **2.1.0**, **2.2.0**, **2.3.0** und **2.4.0**. Der Java-Client bekam in 2.1.0
 die einstellbare Sichtweite und in 2.3.0 eine Reihe echter Fehlerbehebungen; 2.4.0 betrifft
 ausschließlich den Rust-Client.
 
-## Rust-Client 2.4.0 (neu)
+## Rust-Client 2.4.0
 
 Diese Runde ist reine Fehlersuche. Vier der behobenen Fehler kosteten unter den richtigen
 Umständen die Verbindung, zwei weitere ließen Chat still verschwinden – und keiner davon wäre am
@@ -295,9 +649,9 @@ Stand: 113 Modultests und 19 Ablauftests, alle sieben Bauformen bauen ohne eine 
   POV-Bauformen 6) und nehmen die Optionen des jeweils anderen an, statt am Start abzubrechen.
   Das ist die einzige Änderung, die in diesen beiden Runden auch den Java-Client betraf.
 
-## Java-Client (`afk-*.jar`)
+## Java-Client (Stand bis Rust 2.4.0, `afk-*.jar`)
 
-Unverändert seit 2.3.0 – die aktuelle Runde betrifft nur den Rust-Client. In 2.1.0 kam hier nur
+Im damaligen Rust-Stand 2.4.0 unverändert seit 2.3.0 – diese Runde betraf nur den Rust-Client. In 2.1.0 kam hier nur
 `--view-distance` dazu (und die Duldung der Rust-Optionen); 2.3.0 war die erste Runde, die im
 Java-Client wieder Fehler behebt. Die Protokollarbeit erledigt weiterhin
 MCProtocolLib; alles hier betrifft das Drumherum.
