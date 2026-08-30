@@ -220,6 +220,9 @@ Feature-Kombinationen, Abhängigkeiten, Generatoren und Release-Schritte wurden 
 - `--pov-resources` ohne `--pov-web` lädt die große JAR nicht mehr nutzlos und meldet die ignorierte
   Angabe. Browser und ANSI-Renderer teilen ihre vorhandenen Szenen-/Pixelpuffer und blockieren den
   Netzwerkthread beim Zeichnen nicht.
+- Die sieben veröffentlichten Rust-Bauformen teilen in lokalen und GitHub-Builds nun einen
+  Cargo-Zielcache. Jede fertige Datei wird vor dem nächsten Featureprofil gesichert; gemeinsame
+  Abhängigkeiten werden nicht mehr siebenmal in getrennten Zielverzeichnissen kompiliert.
 
 ### Java-Client und Abhängigkeiten
 

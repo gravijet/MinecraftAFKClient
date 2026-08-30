@@ -110,19 +110,29 @@ jobs:
             cargo fmt --all --check
             cargo clippy --locked --all-targets --all-features -- -D warnings
           fi
+          mkdir -p ../out
+          ext='${{ matrix.ext }}'
+          platform='${{ matrix.platform }}'
           cargo build --locked --release
-          cargo build --locked --release --features movement --target-dir target/movement
-          cargo build --locked --release --features items --target-dir target/items
-          cargo build --locked --release --features premium --target-dir target/premium
-          cargo build --locked --release --features premium,items --target-dir target/premium-items
-          cargo build --locked --release --features pov-client --target-dir target/pov
-          cargo build --locked --release --features ultra --target-dir target/ultra
+          cp "target/release/afk$ext" "../out/afk-$platform$ext"
+          cargo build --locked --release --features movement
+          cp "target/release/afk$ext" "../out/afk-$platform-move$ext"
+          cargo build --locked --release --features items
+          cp "target/release/afk$ext" "../out/items-afk-$platform$ext"
+          cargo build --locked --release --features premium
+          cp "target/release/afk$ext" "../out/premium-afk-$platform$ext"
+          cargo build --locked --release --features premium,items
+          cp "target/release/afk$ext" "../out/premium-items-afk-$platform$ext"
+          cargo build --locked --release --features pov-client
+          cp "target/release/afk$ext" "../out/pov-afk-$platform$ext"
+          cargo build --locked --release --features ultra
+          cp "target/release/afk$ext" "../out/ultra-afk-$platform$ext"
 
       - name: Tests
         working-directory: rust
         run: |
           cargo test --locked --release
-          cargo test --locked --release --all-features --target-dir target/tests
+          cargo test --locked --release --all-features
 
       - name: Hochladen
         shell: bash
@@ -130,16 +140,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          mkdir -p out
-          ext='${{ matrix.ext }}'
-          platform='${{ matrix.platform }}'
-          cp "rust/target/release/afk$ext" "out/afk-$platform$ext"
-          cp "rust/target/movement/release/afk$ext" "out/afk-$platform-move$ext"
-          cp "rust/target/items/release/afk$ext" "out/items-afk-$platform$ext"
-          cp "rust/target/premium/release/afk$ext" "out/premium-afk-$platform$ext"
-          cp "rust/target/premium-items/release/afk$ext" "out/premium-items-afk-$platform$ext"
-          cp "rust/target/pov/release/afk$ext" "out/pov-afk-$platform$ext"
-          cp "rust/target/ultra/release/afk$ext" "out/ultra-afk-$platform$ext"
+          test "$(find out -maxdepth 1 -type f | wc -l)" -eq 7
           gh release upload "$ENTWURF" out/* --clobber
 
   veroeffentlichen:

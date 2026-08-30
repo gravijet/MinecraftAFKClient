@@ -64,19 +64,20 @@ if [ "$only" = rust ] || [ "$only" = both ]; then
         cd rust
         cargo build --locked --release
         cp target/release/afk "$dist/afk-linux"
-        # Eigene Zielverzeichnisse verhindern, dass eine Bauform eine andere überschreibt.
-        cargo build --locked --release --features movement --target-dir target/movement
-        cp target/movement/release/afk "$dist/afk-linux-move"
-        cargo build --locked --release --features items --target-dir target/items
-        cp target/items/release/afk "$dist/items-afk-linux"
-        cargo build --locked --release --features premium --target-dir target/premium
-        cp target/premium/release/afk "$dist/premium-afk-linux"
-        cargo build --locked --release --features premium,items --target-dir target/premium-items
-        cp target/premium-items/release/afk "$dist/premium-items-afk-linux"
-        cargo build --locked --release --features pov-client --target-dir target/pov
-        cp target/pov/release/afk "$dist/pov-afk-linux"
-        cargo build --locked --release --features ultra --target-dir target/ultra
-        cp target/ultra/release/afk "$dist/ultra-afk-linux"
+        # Sofort kopieren, danach darf Cargo denselben Ausgabepfad wiederverwenden. So teilen alle
+        # Bauformen den Dependency-Cache, statt dieselben Crates in sieben target-Ordnern zu bauen.
+        cargo build --locked --release --features movement
+        cp target/release/afk "$dist/afk-linux-move"
+        cargo build --locked --release --features items
+        cp target/release/afk "$dist/items-afk-linux"
+        cargo build --locked --release --features premium
+        cp target/release/afk "$dist/premium-afk-linux"
+        cargo build --locked --release --features premium,items
+        cp target/release/afk "$dist/premium-items-afk-linux"
+        cargo build --locked --release --features pov-client
+        cp target/release/afk "$dist/pov-afk-linux"
+        cargo build --locked --release --features ultra
+        cp target/release/afk "$dist/ultra-afk-linux"
     )
 fi
 

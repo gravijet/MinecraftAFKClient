@@ -86,19 +86,17 @@ if ($Only -in @('rust', 'both')) {
         Copy-Item 'target\release\afk.exe' (Join-Path $dist 'afk-windows.exe') -Force
 
         $variants = @(
-            @{ Target = 'movement';     Features = 'movement';      File = 'afk-windows-move.exe';          Label = 'Bewegung' },
-            @{ Target = 'items';        Features = 'items';         File = 'items-afk-windows.exe';          Label = 'Items' },
-            @{ Target = 'premium';      Features = 'premium';       File = 'premium-afk-windows.exe';        Label = 'Premium' },
-            @{ Target = 'premium-items'; Features = 'premium,items'; File = 'premium-items-afk-windows.exe'; Label = 'Premium + Items' },
-            @{ Target = 'pov';          Features = 'pov-client';    File = 'pov-afk-windows.exe';            Label = 'POV' },
-            @{ Target = 'ultra';        Features = 'ultra';         File = 'ultra-afk-windows.exe';          Label = 'Ultra' }
+            @{ Features = 'movement';      File = 'afk-windows-move.exe';          Label = 'Bewegung' },
+            @{ Features = 'items';         File = 'items-afk-windows.exe';          Label = 'Items' },
+            @{ Features = 'premium';       File = 'premium-afk-windows.exe';        Label = 'Premium' },
+            @{ Features = 'premium,items'; File = 'premium-items-afk-windows.exe'; Label = 'Premium + Items' },
+            @{ Features = 'pov-client';    File = 'pov-afk-windows.exe';            Label = 'POV' },
+            @{ Features = 'ultra';         File = 'ultra-afk-windows.exe';          Label = 'Ultra' }
         )
         foreach ($variant in $variants) {
-            # Eigene Zielverzeichnisse verhindern, dass eine Bauform eine andere ueberschreibt.
-            Invoke-Native {
-                & cargo build --locked --release --features $variant.Features --target-dir "target\$($variant.Target)"
-            } "Rust-Build $($variant.Label)"
-            Copy-Item "target\$($variant.Target)\release\afk.exe" (Join-Path $dist $variant.File) -Force
+            # Sofort kopieren: Alle Bauformen teilen dadurch denselben Cargo-Dependency-Cache.
+            Invoke-Native { & cargo build --locked --release --features $variant.Features } "Rust-Build $($variant.Label)"
+            Copy-Item 'target\release\afk.exe' (Join-Path $dist $variant.File) -Force
         }
     } finally {
         Pop-Location
