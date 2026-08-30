@@ -243,6 +243,9 @@ Feature-Kombinationen, Abhängigkeiten, Generatoren und Release-Schritte wurden 
 - Die Release-CI verwendet die aktuellen offiziellen Hauptversionen `actions/checkout@v7` und
   `actions/setup-java@v6`. Lokale Buildskripte entfernen vor dem Java-Build gezielt alte
   `afk-*.jar`, damit ein früherer Bewegungs-Build keine veraltete JAR ins neue Paket schmuggelt.
+- Die vier Java-JARs werden trotz sauberem Einzelbuild in einem eigenen Ausgabeordner gesammelt.
+  Vor dem Ersetzen von `latest` vergleicht die CI alle 19 erwarteten Assetnamen exakt; ein fehlendes
+  oder zusätzliches Paket lässt das alte vollständige Release unangetastet.
 - `cargo audit` ist bis auf `RUSTSEC-2023-0071` sauber. Dieses Advisory betrifft zeitabhängige
   private RSA-PKCS#1-v1.5-Entschlüsselung und hat upstream für `rsa 0.9` keinen Fix. Das
   ausgelieferte Programm besitzt keinen privaten RSA-Schlüssel und verwendet RSA ausschließlich
