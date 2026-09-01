@@ -222,6 +222,10 @@ public class AfkClient {
             return;
         }
         int attempt = reconnectAttempts.incrementAndGet();
+        if (options.reconnectTries > 0 && attempt > options.reconnectTries) {
+            console.error("Nach " + options.reconnectTries + " Versuchen keine Verbindung – beende.");
+            System.exit(1);
+        }
         int exp = Math.min(attempt - 1, 6);
         long delay = Math.min((long) (options.reconnectDelaySeconds * Math.pow(2, exp)), options.maxBackoffSeconds);
         delay = Math.max(1, delay);

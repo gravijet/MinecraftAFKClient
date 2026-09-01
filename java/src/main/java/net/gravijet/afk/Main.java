@@ -235,6 +235,7 @@ public class Main {
                       --no-reconnect          nach einem Abbruch nicht neu verbinden
                       --reconnect-delay <sek> erste Wartezeit vor dem Reconnect (5)
                       --max-backoff <sek>     Obergrenze der Reconnect-Wartezeit (60)
+                      --reconnect-tries <n>   nach n erfolglosen Versuchen aufgeben (0 = nie)
                       --chat-delay <ms>       Mindestabstand ausgehender Nachrichten (1000)
                       --view-distance <2-32>  gemeldete Sichtweite in Chunks (2)
                       --no-color              keine Farben

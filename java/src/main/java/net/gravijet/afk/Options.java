@@ -34,6 +34,15 @@ public final class Options {
     public long reconnectDelaySeconds = 5;
     public long maxBackoffSeconds = 60;
 
+    /**
+     * Höchstzahl erfolgloser Reconnect-Versuche, {@code 0} für unbegrenzt.
+     *
+     * <p>Gezählt werden nur Versuche, die es nicht bis in die Spielphase geschafft haben; ein
+     * gelungener Beitritt setzt den Zähler zurück. Sonst würde ein Bot, der seit Tagen läuft und
+     * dabei zehnmal kurz die Verbindung verloren hat, beim elften Mal aufgeben.
+     */
+    public long reconnectTries = 0;
+
     public boolean color = true;
     /** Keine Statusmeldungen – nur noch Chat auf der Standardausgabe. */
     public boolean quiet = false;
@@ -85,6 +94,10 @@ public final class Options {
         // Moment, bis er Chat von uns überhaupt annimmt.
         long joinDelay = 4;
         List<String> rawCommands = new ArrayList<>();
+        // Erst am Ende gesetzt, damit --no-reconnect unabhängig von der Reihenfolge gewinnt:
+        // Wer '--reconnect --no-reconnect' schreibt, meint das Abschalten, und wer es umgekehrt
+        // schreibt, ebenso. Der Rust-Client verhält sich an derselben Stelle genauso.
+        Boolean reconnectOn = null;
 
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
@@ -113,15 +126,34 @@ public final class Options {
                 }
                 case "-c", "--cmd" -> rawCommands.add(value(args, ++i, "--cmd"));
                 case "--join-delay" -> joinDelay = number(value(args, ++i, "--join-delay"), "--join-delay");
-                case "--reconnect-delay" ->
-                        o.reconnectDelaySeconds = Math.max(1, number(value(args, ++i, "--reconnect-delay"), "--reconnect-delay"));
-                case "--max-backoff" ->
-                        o.maxBackoffSeconds = Math.max(1, number(value(args, ++i, "--max-backoff"), "--max-backoff"));
+                case "--reconnect-delay" -> {
+                    o.reconnectDelaySeconds = Math.max(1, number(value(args, ++i, "--reconnect-delay"), "--reconnect-delay"));
+                    if (reconnectOn == null) {
+                        reconnectOn = true;
+                    }
+                }
+                case "--max-backoff" -> {
+                    o.maxBackoffSeconds = Math.max(1, number(value(args, ++i, "--max-backoff"), "--max-backoff"));
+                    if (reconnectOn == null) {
+                        reconnectOn = true;
+                    }
+                }
+                case "--reconnect-tries" -> {
+                    o.reconnectTries = number(value(args, ++i, "--reconnect-tries"), "--reconnect-tries");
+                    if (reconnectOn == null) {
+                        reconnectOn = true;
+                    }
+                }
                 case "--chat-delay" ->
                         o.chatMinDelayMs = Math.max(MIN_CHAT_DELAY_MS, number(value(args, ++i, "--chat-delay"), "--chat-delay"));
                 case "--view-distance", "--sichtweite" -> o.viewDistance =
                         (int) Math.min(32, Math.max(2, number(value(args, ++i, "--view-distance"), "--view-distance")));
-                case "--no-reconnect" -> o.autoReconnect = false;
+                case "--reconnect" -> {
+                    if (reconnectOn == null) {
+                        reconnectOn = true;
+                    }
+                }
+                case "--no-reconnect" -> reconnectOn = false;
                 case "--no-color" -> o.color = false;
                 case "-q", "--quiet" -> o.quiet = true;
                 default -> {
@@ -141,6 +173,9 @@ public final class Options {
                 }
             }
         }
+
+        o.autoReconnect = reconnectOn == null || reconnectOn;
+        o.maxBackoffSeconds = Math.max(o.maxBackoffSeconds, o.reconnectDelaySeconds);
 
         if (o.server.isBlank()) {
             throw new IllegalArgumentException(
