@@ -67,8 +67,8 @@ beginnt wieder bei 5 s statt bei der zuletzt erreichten Obergrenze.
 `--reconnect-delay 10 --no-reconnect` schreibt, bekommt keinen Reconnect. Umgekehrt schaltet jede
 der drei Feineinstellungen den Reconnect ein, falls er nicht ausdrücklich abgeschaltet wurde.
 
-Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<s>s`, damit ein Panel den Zustand
-mitbekommt, ohne die Fehlerausgabe zu lesen.
+Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<sekunden>`, damit ein Panel den
+Zustand mitbekommt, ohne die Fehlerausgabe mitzulesen.
 
 ### Protokollbasierter Kick-Schutz
 

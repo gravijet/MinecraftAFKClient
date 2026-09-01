@@ -75,7 +75,7 @@ neu startet. Jetzt liegt es im Client:
 
 Der Zähler springt auf null, sobald der Client wieder in der Spielphase ist – eine Sitzung, die
 nach zwei Stunden abbricht, beginnt also wieder bei 5 s und nicht bei der zuletzt erreichten
-Obergrenze. Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<s>s`. Abgelegte
+Obergrenze. Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<sekunden>`. Abgelegte
 Cookies werden bei einer Neuverbindung verworfen, bei einem Server-Transfer nicht: Nur der
 Transfer setzt dieselbe Sitzung fort.
 

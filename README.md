@@ -127,7 +127,7 @@ sie kommen **auch mit `-q`** durch, sind nie eingefärbt, stehen immer auf **gen
 | `@event world` | Weltwechsel (Respawn in einer anderen Welt) |
 | `@event death` | gestorben |
 | `@event disconnect <grund>` | Verbindung beendet (Grund kann leer sein) |
-| `@event reconnect versuch=N in=Ns` | **R** Neuverbindung geplant, mit Nummer und Wartezeit |
+| `@event reconnect versuch=N in=N` | **R** Neuverbindung geplant: Nummer des Versuchs und Wartezeit in Sekunden |
 | `@event menu open id=N` / `@event menu close` | Menü auf/zu (Items/Premium/Ultra) |
 | `@event board …` | Scoreboard-Titel/-Zeilen samt formatiertem Zahlenfeld und `§`-Farbcodes (Premium/Ultra) |
 | `@event slot …` / `@event lore …` | Gegenstände und Lore mit `§`-Farbcodes (Items-Bauformen) |
@@ -135,7 +135,7 @@ sie kommen **auch mit `-q`** durch, sind nie eingefärbt, stehen immer auf **gen
 Nach einem Kick oder Verbindungsabbruch verbindet sich der Client neu: erst nach 5 Sekunden, dann
 mit verdoppelter Wartezeit bis höchstens 60 Sekunden. Der Zähler springt auf null zurück, sobald
 der Client wieder im Spiel ist. Jeder Versuch meldet sich als
-`@event reconnect versuch=<n> in=<sek>s`. Mit `--no-reconnect` endet der Prozess stattdessen mit
+`@event reconnect versuch=<n> in=<sekunden>`. Mit `--no-reconnect` endet der Prozess stattdessen mit
 Status 1. Einem ausdrücklichen Server-Transfer auf einen Unterserver folgt der Client davon
 unabhängig als Teil derselben Sitzung – dabei bleiben die Cookies erhalten, bei einer Neuverbindung
 werden sie verworfen.
