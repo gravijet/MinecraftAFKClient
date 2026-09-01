@@ -134,10 +134,15 @@ fn load_colormap(archive: &mut ZipArchive<File>, name: &str) -> Option<Box<[[u8;
     if texture.width != 256 || texture.rgba.len() < 256 * 256 * 4 {
         return None;
     }
+    // `as_chunks::<4>` statt `chunks_exact(4)`: Bei fester Groesse kennt der Compiler die
+    // Schrittweite und braucht keine Laengenpruefung je Pixel. Neuere clippy-Fassungen bestehen
+    // ohnehin darauf.
     Some(
         texture
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(256 * 256)
             .map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect(),
