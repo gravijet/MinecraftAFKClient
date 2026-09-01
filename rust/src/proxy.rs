@@ -9,7 +9,7 @@
 
 use base64::Engine;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 /// So lange darf der Proxy für den TCP-Aufbau und für jede Antwort im Handshake brauchen.
@@ -141,18 +141,11 @@ impl Proxy {
         Ok(stream)
     }
 
-    /// TCP-Verbindung zum Proxy mit Zeitlimit. `connect_timeout` braucht eine aufgelöste Adresse,
-    /// deshalb wird der Name hier selbst aufgelöst; scheitert jeder Kandidat, kommt der letzte
-    /// Fehler heraus.
+    /// TCP-Verbindung zum Proxy mit demselben Dual-Stack-Aufbau wie beim direkten Serverziel.
+    /// Damit blockiert auch ein nur halb erreichbarer IPv6-Proxy nicht den funktionierenden
+    /// IPv4-Kandidaten bis zum vollen Zeitlimit.
     fn dial(&self) -> io::Result<TcpStream> {
-        let mut last = None;
-        for address in (self.host.as_str(), self.port).to_socket_addrs()? {
-            match TcpStream::connect_timeout(&address, HANDSHAKE_TIMEOUT) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| fail("Proxy-Adresse ließ sich nicht auflösen")))
+        crate::conn::dial_timeout(&self.host, self.port, HANDSHAKE_TIMEOUT)
     }
 
     // ===================== SOCKS5 (RFC 1928) =====================

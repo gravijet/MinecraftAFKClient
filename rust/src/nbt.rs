@@ -50,6 +50,30 @@ impl Nbt {
         }
     }
 
+    /// Fließkommafeld eines Compounds.
+    ///
+    /// Temperatur und Niederschlag eines Bioms stehen in Vanilla als `Float`; ein Datenpaket darf
+    /// dieselbe Zahl aber auch als `Double` oder – bei glatten Werten wie `1` – als Ganzzahl
+    /// schreiben. Alle vier Schreibweisen meinen denselben Wert.
+    #[cfg(feature = "pov")]
+    pub(crate) fn get_f32(&self, key: &str) -> Option<f32> {
+        match self.get(key)? {
+            Nbt::Float(value) => Some(*value),
+            Nbt::Double(value) => Some(*value as f32),
+            Nbt::Byte(value) => Some(*value as f32),
+            Nbt::Short(value) => Some(*value as f32),
+            Nbt::Int(value) => Some(*value as f32),
+            Nbt::Long(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    /// Textfeld eines Compounds – für `grass_color_modifier`.
+    #[cfg(feature = "pov")]
+    pub(crate) fn get_str<'a>(&'a self, key: &str) -> Option<&'a str> {
+        self.get(key)?.as_str()
+    }
+
     fn as_str(&self) -> Option<&str> {
         match self {
             Nbt::Str(s) => Some(s),

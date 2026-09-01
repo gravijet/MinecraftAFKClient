@@ -41,10 +41,10 @@ pub(crate) fn start(shared: &Arc<Shared>, address: SocketAddr) -> Result<(), Str
             "Browser-POV lauscht ausserhalb von localhost. Die URL enthaelt den Zugriffstoken; nicht weitergeben.",
         );
     }
-    if let Some(error) = shared.extras.pov.asset_error() {
+    if let Some(note) = shared.extras.pov.asset_note() {
         shared
             .console
-            .warn(&format!("Browser-POV startet ohne Texturen: {}", error));
+            .info(&format!("Browser-POV: {}", note));
     }
 
     let owned = Arc::clone(shared);
@@ -64,14 +64,6 @@ fn access_token() -> String {
 }
 
 fn serve(listener: TcpListener, shared: Arc<Shared>, token: String) {
-    if let Err(error) = listener.set_nonblocking(true) {
-        shared.console.error(&format!(
-            "Browser-POV konnte nicht gestartet werden: {}",
-            error
-        ));
-        return;
-    }
-
     let (sender, receiver) = sync_channel::<TcpStream>(CONNECTION_QUEUE);
     let receiver = Arc::new(Mutex::new(receiver));
     let token: Arc<str> = token.into();
@@ -108,6 +100,10 @@ fn serve(listener: TcpListener, shared: Arc<Shared>, token: String) {
         return;
     }
 
+    // Blockierendes `accept`. Vorher lief der Listener nicht-blockierend in einer 10-ms-Schleife:
+    // Der Prozess wachte dadurch hundertmal je Sekunde auf, sein Leben lang, ohne dass jemals
+    // etwas passiert wäre – ausgerechnet in einem Client, dessen Aufgabe das Nichtstun ist.
+    // Blockierend wartet der Thread stattdessen im Kern und kostet nichts.
     while shared.running.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => match sender.try_send(stream) {
@@ -123,14 +119,14 @@ fn serve(listener: TcpListener, shared: Arc<Shared>, token: String) {
                 }
                 Err(TrySendError::Disconnected(_)) => break,
             },
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
+            // Ein unterbrochener Systemaufruf ist kein Fehler, sondern ein Signal – weitermachen.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 shared.console.warn(&format!(
                     "Browser-POV: Verbindung fehlgeschlagen: {}",
                     error
                 ));
+                // Dauerfehler (etwa erschöpfte Dateizeiger) sollen keine heiße Schleife ergeben.
                 thread::sleep(Duration::from_millis(50));
             }
         }

@@ -27,6 +27,8 @@ use std::sync::Mutex;
 use crate::buf::Writer;
 #[cfg(feature = "state")]
 use crate::proto::values;
+#[cfg(feature = "state")]
+use std::sync::atomic::AtomicU32;
 #[cfg(all(feature = "state", feature = "pov"))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(any(feature = "state", feature = "antiafk"))]
@@ -62,6 +64,10 @@ pub struct Extras {
     sneaking: AtomicBool,
     #[cfg(feature = "state")]
     sprinting: AtomicBool,
+    /// Sequenz der Weltinteraktionen. Vanilla erhöht sie bei jeder Benutzung; dauerhaft `0` zu
+    /// senden lässt Server-Acknowledgements mehrerer Aktionen ununterscheidbar werden.
+    #[cfg(feature = "state")]
+    use_sequence: AtomicU32,
     #[cfg(all(feature = "state", feature = "pov"))]
     pub(crate) selected_hotbar: AtomicUsize,
 }
@@ -88,6 +94,8 @@ impl Extras {
             sneaking: AtomicBool::new(false),
             #[cfg(feature = "state")]
             sprinting: AtomicBool::new(false),
+            #[cfg(feature = "state")]
+            use_sequence: AtomicU32::new(0),
             #[cfg(all(feature = "state", feature = "pov"))]
             selected_hotbar: AtomicUsize::new(0),
         }
@@ -110,7 +118,10 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     let Ok(registry) = r.string() else { return };
     let wants_items = cfg!(feature = "items") && registry == "minecraft:item";
     let wants_dimensions = cfg!(feature = "pov") && registry == "minecraft:dimension_type";
-    if !wants_items && !wants_dimensions {
+    // Aus den Biomen kommt die Einfärbung von Gras, Laub und Wasser. Ihre Reihenfolge hier ist
+    // genau die, die die Chunk-Paletten als Nummer nennen.
+    let wants_biomes = cfg!(feature = "pov") && registry == "minecraft:worldgen/biome";
+    if !wants_items && !wants_dimensions && !wants_biomes {
         return;
     }
 
@@ -129,6 +140,11 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     };
     #[cfg(feature = "pov")]
     let mut dimensions = match wants_dimensions {
+        true => Vec::with_capacity(count as usize),
+        false => Vec::new(),
+    };
+    #[cfg(feature = "pov")]
+    let mut biomes = match wants_biomes {
         true => Vec::with_capacity(count as usize),
         false => Vec::new(),
     };
@@ -156,6 +172,11 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
             continue;
         }
         #[cfg(feature = "pov")]
+        if wants_biomes {
+            biomes.push(crate::pov::BiomeParams::from_registry(data.as_ref()));
+            continue;
+        }
+        #[cfg(feature = "pov")]
         if wants_dimensions {
             dimensions.push(crate::pov::Dimension::from_registry(name, data.as_ref()));
         }
@@ -168,6 +189,10 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     #[cfg(feature = "pov")]
     if wants_dimensions {
         shared.extras.pov.set_dimensions(dimensions);
+    }
+    #[cfg(feature = "pov")]
+    if wants_biomes {
+        shared.extras.pov.set_biomes(biomes);
     }
 }
 
@@ -198,7 +223,6 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
         | In::ForgetChunk
         | In::BlockUpdate
         | In::SectionBlocks
-        | In::ChunkBatchFinished
         | In::AddEntity
         | In::RemoveEntities
         | In::MoveEntityPos
@@ -231,14 +255,23 @@ pub fn on_join(shared: &Arc<Shared>) {
     {
         shared.extras.sneaking.store(false, Ordering::Relaxed);
         shared.extras.sprinting.store(false, Ordering::Relaxed);
+        shared.extras.use_sequence.store(0, Ordering::Relaxed);
         #[cfg(feature = "pov")]
         shared.extras.selected_hotbar.store(0, Ordering::Relaxed);
-        if shared.extras.sneak_on_join {
-            set_sneak(shared, true);
-        }
     }
     #[cfg(feature = "antiafk")]
     crate::antiafk::on_join(shared);
+}
+
+/// Der Login allein reicht für Spieleraktionen noch nicht: Erst nach dem ersten Teleport kennt
+/// der Client seine autoritative Position. Genau danach wird ein gewünschtes `--sneak` gesendet.
+pub fn on_position(shared: &Arc<Shared>, initial: bool) {
+    #[cfg(not(feature = "state"))]
+    let _ = (shared, initial);
+    #[cfg(feature = "state")]
+    if initial && shared.extras.sneak_on_join {
+        set_sneak(shared, true);
+    }
 }
 
 pub fn on_disconnect(shared: &Shared) {
@@ -303,6 +336,36 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
 
     #[cfg(feature = "state")]
     {
+        let game_action = matches!(
+            verb,
+            "sneak"
+                | "schleich"
+                | "schleichen"
+                | "ducken"
+                | "sprint"
+                | "rennen"
+                | "sprinten"
+                | "swing"
+                | "schlag"
+                | "schlage"
+                | "arm"
+                | "use"
+                | "benutze"
+                | "rechtsklick"
+                | "hand"
+                | "slot-hotbar"
+                | "hotbar"
+        );
+        // Kurz abwarten statt sofort abzulehnen: Zwischen dem Absetzen durch den Server und der
+        // fertig geladenen Umgebung liegen Millisekunden, und eine in diesem Fenster getippte
+        // Aktion soll nicht verlorengehen. Wer noch gar nicht im Spiel ist, bekommt weiterhin
+        // sofort eine Absage – siehe [`Shared::await_gameplay`].
+        if game_action && !shared.await_gameplay(crate::client::GAMEPLAY_WAIT) {
+            shared
+                .console
+                .error("Diese Aktion ist erst nach dem Beitritt und der Startposition möglich.");
+            return true;
+        }
         if matches!(verb, "sneak" | "schleich" | "schleichen" | "ducken") {
             toggle(
                 shared,
@@ -455,7 +518,18 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
 fn use_item(shared: &Arc<Shared>) {
     let mut w = Writer::packet(shared.proto.extra.sb_use_item);
     w.var_int(0); // Haupthand
-    w.var_int(0); // Sequenznummer – der Server nutzt sie nur zum Zurückrollen von Blockänderungen
+    let sequence = shared
+        .extras
+        .use_sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(if value >= i32::MAX as u32 {
+                0
+            } else {
+                value + 1
+            })
+        })
+        .unwrap_or(0);
+    w.var_int(sequence as i32);
     if shared.proto.modern {
         let (yaw, pitch) = shared
             .position()
@@ -491,7 +565,7 @@ fn hotbar(shared: &Arc<Shared>, arg: &str) {
 
 #[cfg(all(feature = "state", feature = "pov"))]
 pub(crate) fn web_hotbar(shared: &Arc<Shared>, slot: usize) -> bool {
-    if slot >= 9 {
+    if slot >= 9 || !shared.ready_for_gameplay() {
         return false;
     }
     let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
@@ -536,8 +610,6 @@ mod tests {
                 ("cb_forget_level_chunk", e.cb_forget_level_chunk),
                 ("cb_block_update", e.cb_block_update),
                 ("cb_section_blocks_update", e.cb_section_blocks_update),
-                ("cb_chunk_batch_finished", e.cb_chunk_batch_finished),
-                ("sb_chunk_batch_received", e.sb_chunk_batch_received),
                 ("cb_add_entity", e.cb_add_entity),
                 ("cb_remove_entities", e.cb_remove_entities),
                 ("cb_move_entity_pos", e.cb_move_entity_pos),

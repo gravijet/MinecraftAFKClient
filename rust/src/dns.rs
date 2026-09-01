@@ -6,12 +6,33 @@
 //!
 //! Bewusst nur UDP, ein Versuch pro Resolver, kurze Timeouts: Schlägt alles fehl, wird schlicht
 //! `host:port` direkt verwendet (genau wie ein Vanilla-Client, dessen SRV-Abfrage ins Leere läuft).
+//!
+//! Gefragt wird **zuerst der Resolver des Rechners**, danach erst die drei öffentlichen als
+//! Ersatz. Das ist kein Detail: In vielen Netzen ist ausgehendes UDP/53 nach draußen gesperrt
+//! (Firmennetz, Schulnetz, mancher Hoster). Dort lief vorher jeder einzelne Verbindungsversuch
+//! erst in drei Zeitabläufe – viereinhalb Sekunden, bevor überhaupt ein TCP-SYN hinausging.
+//! Zudem findet nur der Systemresolver einen Server, dessen SRV-Eintrag in einer internen Zone
+//! steht.
 
+use std::collections::HashMap;
 use std::net::UdpSocket;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-const RESOLVERS: [&str; 3] = ["192.0.2.1:53", "192.0.2.1:53", "192.0.2.1:53"];
-const TIMEOUT: Duration = Duration::from_millis(1500);
+/// Ersatz, wenn der Rechner keinen brauchbaren Resolver nennt.
+const FALLBACK_RESOLVERS: [&str; 3] = ["192.0.2.1:53", "192.0.2.1:53", "192.0.2.1:53"];
+/// Zeitlimit einer einzelnen Abfrage.
+const TIMEOUT: Duration = Duration::from_millis(1200);
+/// Gesamtbudget der SRV-Auflösung. Sie sitzt vor dem Verbindungsaufbau und blockiert den
+/// Netz-Thread; ohne Budget summierten sich sechs erfolglose Abfragen auf über sieben Sekunden.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
+/// So lange gilt eine einmal geholte Auskunft (auch ein „gibt es nicht").
+///
+/// Der Client löst nur beim Verbindungsaufbau auf, und der kommt selten – außer bei einem Server,
+/// der uns im Kreis weiterreicht. Genau dort verhindert dieser kurze Speicher, dass jede Runde
+/// erneut das volle Zeitbudget kostet. Kurz genug, dass eine echte Umstellung im DNS binnen einer
+/// Minute ankommt.
+const CACHE_TTL: Duration = Duration::from_secs(60);
 const TYPE_SRV: u16 = 33;
 
 /// Was eine einzelne Resolver-Abfrage ergeben hat.
@@ -36,13 +57,27 @@ pub fn resolve_srv(host: &str) -> Option<(String, u16)> {
     if host.parse::<std::net::IpAddr>().is_ok() {
         return None; // IP-Adresse: nichts aufzulösen
     }
+    if let Some(cached) = cache_get(host) {
+        return cached;
+    }
+    let found = query_srv(host);
+    cache_put(host, found.clone());
+    found
+}
+
+fn query_srv(host: &str) -> Option<(String, u16)> {
     // Zufällige Transaktions-ID und Prüfung derselben in der Antwort: eine feste Kennung wäre
     // für jeden, der auf dem Weg mitliest, eine Einladung, eine eigene Antwort vorzulegen.
     let mut id = [0u8; 2];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
     let query = build_query(&format!("_minecraft._tcp.{}", host), id)?;
-    for resolver in RESOLVERS {
-        match ask(resolver, &query, id) {
+    let deadline = Instant::now() + TOTAL_TIMEOUT;
+    for resolver in resolvers() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match ask(&resolver, &query, id, TIMEOUT.min(left)) {
             Reply::Found(target, port) => return Some((target, port)),
             Reply::Empty => return None,
             Reply::Unusable => {}
@@ -51,12 +86,105 @@ pub fn resolve_srv(host: &str) -> Option<(String, u16)> {
     None
 }
 
-fn ask(resolver: &str, query: &[u8], id: [u8; 2]) -> Reply {
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+/// Zu fragende Resolver: erst die des Rechners, dahinter die öffentlichen als Ersatz.
+fn resolvers() -> Vec<String> {
+    let mut list = system_resolvers();
+    for fallback in FALLBACK_RESOLVERS {
+        if !list.iter().any(|known| known == fallback) {
+            list.push(fallback.to_string());
+        }
+    }
+    list
+}
+
+/// Die Resolver des Systems. Unter Unix stehen sie in `/etc/resolv.conf`; unter Windows gibt es
+/// dafür keinen Weg ohne Systembibliothek, dort bleiben die öffentlichen die erste Wahl.
+#[cfg(unix)]
+fn system_resolvers() -> Vec<String> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .map(|text| parse_resolv_conf(&text))
+        .unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn system_resolvers() -> Vec<String> {
+    Vec::new()
+}
+
+/// `nameserver`-Zeilen aus `resolv.conf` lesen.
+///
+/// Bewusst als reine Funktion über den Text: nur so lässt sich das Format prüfen, ohne dass der
+/// Test von der Datei des Rechners abhängt, auf dem er gerade läuft.
+fn parse_resolv_conf(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Kommentare beginnen mit '#' oder ';'.
+        let line = line.split(['#', ';']).next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("nameserver") else {
+            continue;
+        };
+        // Ohne Trennzeichen wäre „nameserverX" ein Treffer.
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let Ok(address) = rest.trim().parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        let formatted = match address {
+            std::net::IpAddr::V4(v4) => format!("{}:53", v4),
+            std::net::IpAddr::V6(v6) => format!("[{}]:53", v6),
+        };
+        if !out.contains(&formatted) {
+            out.push(formatted);
+        }
+        // `resolv.conf` erlaubt selbst höchstens drei Einträge (MAXNS).
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
+}
+
+/// Kurzzeitspeicher der Auskünfte, siehe [`CACHE_TTL`].
+#[allow(clippy::type_complexity)]
+fn cache() -> &'static Mutex<HashMap<String, (Instant, Option<(String, u16)>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<(String, u16)>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `None` = nichts (mehr) gespeichert; `Some(auskunft)` = gespeicherte Auskunft, auch ein „nein".
+fn cache_get(host: &str) -> Option<Option<(String, u16)>> {
+    let mut cache = cache().lock().ok()?;
+    let (at, value) = cache.get(host)?;
+    if at.elapsed() >= CACHE_TTL {
+        cache.remove(host);
+        return None;
+    }
+    Some(value.clone())
+}
+
+fn cache_put(host: &str, value: Option<(String, u16)>) {
+    let Ok(mut cache) = cache().lock() else {
+        return;
+    };
+    // Abgelaufene Einträge mitnehmen: Die Ablage wächst sonst mit jedem je gefragten Namen.
+    cache.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+    cache.insert(host.to_string(), (Instant::now(), value));
+}
+
+fn ask(resolver: &str, query: &[u8], id: [u8; 2], timeout: Duration) -> Reply {
+    // Zum Ziel passende Adressfamilie binden – an einen IPv6-Resolver kommt ein IPv4-Socket nicht.
+    let bind = if resolver.starts_with('[') {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let Ok(socket) = UdpSocket::bind(bind) else {
         return Reply::Unusable;
     };
-    if socket.set_read_timeout(Some(TIMEOUT)).is_err()
-        || socket.set_write_timeout(Some(TIMEOUT)).is_err()
+    if socket.set_read_timeout(Some(timeout)).is_err()
+        || socket.set_write_timeout(Some(timeout)).is_err()
         || socket.send_to(query, resolver).is_err()
     {
         return Reply::Unusable;
@@ -331,6 +459,69 @@ mod tests {
             Reply::Unusable
         ));
         assert!(matches!(parse_answer(&[], ID), Reply::Unusable));
+    }
+
+    /// Der Resolver des Rechners wird zuerst gefragt – in Netzen mit gesperrtem UDP/53 nach
+    /// draußen ist er der einzige, der überhaupt antwortet.
+    #[test]
+    fn resolv_conf_wird_gelesen() {
+        let text = "\
+# Kommentar
+domain example.net
+nameserver 192.0.2.1
+nameserver 192.0.2.1  ; noch ein Kommentar
+nameserver fd00::1
+options edns0
+";
+        assert_eq!(
+            parse_resolv_conf(text),
+            vec!["192.0.2.1:53", "192.0.2.1:53", "[fd00::1]:53"]
+        );
+
+        // Unsinn darf nicht als Resolver durchgehen.
+        assert!(parse_resolv_conf("nameserver\nnameserver keine-ip\n").is_empty());
+        assert!(parse_resolv_conf("nameserverX 192.0.2.1").is_empty());
+        assert!(parse_resolv_conf("# nameserver 192.0.2.1").is_empty());
+        // Doppelte Einträge nur einmal, und höchstens drei (MAXNS).
+        assert_eq!(parse_resolv_conf("nameserver 192.0.2.1\nnameserver 192.0.2.1").len(), 1);
+        assert_eq!(
+            parse_resolv_conf("nameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1").len(),
+            3
+        );
+    }
+
+    /// Die öffentlichen Resolver bleiben als Ersatz erhalten – aber hinter denen des Systems und
+    /// ohne Doppelung, falls der Rechner ohnehin einen davon benutzt.
+    #[test]
+    fn oeffentliche_resolver_bleiben_der_ersatz() {
+        let list = resolvers();
+        for fallback in FALLBACK_RESOLVERS {
+            assert_eq!(
+                list.iter().filter(|entry| *entry == fallback).count(),
+                1,
+                "{} fehlt oder steht doppelt in {:?}",
+                fallback,
+                list
+            );
+        }
+        let system = system_resolvers();
+        assert_eq!(&list[..system.len()], &system[..], "System zuerst");
+    }
+
+    /// Eine einmal geholte Auskunft gilt kurz – auch ein „gibt es nicht". Sonst kostet ein Server,
+    /// der uns im Kreis weiterreicht, in jeder Runde erneut das volle Zeitbudget.
+    #[test]
+    fn auskuenfte_werden_kurz_behalten() {
+        let host = "test.beispiel.invalid";
+        assert!(cache_get(host).is_none());
+        cache_put(host, Some(("mc.beispiel.invalid".to_string(), 25577)));
+        assert_eq!(
+            cache_get(host),
+            Some(Some(("mc.beispiel.invalid".to_string(), 25577)))
+        );
+        // Auch das „nein" wird behalten, nicht nur der Treffer.
+        cache_put(host, None);
+        assert_eq!(cache_get(host), Some(None));
     }
 
     /// Ein Ziel „." heißt im SRV-Standard ausdrücklich „Dienst nicht verfügbar".

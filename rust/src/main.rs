@@ -42,6 +42,8 @@ mod pov;
 #[cfg(feature = "pov")]
 mod pov_assets;
 #[cfg(feature = "pov")]
+mod pov_resources;
+#[cfg(feature = "pov")]
 mod pov_web;
 mod proto;
 mod proxy;
@@ -145,8 +147,7 @@ fn run(options: Options) {
 fn warn_about_unused_options(console: &Console, options: &Options) {
     if !options.ignored.is_empty() {
         console.warn(&format!(
-            "{} gibt es nur im Java-Client; wird ignoriert (dieser Client verbindet nie \
-             automatisch neu).",
+            "{} gibt es nur im Java-Client; wird ignoriert.",
             options.ignored.join(", ")
         ));
     }
@@ -178,7 +179,7 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
         }
     }
     #[cfg(feature = "pov")]
-    if options.pov_resources.is_some() && options.pov_web.is_none() {
+    if options.pov_resources != pov_resources::Source::Auto && options.pov_web.is_none() {
         console.warn("--pov-resources wird ohne --pov-web nicht geladen.");
     }
     #[cfg(all(feature = "state", feature = "pov"))]
@@ -295,6 +296,10 @@ fn print_usage() {
          \x20     --proxy <adresse>       socks5://[nutzer:pass@]host:port oder http://...\n\
          \x20     --fakehost <host[:port]> diese Adresse im Handshake statt der echten\n\
          \x20     --view-distance <2-32>  gemeldete Sichtweite in Chunks (Standard: {})\n\
+         \x20     --no-reconnect          nach einem Kick/Abbruch beenden statt neu verbinden\n\
+         \x20     --reconnect-delay <sek> Grundwartezeit davor (5), verdoppelt je Fehlversuch\n\
+         \x20     --max-backoff <sek>     Obergrenze dieser Wartezeit (60)\n\
+         \x20     --reconnect-tries <n>   Versuche in Folge, bevor aufgegeben wird (0 = endlos)\n\
          \n\
          Befehle und Makros:\n\
          \x20 -c, --cmd [sek:]<befehl>    Befehl nach dem Beitritt, mehrfach angebbar.\n\
@@ -350,7 +355,9 @@ fn print_usage() {
              \x20     --pov-size <b>x<h>      Bildgroesse in Pixeln, z. B. 160x80 (Standard 64x32)\n\
              \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n\
              \x20     --pov-web <port|ip:port> texturierten Browser-Viewer starten\n\
-             \x20     --pov-resources <jar>   passende Original-Minecraft-Client-JAR\n"
+             \x20     --pov-resources <jar|auto|aus>  Original-Client-JAR fuer echte Texturen.\n\
+             \x20                             Standard 'auto': vorhandene Minecraft-Installation\n\
+             \x20                             benutzen, sonst einmalig von Mojang laden.\n"
         } else {
             ""
         },

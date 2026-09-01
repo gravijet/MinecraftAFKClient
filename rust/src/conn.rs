@@ -6,11 +6,14 @@
 use crate::buf::{err, push_var_int, Reader, Writer};
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Block};
-use flate2::write::ZlibEncoder;
-use flate2::{Compression, Decompress, FlushDecompress};
+use flate2::{
+    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
+};
 use std::io::{self, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Antwortet der Server so lange nicht, gilt die Verbindung als tot (Server sendet KeepAlive
 /// im 15-Sekunden-Takt – 120 s Stille heißt: da kommt nichts mehr).
@@ -22,6 +25,26 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Zeitlimit: Ein Server, der das SYN verschluckt (Firewall, falscher Port), hing damit je nach
 /// Betriebssystem zwei Minuten am Netz-Thread, ohne dass der Client etwas gemeldet hätte.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Verzögerung bis zum parallelen Versuch der nächsten Adresse (Happy Eyeballs, RFC 8305).
+/// Ein sofortiges `connection refused` startet den nächsten Kandidaten ohne diese Wartezeit.
+const CONNECT_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+/// DNS kann für einen Namen sehr viele Adressen liefern. Mehr parallele SYNs verbessern den
+/// Aufbau nicht mehr, würden bei einer kaputten Antwort aber unnötig Ressourcen binden.
+const MAX_CONNECT_ADDRESSES: usize = 8;
+
+/// Kompressionsstufe für ausgehende Pakete – dieselbe, die auch der Vanilla-Client benutzt.
+///
+/// Sein `CompressionEncoder` legt einen `new Deflater()` an, und der läuft auf der zlib-Vorgabe
+/// (Stufe 6). Das ist keine Geschmacksfrage: Die Stufe steckt in den FLEVEL-Bits **jedes**
+/// zlib-Kopfes, den wir senden. Mit der vorher eingestellten schnellsten Stufe trug damit jedes
+/// komprimierte Paket sichtbar „von keinem Minecraft-Client" – und gespart hätte es ohnehin fast
+/// nichts: Ein AFK-Client sendet Chat und Positionen, beides weit unter der üblichen Schwelle von
+/// 256 Byte, also unkomprimiert.
+const OUTGOING_COMPRESSION: Compression = Compression::new(6);
+
+/// Harte Obergrenze für Rahmen und entpackte Pakete. Sie gilt vor jeder Reservierung, damit eine
+/// kaputte oder bösartige Gegenstelle nicht über ein Längenfeld beliebig viel Speicher anfordert.
+const MAX_PACKET_SIZE: usize = 32 * 1024 * 1024;
 
 /// Ab dieser Größe gilt ein Puffer als Ausreißer und wird nach dem Gebrauch wieder eingezogen.
 ///
@@ -180,7 +203,7 @@ impl PacketReader {
     /// Allokation, und der Reader bleibt danach frei ausleihbar.
     pub fn read_packet(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
         let len = self.read_frame_len()?;
-        if len == 0 || len > 32 * 1024 * 1024 {
+        if len == 0 || len > MAX_PACKET_SIZE {
             return Err(err("Unplausible Paketlaenge"));
         }
 
@@ -213,24 +236,38 @@ impl PacketReader {
         let uncompressed_len = r.var_int()?;
         let start = len - r.remaining();
         if uncompressed_len == 0 {
+            // Der Vanilla-Decoder akzeptiert die rohe Form nur *unterhalb* der ausgehandelten
+            // Schwelle. Ohne diese Prüfung würden wir Rahmen hinnehmen, die ein echter Client als
+            // fehlerhaft komprimiert trennt.
+            if len - start >= self.threshold as usize {
+                return Err(err("Unkomprimiertes Paket erreicht Kompressionsschwelle"));
+            }
             out.extend_from_slice(&self.frame[start..len]);
             trim_used(&mut self.frame, len);
             return Ok(());
         }
-        if !(0..=32 * 1024 * 1024).contains(&uncompressed_len) {
+        if !(0..=MAX_PACKET_SIZE as i32).contains(&uncompressed_len) {
             return Err(err("Unplausible entpackte Laenge"));
         }
         let expected = uncompressed_len as usize;
+        if expected < self.threshold as usize {
+            return Err(err("Komprimiertes Paket unterschreitet Kompressionsschwelle"));
+        }
         out.reserve(expected);
         self.inflate.reset(true);
-        let result = self
+        let compressed = &self.frame[start..len];
+        let compressed_len = compressed.len();
+        let status = self
             .inflate
-            .decompress_vec(&self.frame[start..len], out, FlushDecompress::Finish)
+            .decompress_vec(compressed, out, FlushDecompress::Finish)
             .map_err(|e| err(&format!("zlib: {}", e)));
         trim_used(&mut self.frame, len);
-        result?;
+        let status = status?;
         if out.len() != expected {
             return Err(err("Entpackte Laenge weicht ab"));
+        }
+        if status != Status::StreamEnd || self.inflate.total_in() != compressed_len as u64 {
+            return Err(err("zlib-Strom ist nicht vollstaendig begrenzt"));
         }
         Ok(())
     }
@@ -242,6 +279,9 @@ pub struct PacketWriter {
     stream: TcpStream,
     enc: Option<Cfb8>,
     threshold: i32,
+    /// Wiederverwendeter Deflate-Zustand. `reset()` behält Fenster und Tabellen; ein neuer
+    /// `ZlibEncoder` je Paket würde diese Arbeitsbereiche bei jedem großen Senden neu anlegen.
+    deflate: Compress,
     /// Wiederverwendete Puffer für den Paketrahmen. Ohne sie legt **jedes** gesendete Paket zwei
     /// bis drei kurzlebige Vektoren an; bei zwanzig Positionspaketen je Sekunde (Bewegung,
     /// Anti-AFK) ist das reine Verwaltungsarbeit. Der Zugriff ist unkritisch: `send` läuft nur
@@ -268,30 +308,50 @@ impl PacketWriter {
     }
 
     pub fn send(&mut self, packet: Writer) -> io::Result<()> {
-        let payload = &packet.data;
+        self.send_payload(&packet.data)
+    }
+
+    /// Ein Paket ohne Nutzdaten ohne kurzlebigen `Vec` senden. Moderne Clients schicken davon
+    /// zwanzig Tick-Enden pro Sekunde; eine Heap-Allokation je Tick wäre vermeidbare Dauerlast.
+    pub fn send_empty(&mut self, packet_id: i32) -> io::Result<()> {
+        let mut encoded = [0u8; 5];
+        let len = encode_var_int(&mut encoded, packet_id);
+        self.send_payload(&encoded[..len])
+    }
+
+    fn send_payload(&mut self, payload: &[u8]) -> io::Result<()> {
+        if payload.is_empty() || payload.len() > MAX_PACKET_SIZE {
+            return Err(err("Unplausible ausgehende Paketlaenge"));
+        }
 
         self.body.clear();
+        self.frame.clear();
         if self.threshold < 0 {
-            self.body.extend_from_slice(payload);
+            // Ohne Kompression direkt in den Rahmen schreiben: der alte Weg kopierte jedes Paket
+            // erst in `body` und unmittelbar danach ein zweites Mal in `frame`.
+            push_var_int(&mut self.frame, payload.len() as i32);
+            self.frame.extend_from_slice(payload);
         } else if payload.len() >= self.threshold as usize {
             // Mit Kompression: VarInt „Länge im entpackten Zustand", dahinter der zlib-Strom.
             push_var_int(&mut self.body, payload.len() as i32);
-            let mut z = ZlibEncoder::new(std::mem::take(&mut self.body), Compression::fast());
-            // Auch im Fehlerfall den Puffer zurückholen: sonst stünde `body` danach ohne
-            // reservierten Platz da und jedes weitere Paket müsste ihn neu aufbauen.
-            if let Err(e) = z.write_all(payload) {
-                self.body = z.finish().unwrap_or_default();
-                return Err(e);
+            self.body.reserve(zlib_bound(payload.len()));
+            self.deflate.reset();
+            let status = self
+                .deflate
+                .compress_vec(payload, &mut self.body, FlushCompress::Finish)
+                .map_err(|e| err(&format!("zlib: {}", e)))?;
+            if status != Status::StreamEnd || self.deflate.total_in() != payload.len() as u64 {
+                return Err(err("Ausgehender zlib-Strom blieb unvollstaendig"));
             }
-            self.body = z.finish()?;
+            push_var_int(&mut self.frame, self.body.len() as i32);
+            self.frame.extend_from_slice(&self.body);
         } else {
-            push_var_int(&mut self.body, 0); // 0 = unkomprimiert übertragen
-            self.body.extend_from_slice(payload);
+            // Kompression ist aktiv, dieses Paket bleibt aber roh. Auch hier direkt in `frame`,
+            // statt den Inhalt über den zweiten Puffer zu kopieren.
+            push_var_int(&mut self.frame, (payload.len() + 1) as i32);
+            self.frame.push(0); // Data Length = 0: unkomprimiert übertragen
+            self.frame.extend_from_slice(payload);
         }
-
-        self.frame.clear();
-        push_var_int(&mut self.frame, self.body.len() as i32);
-        self.frame.extend_from_slice(&self.body);
 
         if let Some(enc) = &mut self.enc {
             enc.encrypt(&mut self.frame);
@@ -301,6 +361,29 @@ impl PacketWriter {
         trim(&mut self.frame);
         result
     }
+}
+
+/// VarInt in einen festen Fünf-Byte-Puffer schreiben; Rückgabe ist die tatsächlich belegte Länge.
+fn encode_var_int(out: &mut [u8; 5], value: i32) -> usize {
+    let mut value = value as u32;
+    let mut at = 0;
+    loop {
+        if value & !0x7F == 0 {
+            out[at] = value as u8;
+            return at + 1;
+        }
+        out[at] = (value as u8 & 0x7F) | 0x80;
+        value >>= 7;
+        at += 1;
+    }
+}
+
+/// Sichere Obergrenze von zlib/deflate (`deflateBound`-Formel plus kleiner Spielraum).
+fn zlib_bound(len: usize) -> usize {
+    len.saturating_add(len >> 12)
+        .saturating_add(len >> 14)
+        .saturating_add(len >> 25)
+        .saturating_add(16)
 }
 
 // ===================== Aufbau =====================
@@ -329,6 +412,7 @@ pub fn connect(
             stream: write_half,
             enc: None,
             threshold: -1,
+            deflate: Compress::new(OUTGOING_COMPRESSION, true),
             body: Vec::with_capacity(256),
             frame: Vec::with_capacity(256),
         },
@@ -339,20 +423,166 @@ pub fn connect(
 /// deshalb wird der Name hier selbst aufgelöst; scheitert jeder Kandidat, kommt der letzte
 /// Fehler heraus (das ist der aussagekräftige – „connection refused" statt „unbekannter Name").
 fn dial(host: &str, port: u16) -> io::Result<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let mut last = None;
-    for address in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last = Some(e),
+    dial_timeout(host, port, CONNECT_TIMEOUT)
+}
+
+/// Zu allen aufgelösten Adressen mit einem gemeinsamen Zeitbudget verbinden.
+///
+/// IPv6 und IPv4 werden versetzt versucht. Damit kostet ein schwarzes IPv6-Ziel nicht erst den
+/// vollen Verbindungs-Timeout, bevor die funktionierende IPv4-Adresse drankommt. Antwortet ein
+/// Kandidat sofort mit einem Fehler, startet der nächste sofort; nur bei Schweigen greift die
+/// kleine Staffelung.
+pub(crate) fn dial_timeout(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    let mut addresses: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    // `dedup` allein hätte nur **unmittelbar** benachbarte Wiederholungen entfernt. Resolver
+    // liefern dieselbe Adresse aber gern verstreut (Round-Robin über mehrere Einträge), und jede
+    // Wiederholung kostete einen der wenigen parallelen Versuche und dazu ein SYN an ein Ziel,
+    // das ohnehin schon läuft. Die Reihenfolge des Resolvers bleibt dabei erhalten.
+    let mut seen = std::collections::HashSet::with_capacity(addresses.len());
+    addresses.retain(|address| seen.insert(*address));
+    addresses.truncate(MAX_CONNECT_ADDRESSES);
+    let addresses = alternate_families(addresses);
+    if addresses.is_empty() {
+        return Err(err("Adresse liess sich nicht aufloesen"));
+    }
+    if addresses.len() == 1 {
+        return TcpStream::connect_timeout(&addresses[0], timeout);
+    }
+
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = mpsc::channel();
+    let mut next = 0usize;
+    let mut active = 0usize;
+    let mut last_launch = Instant::now();
+    let mut last_error = None;
+
+    let launch = |address: SocketAddr, tx: mpsc::Sender<io::Result<TcpStream>>| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        thread::Builder::new()
+            .name("afk-connect".into())
+            .spawn(move || {
+                let _ = tx.send(TcpStream::connect_timeout(&address, left));
+            })
+            .map(drop)
+    };
+
+    loop {
+        // Der erste Versuch sowie ein Ersatz nach einem sofortigen Fehler starten ohne Pause.
+        while active == 0 && next < addresses.len() {
+            match launch(addresses[next], tx.clone()) {
+                Ok(()) => active += 1,
+                Err(e) => last_error = Some(e),
+            }
+            next += 1;
+            last_launch = Instant::now();
+        }
+        if active == 0 || Instant::now() >= deadline {
+            break;
+        }
+
+        let until_fallback = if next < addresses.len() {
+            CONNECT_FALLBACK_DELAY.saturating_sub(last_launch.elapsed())
+        } else {
+            deadline.saturating_duration_since(Instant::now())
+        };
+        let wait = until_fallback.min(deadline.saturating_duration_since(Instant::now()));
+        match rx.recv_timeout(wait) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                active -= 1;
+                last_error = Some(e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if next < addresses.len() => {
+                match launch(addresses[next], tx.clone()) {
+                    Ok(()) => active += 1,
+                    Err(e) => last_error = Some(e),
+                }
+                next += 1;
+                last_launch = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Err(last.unwrap_or_else(|| err("Serveradresse liess sich nicht aufloesen")))
+
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Verbindungsaufbau dauerte zu lange")))
+}
+
+/// Resolver-Reihenfolge innerhalb jeder Adressfamilie erhalten, die Familien aber abwechseln.
+fn alternate_families(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addresses.first() else {
+        return addresses;
+    };
+    let starts_v6 = first.is_ipv6();
+    let mut v4 = addresses.iter().copied().filter(SocketAddr::is_ipv4);
+    let mut v6 = addresses.iter().copied().filter(SocketAddr::is_ipv6);
+    let mut out = Vec::with_capacity(addresses.len());
+    for index in 0..addresses.len() {
+        let wants_v6 = (index % 2 == 0) == starts_v6;
+        let address = if wants_v6 {
+            v6.next().or_else(|| v4.next())
+        } else {
+            v4.next().or_else(|| v6.next())
+        };
+        if let Some(address) = address {
+            out.push(address);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbindungsadressen_wechseln_ipv6_und_ipv4_ab() {
+        let addresses = vec![
+            "[2001:db8::1]:25565".parse().unwrap(),
+            "[2001:db8::2]:25565".parse().unwrap(),
+            "192.0.2.1:25565".parse().unwrap(),
+            "192.0.2.2:25565".parse().unwrap(),
+        ];
+        let ordered = alternate_families(addresses);
+        assert!(ordered[0].is_ipv6());
+        assert!(ordered[1].is_ipv4());
+        assert!(ordered[2].is_ipv6());
+        assert!(ordered[3].is_ipv4());
+    }
+
+    #[test]
+    fn fester_varint_puffer_deckt_alle_ids_ab() {
+        for value in [0, 127, 128, 16_384, i32::MAX, -1] {
+            let mut fixed = [0u8; 5];
+            let len = encode_var_int(&mut fixed, value);
+            let mut vec = Vec::new();
+            push_var_int(&mut vec, value);
+            assert_eq!(&fixed[..len], vec);
+        }
+    }
+
+    /// Die Kompressionsstufe steht in den obersten zwei Bits des zweiten zlib-Kopfbytes
+    /// (FLEVEL). Vanilla komprimiert mit der zlib-Vorgabe, und die trägt dort die 2; die
+    /// schnellste Stufe trüge eine 0 und wäre in jedem gesendeten Paket zu sehen.
+    #[test]
+    fn ausgehende_kompression_traegt_die_vanilla_stufe() {
+        let payload = [7u8; 4096];
+        // `compress_vec` schreibt in den freien Platz des Vektors – ohne Reservierung käme
+        // nichts heraus. Genau so macht es auch [`PacketWriter::send_payload`].
+        let mut out = Vec::with_capacity(zlib_bound(payload.len()));
+        let mut deflate = Compress::new(OUTGOING_COMPRESSION, true);
+        deflate
+            .compress_vec(&payload, &mut out, FlushCompress::Finish)
+            .unwrap();
+        assert_eq!(out[0], 0x78, "zlib-Kopf fehlt");
+        assert_eq!(out[1] >> 6, 2, "FLEVEL passt nicht zur Vanilla-Stufe");
+    }
+
+    #[test]
+    fn zlib_obergrenze_liegt_ueber_dem_schlimmsten_fall() {
+        for len in [0, 1, 255, 65_536, MAX_PACKET_SIZE] {
+            assert!(zlib_bound(len) >= len + 6);
+        }
+    }
 
     /// Ein einzelnes großes Paket beim Beitritt hielt seinen Puffer für die ganze Laufzeit belegt.
     #[test]

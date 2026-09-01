@@ -22,6 +22,8 @@ fn plan_with_ground() -> Plan {
         }
     }
     Plan {
+        before_login_ms: 0,
+        before_position_ms: 0,
         chunks,
         // Abschnitt 4 deckt bei min_y = -64 die Höhen y = 0..15 ab; der Spieler steht darauf.
         solid_section: 4,
@@ -43,6 +45,10 @@ fn plan_with_ground() -> Plan {
         hold_secs: 20,
         compression: None,
         encrypt: false,
+        respawn_after_death: false,
+        connections: 1,
+        // Wie ein echter Server: voller Himmel über dem Boden.
+        sky_light: Some(15),
     }
 }
 
@@ -72,6 +78,279 @@ fn beitritt_chat_und_befehl() {
     assert!(got_command, "--cmd hat den Befehl nicht geschickt");
 
     let _ = child.kill();
+}
+
+/// Die Client-Brand wird über Vanillas `minecraft:brand`-Payload unmittelbar beim
+/// Spielbeitritt gesendet und enthält immer die tatsächlich gewählte Minecraft-Version.
+#[test]
+fn client_brand_ist_versionsgenau_und_vollstaendig() {
+    for ids in [&common::MC_1_21_1, &common::MC_26_1, &common::MC_26_2] {
+        let server = common::start(ids, plan_with_ground());
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+        let expected = format!("example.invalid {}", ids.name);
+        let branded = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Brand(brand) if brand == &expected),
+        );
+        assert!(branded, "{}: Client-Brand fehlte oder war falsch", ids.name);
+        let _ = child.kill();
+    }
+}
+
+/// Ein sofort fälliger `--cmd`-Eintrag wartet auf den ersten autoritativen Teleport. Dadurch
+/// landet kein Spielerkommando zwischen Spiel-Login und dem vollständigen Weltzustand.
+#[test]
+fn serverbefehl_wartet_auf_startposition() {
+    let mut plan = plan_with_ground();
+    plan.before_position_ms = 400;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &["--no-color", "-c", "/erst-nach-position"],
+    );
+
+    let joined = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Joined),
+    );
+    assert!(joined, "Spiel-Login kam nicht an");
+
+    let premature = common::wait_note(
+        &server.notes,
+        Duration::from_millis(200),
+        |note| matches!(note, Note::Command(command) if command == "erst-nach-position"),
+    );
+    assert!(!premature, "Befehl wurde vor der Startposition gesendet");
+
+    let sent = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Command(command) if command == "erst-nach-position"),
+    );
+    assert!(sent, "Befehl wurde nach der Startposition nicht gesendet");
+    let _ = child.kill();
+}
+
+/// Moderne Vanilla-Clients markieren das Ende jedes 50-ms-Ticks mit einem leeren Paket. Ohne
+/// diese Grenze verarbeitet der Server Eingabeereignisse anders als bei einem normalen Client.
+#[test]
+fn moderne_client_ticks_werden_abgeschlossen() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+
+    let tick = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, 0) if *id == common::MC_26_1.sb_client_tick_end),
+    );
+    assert!(tick, "kein ClientTickEnd-Paket empfangen");
+    let _ = child.kill();
+}
+
+/// Lokale Aktionen dürfen während Login/Konfiguration keine Spielpakete senden. Die künstliche
+/// Pause hält den Server sicher vor der Spielphase, während die Eingabe bereits verarbeitet wird.
+#[test]
+#[cfg(feature = "state")]
+fn spielaktion_vor_dem_join_wird_nicht_gesendet() {
+    let mut plan = plan_with_ground();
+    plan.before_login_ms = 500;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    writeln!(child.stdin.as_mut().unwrap(), ":use").unwrap();
+
+    let err = common::collect(child.stderr.take().unwrap());
+    let (rejected, output) = common::wait_for(
+        &err,
+        TIMEOUT,
+        "Diese Aktion ist erst nach dem Beitritt und der Startposition möglich",
+    );
+    assert!(rejected, "Aktion wurde nicht lokal abgelehnt:\n{}", output);
+
+    let sent = common::wait_note(
+        &server.notes,
+        Duration::from_secs(1),
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_use_item),
+    );
+    assert!(!sent, "UseItem wurde trotz fehlender Spielphase gesendet");
+    let _ = child.kill();
+}
+
+/// `--sneak` wird erst nach Bestätigung der autoritativen Startposition gesendet. Damit steht
+/// kein Spieler-Eingabepaket zwischen Teleport und dessen verpflichtender Antwort.
+#[test]
+#[cfg(feature = "state")]
+fn schleichen_startet_erst_nach_der_position() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--sneak"]);
+
+    let positioned = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_move),
+    );
+    assert!(positioned, "Startposition wurde nicht zurückgespiegelt");
+    let sneaking = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::PlayerInput(bits) if *bits == 0x20),
+    );
+    assert!(
+        sneaking,
+        "Schleichzustand kam nicht nach der Startposition an"
+    );
+    let _ = child.kill();
+}
+
+/// Reines Drehen verwendet Vanillas kurzes Rotationspaket. Ein PosRot-Paket würde unnötig alte
+/// Koordinaten wiederholen und könnte mit einer gleichzeitig laufenden Bewegung kollidieren.
+#[test]
+#[cfg(feature = "movement")]
+fn blickbewegung_sendet_keine_position() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+
+    let positioned = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation),
+    );
+    assert!(positioned, "Startposition wurde nicht bestätigt");
+    writeln!(child.stdin.as_mut().unwrap(), ":look rechts 7").unwrap();
+
+    let rotated = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, 9) if *id == common::MC_26_1.sb_move_rot),
+    );
+    assert!(rotated, "kein korrektes Rotationspaket empfangen");
+    let _ = child.kill();
+}
+
+/// Ändert sich nur die Position, verwendet Vanilla `MovePlayerPos` (3 Double + Flag) und nicht
+/// in jedem Tick das längere Paket mit unveränderten Blickwinkeln.
+#[test]
+#[cfg(feature = "movement")]
+fn laufbewegung_sendet_nur_die_position() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+
+    let positioned = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation),
+    );
+    assert!(positioned, "Startposition wurde nicht bestätigt");
+    writeln!(child.stdin.as_mut().unwrap(), ":go vor 0.1").unwrap();
+
+    // Auf die Koordinaten prüfen, nicht nur auf die Paketlänge: Der Erinnerungstakt eines
+    // stillstehenden Clients schickt dasselbe Paket, nur mit unveränderter Position. Der Start
+    // liegt bei z = 8.0, gelaufen wird nach vorn (Blick nach Süden, also +z).
+    let moved = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::MovePos(_, _, z) if *z > 8.0),
+    );
+    assert!(moved, "kein korrektes Positionspaket empfangen");
+    let _ = child.kill();
+}
+
+/// Auch wer stillsteht, meldet dem Server alle 20 Ticks erneut seine Position.
+///
+/// `LocalPlayer.sendPosition()` sendet spätestens jeden 20. Tick, selbst wenn sich nichts geändert
+/// hat. Ein Client, der nach dem Beitritt überhaupt kein Positionspaket mehr schickt, sieht auf
+/// dem Server anders aus als jeder echte Spieler.
+#[test]
+fn stillstehender_client_meldet_seine_position_weiter() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
+
+    // Der erste Teleport wird mit einem PosRot beantwortet; erst danach greift der Takt. Deshalb
+    // zweimal warten: das erste Pos-Paket kann noch nichts beweisen, das zweite schon.
+    let (x, z) = (8.0, 8.0);
+    for round in 1..=2 {
+        let ticked = common::wait_note(&server.notes, TIMEOUT, |note| {
+            matches!(note, Note::MovePos(px, _, pz)
+                if (*px - x).abs() < 1e-9 && (*pz - z).abs() < 1e-9)
+        });
+        assert!(
+            ticked,
+            "Positionserinnerung {} kam nicht (Takt steht still)",
+            round
+        );
+    }
+    let _ = child.kill();
+}
+
+/// Ein Respawn setzt die Ladephase zurück – aber der Client darf daran nicht hängenbleiben.
+///
+/// Ein Vanilla-Server schickt nach dem Respawn Position und Chunks hinterher; ein Plugin muss das
+/// nicht. Käme der Client nur mit dem Vanilla-Ablauf zurecht, wäre er nach dem ersten Tod
+/// dauerhaft stumm: kein Chat, kein `--cmd`, keine Regel. Geprüft wird deshalb der karge Fall –
+/// nacktes Respawn-Paket, sonst nichts – und dass danach trotzdem alles weiterläuft.
+#[test]
+fn nackter_respawn_laesst_den_client_nicht_haengen() {
+    let mut plan = plan_with_ground();
+    plan.kill = true;
+    plan.respawn_after_death = true;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--events"]);
+    let mut stdin = child.stdin.take().unwrap();
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let (died, log) = common::wait_for(&err, TIMEOUT, "@event death");
+    assert!(died, "kein Tod gemeldet. Ausgabe:\n{}", log);
+
+    // Nach dem Respawn muss die Ladephase erneut abgeschlossen werden – notfalls über die
+    // Notbremse, denn Chunks kommen hier keine mehr.
+    let loaded = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, 0) if *id == common::MC_26_1.sb_player_loaded),
+    );
+    assert!(loaded, "nach dem Respawn kam kein zweites PlayerLoaded");
+
+    // Und der Client ist wieder ansprechbar.
+    let _ = writeln!(stdin, "wieder da");
+    let back = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Chat(text) if text == "wieder da"),
+    );
+    assert!(back, "der Client blieb nach dem Respawn stumm");
+    let _ = child.kill();
+}
+
+/// Ab 1.21.4 meldet der Client das Ende seiner Ladephase; vorher gibt es das Paket nicht.
+///
+/// Ohne diese Meldung hält der Server den Spieler bis zu 30 Sekunden in einem Schwebezustand –
+/// und der Client selbst käme nie in die Spielphase.
+#[test]
+fn welt_geladen_wird_gemeldet_sobald_es_das_paket_gibt() {
+    for ids in [&common::MC_26_1, &common::MC_1_21_1] {
+        let server = common::start(ids, plan_with_ground());
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color", "-q"]);
+        let wanted = ids.sb_player_loaded;
+        let seen = common::wait_note(
+            &server.notes,
+            Duration::from_secs(10),
+            |note| matches!(note, Note::Packet(id, 0) if wanted >= 0 && *id == wanted),
+        );
+        assert_eq!(
+            seen,
+            ids.modern,
+            "{}: PlayerLoaded {}",
+            ids.name,
+            if ids.modern {
+                "kam nicht an"
+            } else {
+                "gibt es hier noch gar nicht"
+            }
+        );
+        let _ = child.kill();
+    }
 }
 
 /// Derselbe Ablauf mit dem Verschlüsselungs-Handshake eines Online-Mode-Servers.
@@ -294,6 +573,179 @@ fn letzte_chatzeilen_gehen_vor_dem_beenden_noch_raus() {
     let (found, log) = common::wait_for(&out, TIMEOUT, "Zeile 40");
     assert!(found, "die letzte Chatzeile fehlt. Ausgabe:\n{}", log);
     let _ = child.kill();
+}
+
+/// Das Licht steht am Ende jedes Chunk-Pakets, hinter den Blockentitäten. Es zu lesen heißt
+/// also, den Rest des Pakets **exakt** zu überspringen – ein Byte daneben, und es kommt Unsinn
+/// heraus statt gar nichts.
+///
+/// Geprüft wird auf allen vier Protokollen, weil Höhenkarten und Palettenformat davor
+/// unterschiedlich lang sind: Genau daran fällt ein falscher Lesezeiger auf.
+#[cfg(feature = "pov")]
+#[test]
+fn licht_wird_aus_dem_chunk_paket_gelesen() {
+    for ids in [&common::MC_26_1, &common::MC_1_21_1, &common::MC_26_2] {
+        let server = common::start(ids, plan_with_ground());
+        let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
+        let mut stdin = child.stdin.take().unwrap();
+        let err = common::collect(child.stderr.take().unwrap());
+
+        let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
+        assert!(joined, "{}: kein Beitritt. Ausgabe:\n{}", ids.name, log);
+
+        let (found, log) =
+            common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 mit Licht");
+        assert!(
+            found,
+            "{}: nicht alle 25 Chunks brachten Licht mit. Ausgabe:\n{}",
+            ids.name, log
+        );
+    }
+}
+
+/// Schickt ein Server kein Licht, darf die Ansicht daran nicht zerbrechen: Sie rechnet dann wie
+/// früher mit geschätzter Flächenhelligkeit weiter. Erfunden wird kein Licht.
+#[cfg(feature = "pov")]
+#[test]
+fn ohne_licht_bleibt_die_ansicht_benutzbar() {
+    let mut plan = plan_with_ground();
+    plan.sky_light = None;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let mut stdin = child.stdin.take().unwrap();
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
+    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
+    let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "25 Chunks");
+    assert!(found, "die Chunks fehlen. Ausgabe:\n{}", log);
+    assert!(
+        log.contains("0 mit Licht"),
+        "ohne Lichtdaten darf keins gemeldet werden. Ausgabe:\n{}",
+        log
+    );
+}
+
+/// Mit `--reconnect` muss ein Verbindungsabbruch ein zweiter **vollständiger** Beitritt werden –
+/// nicht nur ein neuer Socket.
+///
+/// Geprüft wird deshalb am Server (`Note::Joined` zweimal auf demselben Port) und nicht an einer
+/// Meldung des Clients: Dass er es *vorhat*, sagt die Meldung; dass er wirklich wieder im Spiel
+/// ankommt, sagt nur der Server. Zusätzlich muss `--cmd` in der zweiten Sitzung erneut laufen –
+/// genau dafür ist der Reconnect da, und die Befehlsplanung hängt an der Verbindungsgeneration.
+#[test]
+fn nach_einem_abbruch_wird_neu_verbunden() {
+    let mut plan = plan_with_ground();
+    // Zwei Sekunden bedienen, dann von Serverseite auflegen – der Client muss von selbst
+    // wiederkommen. So lange, dass der `--cmd`-Befehl der ersten Sitzung noch ankommt.
+    plan.hold_secs = 2;
+    plan.connections = 2;
+
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &[
+            "--no-color",
+            "--events",
+            "--reconnect",
+            // Ohne die kurze Grundzeit wartete der Test fünf Sekunden.
+            "--reconnect-delay",
+            "1",
+            "-c",
+            "/afk",
+            "--join-delay",
+            "0",
+        ],
+    );
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let mut joins = 0;
+    let mut commands = 0;
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while std::time::Instant::now() < deadline && (joins < 2 || commands < 2) {
+        match server.notes.recv_timeout(Duration::from_millis(250)) {
+            Ok(Note::Joined) => joins += 1,
+            Ok(Note::Command(command)) if command == "afk" => commands += 1,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let (_, log) = common::wait_for(&err, Duration::from_millis(200), "@event reconnect");
+    assert_eq!(
+        joins, 2,
+        "der Client ist nach dem Abbruch nicht wieder beigetreten. Ausgabe:\n{}",
+        log
+    );
+    assert_eq!(
+        commands, 2,
+        "die --cmd-Befehle liefen in der zweiten Sitzung nicht erneut. Ausgabe:\n{}",
+        log
+    );
+    assert!(
+        log.contains("@event reconnect"),
+        "ein Panel bekommt den Reconnect nicht zu sehen. Ausgabe:\n{}",
+        log
+    );
+    let _ = child.kill();
+}
+
+/// `--reconnect-tries` muss wirklich aufgeben – sonst wäre es ein Schalter, der nur so aussieht.
+///
+/// Der Ablauf: Der Server bedient genau eine Verbindung und legt dann auf. Der erste Fehlversuch
+/// zählt als Versuch 1 und ist damit noch erlaubt; er trifft auf einen Port, an dem niemand mehr
+/// horcht, und scheitert sofort. Versuch 2 überschreitet die Grenze, und der Prozess endet mit
+/// Status 1 – genau wie ohne Reconnect. Ein endloser Client bliebe hier bis zum Zeitlimit hängen.
+#[test]
+fn nach_der_versuchsgrenze_gibt_der_client_auf() {
+    let mut plan = plan_with_ground();
+    plan.close_after_chat = true;
+
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &[
+            "--no-color",
+            "--events",
+            "--reconnect-tries",
+            "1",
+            "--reconnect-delay",
+            "1",
+        ],
+    );
+    let status = child
+        .wait_within(TIMEOUT)
+        .expect("nach der Versuchsgrenze muss der Client sich beenden");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "das Aufgeben muss denselben Status ergeben wie --no-reconnect"
+    );
+}
+
+/// Mit `--no-reconnect` bleibt es beim bisherigen, zugesagten Verhalten: Der Prozess endet nach
+/// einem Abbruch mit Status 1, damit ein Panel das überhaupt bemerkt. Wer eine Aufsicht davor
+/// gesetzt hat, die den Client neu startet, verlässt sich genau darauf.
+#[test]
+fn mit_no_reconnect_endet_der_prozess_nach_einem_abbruch() {
+    let mut plan = plan_with_ground();
+    plan.close_after_chat = true;
+
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child = common::spawn_client(
+        server.port,
+        "26.1",
+        &["--no-color", "--events", "--no-reconnect"],
+    );
+    let status = child
+        .wait_within(TIMEOUT)
+        .expect("der Client muss sich nach einem Abbruch beenden");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "ein Abbruch mit --no-reconnect muss Status 1 ergeben"
+    );
 }
 
 /// Stirbt der Spieler, muss der Client von selbst wieder einsteigen – sonst steht er bis in alle
@@ -657,6 +1109,12 @@ fn use_item_paket_passt_zur_version() {
 
         let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
         assert!(joined, "{}: kein Beitritt. Ausgabe:\n{}", ids.name, log);
+        let positioned = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Packet(id, _) if *id == ids.sb_accept_teleportation),
+        );
+        assert!(positioned, "{}: Startposition nicht bestätigt", ids.name);
         let _ = writeln!(stdin, ":use");
 
         let id = ids.sb_use_item;
@@ -672,6 +1130,34 @@ fn use_item_paket_passt_zur_version() {
         );
         let _ = child.kill();
     }
+}
+
+/// Mehrere Weltinteraktionen brauchen aufsteigende Sequenznummern. Mit dauerhaft `0` könnten
+/// Server-Acknowledgements nicht mehr eindeutig der auslösenden Aktion zugeordnet werden.
+#[cfg(feature = "state")]
+#[test]
+fn use_item_sequenz_steigt() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
+    let mut stdin = child.stdin.take().unwrap();
+
+    let positioned = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_accept_teleportation),
+    );
+    assert!(positioned, "Startposition wurde nicht bestätigt");
+    writeln!(stdin, ":use\n:use").unwrap();
+
+    for expected in [0, 1] {
+        let received = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::UseSequence(sequence) if *sequence == expected),
+        );
+        assert!(received, "UseItem-Sequenz {} kam nicht an", expected);
+    }
+    let _ = child.kill();
 }
 
 // ===================== Live-POV =====================
@@ -807,17 +1293,175 @@ fn pov_zeigt_den_boden() {
 }
 
 /// Der Chunk-Stapel muss bestätigt werden, sonst hört der Server nach dem ersten Stapel auf.
-#[cfg(feature = "pov")]
+///
+/// Das ist Flusskontrolle des Servers und keine POV-Funktion: Der `PlayerChunkSender` zählt die
+/// unbeantworteten Stapel und stellt bei zehn offenen die Auslieferung ein. Deshalb gilt der Test
+/// für **jede** Bauform, auch für die schlanke, die keinen einzigen Chunk liest.
 #[test]
 fn chunk_stapel_wird_bestaetigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
+    // Der gemeldete Wert muss in den Grenzen liegen, die der Server ohnehin anlegt – ein `inf`
+    // oder eine Null hieße, dass der Server gar keine Chunks mehr schickt.
     let ok = common::wait_note(
         &server.notes,
         TIMEOUT,
-        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_chunk_batch_received),
+        |note| matches!(note, Note::ChunkBatchReceived(rate) if (0.01..=64.0).contains(rate)),
     );
     assert!(ok, "ServerboundChunkBatchReceived kam nie an");
+    let _ = child.kill();
+}
+
+/// Der Browser-Viewer: erreichbar, aber nur mit dem Zugriffstoken aus dem Terminal.
+///
+/// Er lief bisher ganz ohne Ablauftest. Geprüft wird deshalb genau das, was ein Browser sieht:
+/// die Seite selbst, der Zustand als JSON – und dass ohne Token nichts davon herausgeht.
+/// Ausdrücklich ohne Ressourcen (`--pov-resources aus`), damit der Test weder Netz braucht noch
+/// 30 MB lädt.
+#[cfg(feature = "pov")]
+#[test]
+fn browser_viewer_antwortet_nur_mit_token() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+
+    // Der freie Port wird ermittelt, indem er kurz belegt und sofort wieder freigegeben wird –
+    // und genau in dieser Lücke kann ihn ein anderer, gleichzeitig laufender Test erwischen.
+    // Dann startet der Viewer nicht. Statt daran hin und wieder zu scheitern, wird es einfach
+    // noch einmal versucht.
+    let mut attempt = 0;
+    let (port, mut child, token) = loop {
+        attempt += 1;
+        let port = common::free_port();
+        let mut child = common::spawn_client(
+            server.port,
+            "26.1",
+            &[
+                "--no-color",
+                "--pov-web",
+                &port.to_string(),
+                "--pov-resources",
+                "aus",
+            ],
+        );
+        let err = common::collect(child.stderr.take().unwrap());
+        // Der Client nennt die vollständige Adresse samt Token auf der Fehlerausgabe.
+        let (found, log) = common::wait_for(&err, Duration::from_secs(10), "Browser-POV: http://");
+        if found {
+            let token = log
+                .split("?token=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .expect("Token in der Adresse")
+                .to_string();
+            break (port, child, token);
+        }
+        let _ = child.kill();
+        assert!(
+            attempt < 4,
+            "Viewer kam auch nach {} Versuchen nicht hoch. Letzte Ausgabe:\n{}",
+            attempt,
+            log
+        );
+    };
+    assert_eq!(token.len(), 32, "Token hat nicht 128 Bit: {}", token);
+
+    // Ohne Token: nichts.
+    let (status, _, _) = common::http_get(port, "/");
+    assert_eq!(status, 403, "die Seite ging ohne Token heraus");
+    let (status, _, _) = common::http_get(port, "/api/state.json");
+    assert_eq!(status, 403, "der Zustand ging ohne Token heraus");
+    let (status, _, _) = common::http_get(port, &format!("/?token={}x", token));
+    assert_eq!(status, 403, "ein falscher Token wurde angenommen");
+
+    // Mit Token: die Seite, und sie bringt alles selbst mit (kein CDN, kein fremder Server).
+    let (status, head, body) = common::http_get(port, &format!("/?token={}", token));
+    assert_eq!(status, 200);
+    assert!(head.contains("text/html"), "{}", head);
+    let page = String::from_utf8_lossy(&body);
+    assert!(page.contains("Live-POV"), "unerwartete Seite");
+    assert!(!page.contains("https://"), "die Seite laedt von aussen nach");
+
+    // Und der Zustand ist gültiges JSON mit den Feldern, an denen die Seite hängt.
+    let (status, head, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    assert!(head.contains("application/json"), "{}", head);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(state["textures"], serde_json::Value::Bool(false));
+    assert!(
+        state["texture_error"].as_str().unwrap_or("").contains("aus"),
+        "der abgeschaltete Zustand steht nicht im JSON: {}",
+        state["texture_error"]
+    );
+    // Ohne Ressourcen gibt es kein texturiertes Bild – und das sagt der Viewer auch, statt ein
+    // leeres PNG zu liefern.
+    let (status, _, _) = common::http_get(port, &format!("/api/frame.png?token={}", token));
+    assert_eq!(status, 503);
+
+    let _ = child.kill();
+}
+
+/// Der ganze Weg am Stück, durch das echte Binary: verbinden, Chunks lesen, Original-Texturen
+/// laden, ein Bild rendern und es über HTTP ausliefern.
+///
+/// Läuft nicht im normalen Testlauf mit – er braucht eine echte Client-JAR. Aufruf:
+/// `AFK_POV_RESOURCES=~/.minecraft/versions/1.21.1/1.21.1.jar cargo test --features ultra -- --ignored --nocapture browser_viewer_liefert`
+#[cfg(feature = "pov")]
+#[test]
+#[ignore]
+fn browser_viewer_liefert_ein_texturiertes_bild() {
+    let Ok(jar) = std::env::var("AFK_POV_RESOURCES") else {
+        println!("AFK_POV_RESOURCES nicht gesetzt – nichts zu tun");
+        return;
+    };
+    let server = common::start(&common::MC_1_21_1, plan_with_ground());
+    let port = common::free_port();
+    let mut child = common::spawn_client(
+        server.port,
+        "1.21.1",
+        &[
+            "--no-color",
+            "--pov-web",
+            &port.to_string(),
+            "--pov-resources",
+            &jar,
+        ],
+    );
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let (loaded, log) = common::wait_for(&err, Duration::from_secs(120), "Texturen sind geladen");
+    assert!(loaded, "die Texturen kamen nicht. Ausgabe:\n{}", log);
+    let token = log
+        .split("?token=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("Token in der Adresse")
+        .to_string();
+
+    // Der Zustand meldet die Texturen als vorhanden und ohne Hinweistext.
+    let (status, _, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(state["textures"], serde_json::Value::Bool(true));
+    assert_eq!(state["texture_error"], serde_json::Value::Null);
+
+    // Und das Bild kommt als PNG heraus – mit Inhalt, nicht als leere Fläche.
+    let (status, head, png) = common::http_get(
+        port,
+        &format!("/api/frame.png?token={}&w=320&h=180", token),
+    );
+    assert_eq!(status, 200, "kein Bild: {}", head);
+    assert!(head.contains("image/png"), "{}", head);
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "das ist kein PNG");
+    // Ein einfarbiges 320x180-PNG bliebe winzig; ein texturiertes Bild nicht.
+    assert!(
+        png.len() > 10_000,
+        "das Bild ist mit {} Byte verdaechtig klein",
+        png.len()
+    );
+    // Zum Ansehen ablegen, wenn gewünscht – geprüft wird schließlich ein Bild.
+    if let Ok(target) = std::env::var("AFK_POV_PNG") {
+        std::fs::write(&target, &png).expect("Bild schreiben");
+        println!("Bild geschrieben: {}", target);
+    }
     let _ = child.kill();
 }
 

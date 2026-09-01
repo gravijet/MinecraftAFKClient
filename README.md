@@ -53,8 +53,8 @@ Die Grundoptionen verstehen beide Clients gleich. Die mit **R** markierten gibt 
 Rust-Client, die mit **P** nur im Premium-Build, die mit **V** nur in den POV-Bauformen. Jede
 Bauform **nimmt auch die Optionen der anderen an** und sagt nur, dass sie sie ignoriert – so kann
 das Panel allen Bauformen dieselbe Befehlszeile schicken. Das gilt in beide Richtungen: der
-Java-Client schluckt `--offline`, `--proxy`, `--pov …`, der Rust-Client `--no-reconnect`,
-`--reconnect-delay`, `--max-backoff`.
+Java-Client schluckt `--offline`, `--proxy`, `--pov …`. Die Reconnect-Schalter verstehen inzwischen
+**beide** gleich – auch `--reconnect-tries`, das es vorher nur im Rust-Client gab.
 
 | Option | Bedeutung |
 | --- | --- |
@@ -69,6 +69,10 @@ Java-Client schluckt `--offline`, `--proxy`, `--pov …`, der Rust-Client `--no-
 | `--on <auslöser>=<aktion>` | **R** Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
 | `--on-cooldown <sek>` | **R** Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
 | `--chat-delay <ms>` | Mindestabstand ausgehender Nachrichten (Standard 1000, gegen Spam-Kick) |
+| `--no-reconnect` | nach einem Abbruch **nicht** neu verbinden, sondern mit Status 1 enden |
+| `--reconnect-delay <sek>` | Wartezeit vor dem ersten Versuch (Standard 5) |
+| `--max-backoff <sek>` | Obergrenze der Wartezeit (Standard 60); sie verdoppelt sich bis dahin |
+| `--reconnect-tries <n>` | nach `n` erfolglosen Versuchen aufgeben (Standard `0` = unbegrenzt) |
 | `--view-distance <n>` | dem Server gemeldete Sichtweite in Chunks, 2–32. Standard 2 – die POV-Bauformen 6, weil nur sie Chunks überhaupt auswerten. Kleiner heißt weniger Bandbreite, CPU und RAM. Auch `--sichtweite`. |
 | `--no-color` | keine ANSI-Farben |
 | `-q`, `--quiet` | keine Statusmeldungen – wirklich nur Chat |
@@ -79,7 +83,7 @@ Java-Client schluckt `--offline`, `--proxy`, `--pov …`, der Rust-Client `--no-
 | `--pov-size <b>x<h>` | **V** Auflösung der Live-Ansicht, 24–160 × 12–80 (Standard 64x32). Trennzeichen `x`, `*`, `:` oder Leerzeichen; auch `--pov-groesse`. |
 | `--pov-fps <n>` | **V** Bilder je Sekunde, 1–20 (Standard 8) |
 | `--pov-web <port\|ip:port>` | **V** texturierten, token-geschützten Browser-Viewer starten; nur eine Portnummer bindet an `127.0.0.1` |
-| `--pov-resources <client.jar>` | **V** versionsgleiche Original-Client-JAR für Blockmodelle, Texturen, HUD und Menüs |
+| `--pov-resources <jar\|auto\|aus>` | **V** woher die echten Texturen kommen. Standard `auto`: vorhandene Minecraft-Installation benutzen, sonst einmalig von Mojang laden und im Konfigverzeichnis ablegen. Ein Pfad erzwingt genau diese JAR, `aus` verzichtet auf Texturen. |
 | `--login` | Microsoft-Konto anmelden und beenden |
 | `--accounts` | gespeicherte Konten auflisten und beenden |
 | `-h`, `--help` | Hilfe |
@@ -123,13 +127,18 @@ sie kommen **auch mit `-q`** durch, sind nie eingefärbt, stehen immer auf **gen
 | `@event world` | Weltwechsel (Respawn in einer anderen Welt) |
 | `@event death` | gestorben |
 | `@event disconnect <grund>` | Verbindung beendet (Grund kann leer sein) |
+| `@event reconnect versuch=N in=Ns` | **R** Neuverbindung geplant, mit Nummer und Wartezeit |
 | `@event menu open id=N` / `@event menu close` | Menü auf/zu (Items/Premium/Ultra) |
 | `@event board …` | Scoreboard-Titel/-Zeilen samt formatiertem Zahlenfeld und `§`-Farbcodes (Premium/Ultra) |
 | `@event slot …` / `@event lore …` | Gegenstände und Lore mit `§`-Farbcodes (Items-Bauformen) |
 
-Nach einem Kick oder Verbindungsabbruch beendet sich der Rust-Client mit Fehlerstatus und verbindet
-sich nicht automatisch neu. Nur einem ausdrücklichen Server-Transfer auf einen Unterserver folgt er
-weiterhin als Teil derselben Sitzung.
+Nach einem Kick oder Verbindungsabbruch verbindet sich der Client neu: erst nach 5 Sekunden, dann
+mit verdoppelter Wartezeit bis höchstens 60 Sekunden. Der Zähler springt auf null zurück, sobald
+der Client wieder im Spiel ist. Jeder Versuch meldet sich als
+`@event reconnect versuch=<n> in=<sek>s`. Mit `--no-reconnect` endet der Prozess stattdessen mit
+Status 1. Einem ausdrücklichen Server-Transfer auf einen Unterserver folgt der Client davon
+unabhängig als Teil derselben Sitzung – dabei bleiben die Cookies erhalten, bei einer Neuverbindung
+werden sie verworfen.
 
 ## Konten
 
@@ -198,7 +207,7 @@ java -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xmx96m -Dio.netty.eventLoopThread
 ## Bewegung (eigene Bauform)
 
 Der schlanke Client bewegt sich **nie**. Wer gesteuerte Bewegung will (`:go`, `:look`, `:home`,
-`:route`, `:jump`, `:fall`, `:stop`, `:pos`), baut die zweite Bauform:
+`:route`, `:jump`, `:stop`, `:pos`), baut die zweite Bauform:
 
 ```bash
 ./gradlew :java:shadowJar -Pmc=26.1 -Pmove=true   # afk-26.1-move.jar
@@ -206,7 +215,8 @@ cd rust && cargo build --release --features movement --target-dir target/movemen
 ```
 
 Im schlanken Build ist davon keine einzige Klasse bzw. kein Byte enthalten. Die Bewegung merkt sich
-Heimatposition und Routen in `movement.json` neben den Konten.
+Heimatposition und Routen in `movement.json` neben den Konten. `:fall` ist ohne eingelesene
+Weltkollision bewusst deaktiviert; der Client tastet nicht mit erfundenen Y-Positionen nach Boden.
 
 ## Premium-Client (eigene Datei, nur Rust)
 
@@ -241,8 +251,10 @@ Standarditems erhalten dabei ihren versionsgenauen `minecraft:...`-Ressourcennam
 offiziellen Mojang-Registry-Reports; benutzerdefinierte Namen und Lore behalten ihre `§`-Farbcodes.
 
 Die eigene POV-Datei startet nach dem Beitritt automatisch eine Live-First-Person-Ansicht aus den
-empfangenen Chunk-, Block- und Entity-Paketen. Ultra enthält alle Rust-Funktionen; dort wird die
-Ansicht bewusst erst mit `:pov live` gestartet.
+empfangenen Chunk-, Block- und Entity-Paketen. Gezeichnet wird mit dem **Licht**, das der Server
+mitschickt (Himmel und Blocklicht getrennt), und mit den **Biomfarben** aus seiner Registry – eine
+Wiese in der Ebene ist also grün, im Sumpf trüb und in der Wüste ausgeblichen. Ultra enthält alle
+Rust-Funktionen; dort wird die Ansicht bewusst erst mit `:pov live` gestartet.
 
 ```bash
 cd rust && cargo build --release --features pov-client --target-dir target/pov
@@ -258,7 +270,14 @@ Rein protokollbasiert – genau das, was ein wartender Vanilla-Client tut, und *
 * `KeepAlive` sofort beantworten (das ist der eigentliche Schutz gegen `disconnect.timeout`)
 * `Ping` → `Pong`
 * Teleports bestätigen und die vorgegebene Position einmal zurückspiegeln (gegen Rubberband-Kick)
-* erzwungene Resource-Packs bestätigen, aber nicht laden
+* jeden Chunk-Stapel bestätigen (`ChunkBatchReceived`) – ohne das hört der Server nach zehn
+  offenen Stapeln auf, überhaupt noch Chunks zu schicken
+* das Ende der Ladephase melden (`PlayerLoaded`, ab 1.21.4) – ohne das hängt der Spieler bis zu
+  30 Sekunden in einem Schwebezustand
+* die eigene Position alle 20 Ticks erneut melden, auch im Stillstand: genau das tut ein echter
+  Client, und ein Client, der gar nichts mehr schickt, fällt genau dadurch auf
+* ab 1.21.2 jeden 50-ms-Tick mit `ClientTickEnd` abschließen
+* nicht ladbare Resource-Packs ehrlich ablehnen (ein erzwungenes Pack darf den Client daher kicken)
 * beim Beitritt `ClientInformation` senden, Cookies beantworten (auch über einen Transfer
   hinweg), ab 1.21.11 den Verhaltenskodex
 * empfangene signierte Chat-Nachrichten quittieren (sonst `chat_validation_failed`)

@@ -9,7 +9,7 @@
 //!
 //! Bewusste Grenze: Der Client liest **keine** Weltdaten (keine Chunks). Er weiß also nicht, wo
 //! Blöcke stehen. Gelaufen wird daher geradlinig auf gleicher Höhe; korrigiert der Server die
-//! Position (Wand, Gefälle, Treppe), übernehmen wir seine Vorgabe und laufen von dort weiter.
+//! Position, übernehmen wir seine Vorgabe und brechen die laufende Bewegung ab.
 //!
 //! Gegen Hindernisse gibt es trotzdem zwei Mittel, beide ohne jede Kenntnis der Welt:
 //! * **Route** – einmal aufgezeichnete Wegpunkte (`:route rec` … `:route stop`). Ecken, Türen und
@@ -51,11 +51,8 @@ const POSITION_TIMEOUT: Duration = Duration::from_secs(20);
 const JUMP_SPEED: f64 = 0.42;
 const GRAVITY: f64 = 0.08;
 const DRAG: f64 = 0.98;
-/// Notbremsen für einen Sturz: so tief und so lange höchstens.
-const MAX_FALL_BLOCKS: f64 = 24.0;
-const MAX_FALL_TICKS: u32 = 60;
-/// Der Server hat uns nach oben gesetzt (= wir stecken in einem Block) ab dieser Abweichung.
-const CORRECTED: f64 = 0.05;
+/// Notbremse für eine vollständige Sprungkurve.
+const MAX_JUMP_TICKS: u32 = 20;
 
 // ===================== Einstellungen (movement.json) =====================
 
@@ -133,16 +130,13 @@ struct Settings {
     home: Option<Spot>,
     /// Wegpunkte auf dem Weg dorthin, in Reihenfolge. Leer = geradeaus laufen.
     route: Vec<Spot>,
-    /// Blöcke pro Sekunde. 4,317 = Vanilla-Gehen, 5,612 = Sprinten.
+    /// Blöcke pro Sekunde. Höchstens normales Vanilla-Gehen; Sprinten würde zusätzlich einen
+    /// konsistenten Eingabe- und Sprintzustand erfordern.
     walk_speed: f64,
     /// Grad je Tick beim Drehen. Ein Ruck um 180° in einem Tick fällt jedem Anticheat auf.
     turn_speed: f64,
     /// Notbremse: so lange darf ein einzelner Lauf höchstens dauern.
     max_walk_seconds: u64,
-    /// Beim Laufen ohne bekannte Zielhöhe ab und zu nach unten tasten (siehe [`fall`]).
-    auto_fall: bool,
-    /// Nach so vielen gelaufenen Blöcken wird getastet. Kleiner = schneller unten, aber öfter.
-    fall_check_blocks: f64,
 }
 
 impl Default for Settings {
@@ -155,19 +149,15 @@ impl Default for Settings {
             walk_speed: 4.317,
             turn_speed: 25.0,
             max_walk_seconds: 60,
-            auto_fall: true,
-            fall_check_blocks: 2.0,
         }
     }
 }
 
 impl Settings {
     fn normalize(&mut self) {
-        // Schneller als Sprinten meldet der Server als „moved too quickly".
-        self.walk_speed = self.walk_speed.clamp(0.5, 5.612);
+        self.walk_speed = self.walk_speed.clamp(0.5, 4.317);
         self.turn_speed = self.turn_speed.clamp(5.0, 90.0);
         self.max_walk_seconds = self.max_walk_seconds.clamp(5, 600);
-        self.fall_check_blocks = self.fall_check_blocks.clamp(0.5, 16.0);
         self.home_delay_seconds = self.home_delay_seconds.min(3600);
         self.route.truncate(MAX_ROUTE);
         for point in &mut self.route {
@@ -192,6 +182,9 @@ pub struct Mover {
     /// Laufende Aufgabe. Jede neue Aufgabe zählt hoch und beendet damit stillschweigend die vorige –
     /// es bewegt sich immer höchstens ein Thread.
     job: AtomicU32,
+    /// Nummer der tatsächlich laufenden Aufgabe, `0` = keine. Anders als `job` kann damit ein
+    /// Server-Teleport nur dann eine Warnung ausgeben, wenn er wirklich Bewegung abbricht.
+    active: AtomicU32,
     /// Zwischen `:route rec` und `:route stop`: die bisher erreichten Punkte. Bewusst **nicht** in
     /// den Einstellungen – eine halbe Aufzeichnung soll keinen Neustart überleben.
     recording: Mutex<Option<Vec<Spot>>>,
@@ -209,17 +202,32 @@ impl Mover {
             settings: Mutex::new(settings),
             file,
             job: AtomicU32::new(0),
+            active: AtomicU32::new(0),
             recording: Mutex::new(None),
         }
     }
 
     /// Laufende Bewegung abbrechen (Trennung, `:stop`, neuer Befehl).
-    pub fn stop(&self) {
+    pub fn stop(&self) -> bool {
         self.job.fetch_add(1, Ordering::SeqCst);
+        self.active.swap(0, Ordering::SeqCst) != 0
+    }
+
+    #[cfg(feature = "antiafk")]
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst) != 0
     }
 
     fn claim(&self) -> u32 {
-        self.job.fetch_add(1, Ordering::SeqCst) + 1
+        let id = self.job.fetch_add(1, Ordering::SeqCst) + 1;
+        self.active.store(id, Ordering::SeqCst);
+        id
+    }
+
+    fn finish(&self, id: u32) {
+        let _ = self
+            .active
+            .compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     fn get(&self) -> Settings {
@@ -254,11 +262,15 @@ struct Job {
 }
 
 impl Job {
-    fn alive(&self, shared: &Shared) -> bool {
+    fn connection_alive(&self, shared: &Shared) -> bool {
         shared.running.load(Ordering::Relaxed)
             && shared.in_game.load(Ordering::Relaxed)
             && shared.generation.load(Ordering::SeqCst) == self.generation
             && shared.mover.job.load(Ordering::SeqCst) == self.id
+    }
+
+    fn alive(&self, shared: &Shared) -> bool {
+        self.connection_alive(shared) && shared.ready_for_gameplay()
     }
 }
 
@@ -275,8 +287,6 @@ enum Task {
     Turn { yaw: f32, pitch: f32 },
     /// Springen – auf der Stelle oder mit Drift in eine Richtung.
     Jump { dx: f64, dz: f64 },
-    /// Fallen lassen, bis wir aufkommen.
-    Fall,
     /// Heimatposition: auf die Position warten, Verzögerung abwarten, die Route abgehen,
     /// zum Ziel laufen, dort in die gemerkte Richtung schauen.
     Home {
@@ -306,11 +316,19 @@ fn spawn(shared: &Arc<Shared>, task: Task) {
     let shared = Arc::clone(shared);
     thread::Builder::new()
         .name("afk-move".into())
-        .spawn(move || run(&shared, job, task))
+        .spawn(move || {
+            run(&shared, job, task);
+            shared.mover.finish(job.id);
+        })
         .ok();
 }
 
 fn run(shared: &Arc<Shared>, job: Job, task: Task) {
+    // Ein Befehl, der genau zwischen dem Teleport des Servers und der fertig geladenen Umgebung
+    // abgesetzt wird, soll nicht als „abgebrochen" enden, sondern die paar Millisekunden abwarten.
+    // Wer noch gar nicht im Spiel ist, kommt sofort zurück und läuft in die übliche Absage;
+    // `Home` bringt darüber hinaus seine eigene, längere Wartezeit mit ([`wait_for_position`]).
+    let _ = shared.await_gameplay(crate::client::GAMEPLAY_WAIT);
     let settings = shared.mover.get();
     match task {
         Task::Turn { yaw, pitch } => {
@@ -323,30 +341,15 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
         Task::Jump { dx, dz } => {
             report(shared, jump(shared, job, &settings, dx, dz), "Sprung");
         }
-        Task::Fall => {
-            let before = shared.position().map(|p| p.1).unwrap_or_default();
-            let outcome = fall(shared, job, 0.0, 0.0, 0.0);
-            if matches!(outcome, Outcome::Arrived) {
-                let after = shared.position().map(|p| p.1).unwrap_or(before);
-                return shared
-                    .console
-                    .ok(&format!("Gefallen: {:.1} Blöcke.", before - after));
-            }
-            report(shared, outcome, "Fallen");
-        }
         Task::WalkTo {
             x,
             z,
             record,
             label,
         } => {
-            let mut outcome = walk_to(shared, job, &settings, x, z, None);
+            let outcome = walk_to(shared, job, &settings, x, z, None);
             if record && matches!(outcome, Outcome::Arrived) {
                 record_point(shared);
-            }
-            // Am Ziel noch einmal ablegen: der letzte Schritt kann über eine Kante geführt haben.
-            if settings.auto_fall && matches!(outcome, Outcome::Arrived) {
-                outcome = fall(shared, job, 0.0, 0.0, 0.0);
             }
             report(shared, outcome, &label);
         }
@@ -437,13 +440,11 @@ fn report(shared: &Arc<Shared>, outcome: Outcome, label: &str) {
 
 /// Geradlinig zum Punkt (x|z) laufen, Höhe unverändert.
 ///
-/// Gerechnet wird in jedem Tick neu aus der **aktuellen** Position. Schiebt der Server uns zurück
-/// (Wand) oder korrigiert die Höhe (Treppe/Gefälle), laufen wir einfach von dort weiter – und
-/// merken an der ausbleibenden Annäherung, wenn es gar nicht mehr vorangeht. Dann wird
-/// ausgewichen (siehe [`escape`]); erst nach mehreren vergeblichen Versuchen geben wir auf.
+/// Gerechnet wird in jedem Tick neu aus der **aktuellen** Position. Eine autoritative
+/// Serverkorrektur beendet die Aufgabe im Netz-Thread, statt die alte Bewegungsabsicht danach
+/// erneut durchzusetzen. Bleibt der Fortschritt ohne Teleport aus, wird begrenzt ausgewichen.
 /// `ty` ist die Zielhöhe, sofern bekannt (Wegpunkte einer Route haben eine). Dann wird die Höhe
 /// gleichmäßig mitgezogen – so geht es Treppen hinauf und hinunter, ohne die Welt zu kennen.
-/// Ohne Zielhöhe wird stattdessen ab und zu nach unten getastet, siehe [`fall`].
 fn walk_to(
     shared: &Arc<Shared>,
     job: Job,
@@ -459,7 +460,6 @@ fn walk_to(
     let mut closest_at = Instant::now();
     let mut next = Instant::now();
     let mut escapes = 0;
-    let mut since_check = 0.0;
 
     loop {
         if !job.alive(shared) {
@@ -515,22 +515,6 @@ fn walk_to(
             ),
         );
         next = sleep_tick(next);
-
-        // Ohne bekannte Zielhöhe: ab und zu prüfen, ob unter uns überhaupt noch Boden ist.
-        if ty.is_none() && settings.auto_fall {
-            since_check += travel;
-            if since_check >= settings.fall_check_blocks {
-                since_check = 0.0;
-                match fall(shared, job, 0.0, 0.0, 0.0) {
-                    Outcome::Arrived => {}
-                    other => return other,
-                }
-                // Ein Sturz kostet Zeit, bringt aber waagerecht nichts – die Uhr neu stellen,
-                // sonst hielte der Fortschrittswächter das für ein Hindernis.
-                closest_at = Instant::now();
-                next = Instant::now();
-            }
-        }
     }
 }
 
@@ -580,79 +564,42 @@ fn escape(
     strafe(shared, job, settings, sx, sz, blocks)
 }
 
-/// Ein Sprung nach Vanilla-Physik, dabei weiter in Laufrichtung. Beim Steigen und Fallen melden
-/// wir ehrlich `onGround = false` – so sieht es aus wie bei jedem echten Client. Der Rückweg nach
-/// unten ist ein ganz normaler Sturz, siehe [`fall`].
+/// Ein Sprung nach Vanilla-Physik, dabei weiter in Laufrichtung. Während der Flugkurve melden wir
+/// `onGround = false`; gelandet wird wieder auf der bekannten Ausgangshöhe. Ohne Chunk- und
+/// Kollisionsdaten werden keine tieferen Testpositionen erzeugt.
 fn jump(shared: &Arc<Shared>, job: Job, settings: &Settings, dx: f64, dz: f64) -> Outcome {
+    let Some((_, start_y, _, _, _)) = shared.position() else {
+        return Outcome::Unknown;
+    };
     let step = settings.step();
     let mut vy = JUMP_SPEED;
     let mut next = Instant::now();
 
-    // Aufwärts, solange der Sprung trägt.
-    while vy > 0.0 {
+    for _ in 0..MAX_JUMP_TICKS {
         if !job.alive(shared) {
             return Outcome::Cancelled;
         }
         let Some((x, y, z, yaw, pitch)) = shared.position() else {
             return Outcome::Unknown;
         };
+        let next_y = y + vy;
+        if next_y <= start_y {
+            send_move_ground(
+                shared,
+                (x + dx * step, start_y, z + dz * step, yaw, pitch),
+                true,
+            );
+            return Outcome::Arrived;
+        }
         send_move_ground(
             shared,
-            (x + dx * step, y + vy, z + dz * step, yaw, pitch),
+            (x + dx * step, next_y, z + dz * step, yaw, pitch),
             false,
         );
         vy = (vy - GRAVITY) * DRAG;
         next = sleep_tick(next);
     }
-    fall(shared, job, dx * step, dz * step, vy)
-}
-
-/// Fallen, bis wir aufkommen: Treppe hinunter, von der Kante, nach einem Sprung.
-///
-/// `vy` ist die Startgeschwindigkeit (0 = einfach loslassen, negativ = wir fallen schon),
-/// `dx`/`dz` eine waagerechte Drift **je Tick** in Blöcken.
-///
-/// Gelandet sind wir, sobald der Server uns nach oben korrigiert – er tut das, sobald wir
-/// behaupten, in einem Block zu stecken. Das ist die einzige Bodeninformation, die ein Client
-/// ohne Weltdaten überhaupt bekommen kann: steht unter uns etwas, kostet die Prüfung genau einen
-/// Tick; steht dort nichts, fallen wir einfach weiter.
-fn fall(shared: &Arc<Shared>, job: Job, dx: f64, dz: f64, mut vy: f64) -> Outcome {
-    let Some((_, start_y, _, _, _)) = shared.position() else {
-        return Outcome::Unknown;
-    };
-    let mut next = Instant::now();
-
-    for _ in 0..MAX_FALL_TICKS {
-        if !job.alive(shared) {
-            return Outcome::Cancelled;
-        }
-        let Some((x, y, z, yaw, pitch)) = shared.position() else {
-            return Outcome::Unknown;
-        };
-        vy = (vy - GRAVITY) * DRAG;
-        let landing = y + vy;
-        // Notbremse: so tief geht es nur in die Leere, und dort hilft Fallen ohnehin nicht mehr.
-        if start_y - landing > MAX_FALL_BLOCKS {
-            break;
-        }
-        send_move_ground(shared, (x + dx, landing, z + dz, yaw, pitch), false);
-        next = sleep_tick(next);
-        // Hat der Server uns hochgesetzt, steht dort ein Block: wir sind aufgekommen.
-        match shared.position() {
-            Some((_, corrected, _, _, _)) if corrected > landing + CORRECTED => break,
-            Some(_) => {}
-            None => return Outcome::Unknown,
-        }
-    }
-
-    // Wieder als „auf dem Boden" melden.
-    match shared.position() {
-        Some(position) => {
-            send_move(shared, position);
-            Outcome::Arrived
-        }
-        None => Outcome::Unknown,
-    }
+    Outcome::Timeout
 }
 
 /// Ein Stück quer zur Laufrichtung gehen, ohne dabei auf das Ziel zu achten.
@@ -704,7 +651,7 @@ fn turn_to(
         if !job.alive(shared) {
             return Outcome::Cancelled;
         }
-        let Some((x, y, z, yaw, pitch)) = shared.position() else {
+        let Some((_, _, _, yaw, pitch)) = shared.position() else {
             return Outcome::Unknown;
         };
 
@@ -717,18 +664,38 @@ fn turn_to(
         if started.elapsed() > limit {
             return Outcome::Timeout;
         }
-        send_move(
+        send_rotation(
             shared,
-            (
-                x,
-                y,
-                z,
-                wrap_degrees(yaw + dyaw.clamp(-step, step)),
-                (pitch + dpitch.clamp(-step, step)).clamp(-90.0, 90.0),
-            ),
+            wrap_degrees(yaw + dyaw.clamp(-step, step)),
+            (pitch + dpitch.clamp(-step, step)).clamp(-90.0, 90.0),
         );
         next = sleep_tick(next);
     }
+}
+
+/// Nur den Kopf drehen. Vanilla verwendet dafür das kurze Rotationspaket; ein vollständiges
+/// Positionspaket würde dieselben, zuvor gelesenen Koordinaten erneut behaupten und könnte eine
+/// gleichzeitig laufende Bewegung auf einen alten Snapshot zurücksetzen.
+pub(crate) fn send_rotation(shared: &Shared, yaw: f32, pitch: f32) {
+    let yaw = if yaw.is_finite() {
+        wrap_degrees(yaw)
+    } else {
+        return;
+    };
+    let pitch = if pitch.is_finite() {
+        pitch.clamp(-90.0, 90.0)
+    } else {
+        return;
+    };
+    if !shared.set_rotation(yaw, pitch) {
+        return;
+    }
+    let mut w = Writer::packet(shared.proto.game.sb_move_player_rot);
+    w.f32(yaw);
+    w.f32(pitch);
+    // In 1.21.1 ist das ein Bool, danach ein Flag-Byte. 0x01 bedeutet in beiden `onGround`.
+    w.u8(0x01);
+    shared.send(w);
 }
 
 /// Position senden **und** den eigenen Zustand mitziehen – der Server rechnet ab jetzt mit ihr.
@@ -737,16 +704,37 @@ pub(crate) fn send_move(shared: &Shared, position: Position) {
 }
 
 fn send_move_ground(shared: &Shared, position: Position, on_ground: bool) {
+    let Some(position) = checked_position(position) else {
+        return;
+    };
     shared.set_position(position);
-    let (x, y, z, yaw, pitch) = position;
-    let mut w = Writer::packet(shared.proto.game.sb_move_player_pos_rot);
+    let (x, y, z, _, _) = position;
+    // Die Blickrichtung ändert sich hier nicht. Vanilla sendet deshalb das kürzere Pos-Paket
+    // und behauptet nicht in jedem Tick dieselben Winkel erneut.
+    let mut w = Writer::packet(shared.proto.game.sb_move_player_pos);
     w.f64(x);
     w.f64(y);
     w.f64(z);
-    w.f32(yaw);
-    w.f32(pitch);
     w.u8(if on_ground { 0x01 } else { 0x00 });
     shared.send(w);
+    // Der Erinnerungstakt des Client-Ticks beginnt von vorn – sonst schöben Bewegung und Takt
+    // abwechselnd dieselbe Position hinaus.
+    shared.mark_position_sent();
+}
+
+/// Nur Werte aufs Kabel lassen, die auch eine Vanilla-Spielerposition darstellen können.
+fn checked_position(position: Position) -> Option<Position> {
+    let (x, y, z, yaw, pitch) = position;
+    if ![x, y, z]
+        .into_iter()
+        .all(|value| value.is_finite() && (-WORLD_LIMIT..=WORLD_LIMIT).contains(&value))
+        || !yaw.is_finite()
+        || !pitch.is_finite()
+        || !(-90.0..=90.0).contains(&pitch)
+    {
+        return None;
+    }
+    Some((x, y, z, wrap_degrees(yaw), pitch))
 }
 
 /// Bis zum nächsten Tick schlafen und den nächsten Termin zurückgeben. Hinken wir hinterher
@@ -773,7 +761,7 @@ fn nap(shared: &Arc<Shared>, job: Job, duration: Duration) -> bool {
         if left.is_zero() {
             return job.alive(shared);
         }
-        if !job.alive(shared) {
+        if !job.connection_alive(shared) {
             return false;
         }
         thread::sleep(left.min(Duration::from_millis(100)));
@@ -782,8 +770,8 @@ fn nap(shared: &Arc<Shared>, job: Job, duration: Duration) -> bool {
 
 fn wait_for_position(shared: &Arc<Shared>, job: Job) -> bool {
     let until = Instant::now() + POSITION_TIMEOUT;
-    while shared.position().is_none() {
-        if !job.alive(shared) {
+    while !shared.ready_for_gameplay() {
+        if !job.connection_alive(shared) {
             return false;
         }
         if Instant::now() >= until {
@@ -877,7 +865,7 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) {
         "home" | "heim" => home(shared, arg),
         "route" | "weg" | "strecke" => route(shared, arg),
         "jump" | "spring" | "springe" => jump_command(shared, arg),
-        "fall" | "fallen" => fall_command(shared, arg),
+        "fall" | "fallen" => fall_command(shared),
         "stop" | "halt" => {
             shared.mover.stop();
             shared.console.info("Bewegung gestoppt.");
@@ -966,43 +954,11 @@ fn jump_command(shared: &Arc<Shared>, arg: &str) {
     spawn(shared, Task::Jump { dx, dz });
 }
 
-/// `:fall` (jetzt fallen lassen), `:fall on|off` (Automatik) oder `:fall <blöcke>` (Prüfabstand).
-fn fall_command(shared: &Arc<Shared>, arg: &str) {
-    let word = arg.trim().to_lowercase();
-    match word.as_str() {
-        "on" | "an" | "ein" => {
-            shared.mover.edit(|s| s.auto_fall = true);
-            shared
-                .console
-                .ok("Fallen automatisch – beim Laufen wird regelmäßig nach unten getastet.");
-        }
-        "off" | "aus" => {
-            shared.mover.edit(|s| s.auto_fall = false);
-            shared
-                .console
-                .info("Automatisches Fallen aus – nur noch auf  :fall .");
-        }
-        "" => {
-            if shared.position().is_none() {
-                return shared
-                    .console
-                    .error("Position noch unbekannt (nicht im Spiel?).");
-            }
-            spawn(shared, Task::Fall);
-        }
-        text => match parse_number(text) {
-            Some(blocks) if (0.5..=16.0).contains(&blocks) => {
-                shared.mover.edit(|s| s.fall_check_blocks = blocks);
-                shared.console.info(&format!(
-                    "Prüfabstand: alle {:.1} gelaufenen Blöcke einmal nach unten tasten.",
-                    shared.mover.get().fall_check_blocks
-                ));
-            }
-            _ => shared
-                .console
-                .error("Nutzung: :fall   ·   :fall on|off   ·   :fall <0,5–16 blöcke>"),
-        },
-    }
+/// Ohne Welt- und Kollisionsdaten kann ein Fall nicht korrekt simuliert werden.
+fn fall_command(shared: &Arc<Shared>) {
+    shared.console.error(
+        ":fall ist ohne bekannte Weltkollision deaktiviert; es werden keine Testpositionen nach unten gesendet.",
+    );
 }
 
 fn look(shared: &Arc<Shared>, arg: &str) {
@@ -1190,14 +1146,8 @@ fn print_home(shared: &Arc<Shared>) {
             console.print(&console.paint(
                 GRAY,
                 &format!(
-                    "    Start {} s nach dem Beitritt  ·  {:.3} Blöcke/s  ·  Fallen {}",
-                    settings.home_delay_seconds,
-                    settings.walk_speed,
-                    if settings.auto_fall {
-                        "automatisch"
-                    } else {
-                        "aus"
-                    }
+                    "    Start {} s nach dem Beitritt  ·  {:.3} Blöcke/s",
+                    settings.home_delay_seconds, settings.walk_speed
                 ),
             ));
         }
@@ -1505,9 +1455,21 @@ mod tests {
             ..Settings::default()
         };
         settings.normalize();
-        assert_eq!(settings.walk_speed, 5.612);
+        assert_eq!(settings.walk_speed, 4.317);
         // Schritt je Tick bei Vanilla-Gehen: gut 0,2 Blöcke.
         assert!((Settings::default().step() - 0.21585).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nur_gueltige_positionen_gehen_aufs_kabel() {
+        assert_eq!(
+            checked_position((1.0, 64.0, -2.0, 450.0, 30.0)),
+            Some((1.0, 64.0, -2.0, 90.0, 30.0))
+        );
+        assert!(checked_position((f64::NAN, 64.0, 0.0, 0.0, 0.0)).is_none());
+        assert!(checked_position((WORLD_LIMIT + 1.0, 64.0, 0.0, 0.0, 0.0)).is_none());
+        assert!(checked_position((0.0, 64.0, 0.0, f32::INFINITY, 0.0)).is_none());
+        assert!(checked_position((0.0, 64.0, 0.0, 0.0, 90.1)).is_none());
     }
 
     /// Der Sprung muss über eine Stufe (1 Block) tragen, aber nicht über zwei – sonst wäre es
@@ -1578,7 +1540,7 @@ mod tests {
     /// Der erste Tasttick darf nur ein winziges Stück nach unten gehen – sonst rutscht der Client
     /// bei festem Boden sichtbar in ihn hinein, bevor der Server ihn zurückholt.
     #[test]
-    fn erster_fallschritt_ist_klein() {
+    fn erster_abwaertsschritt_des_sprungs_ist_klein() {
         let first = (0.0 - GRAVITY) * DRAG;
         assert!(first < 0.0);
         assert!(first.abs() < 0.1, "erster Fallschritt {} zu groß", first);

@@ -1,12 +1,13 @@
 //! Der eigentliche AFK-Client: verbinden, verbunden bleiben, Chat senden/empfangen.
 //!
 //! Kick-Schutz ist rein protokollbasiert – genau das, was ein wartender Vanilla-Client tut:
-//! `KeepAlive` sofort beantworten, `Ping`→`Pong`, Teleports bestätigen, erzwungene Resource-Packs
-//! bestätigen (nicht laden), beim Beitritt `ClientInformation` senden, Cookies beantworten,
+//! `KeepAlive` sofort beantworten, `Ping`→`Pong`, Teleports bestätigen, nicht ladbare Resource-Packs
+//! ehrlich ablehnen, beim Beitritt `ClientInformation` senden, Cookies beantworten,
 //! den Verhaltenskodex (ab 1.21.11) bestätigen. **Keine** Anti-AFK-Bewegung.
 //!
-//! Threads: 1× Netz (liest und antwortet), 1× Sender (rate-limitiert), sonst nichts. Im Leerlauf
-//! blockieren beide – kein Timer, kein Polling, praktisch 0 % CPU.
+//! Threads: 1× Netz (liest und antwortet), 1× Sender (rate-limitiert) sowie ab 1.21.2 während
+//! einer Verbindung ein Tick-End-Sender. Im Leerlauf blockieren sie – kein Polling, praktisch
+//! 0 % CPU.
 //!
 //! Die Protokollversion steckt in [`crate::proto::Protocol`] und kommt aus `--mc`; alle
 //! versionsabhängigen Stellen sind unten mit `proto.modern` bzw. über `proto.game` markiert.
@@ -30,7 +31,7 @@ use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +44,26 @@ const ACK_THRESHOLD: u32 = 64;
 const MAX_MESSAGE_CHARS: usize = 256;
 const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
+/// Moderne Vanilla-Clients schließen jeden 50-ms-Client-Tick mit einem leeren Paket ab.
+const CLIENT_TICK: Duration = Duration::from_millis(50);
+/// Auch wer stillsteht, meldet dem Server alle 20 Ticks erneut seine Position – siehe
+/// [`position_heartbeat`].
+const POSITION_REMINDER: Duration = Duration::from_millis(1000);
+/// Wie lange nach der Startposition höchstens auf den ersten Chunk-Stapel gewartet wird, bevor
+/// die Welt trotzdem als geladen gilt.
+///
+/// Der Vanilla-Client wartet unbegrenzt (er zeigt „Welt wird geladen"). Ein Server, der gar keine
+/// Chunks schickt – Limbo-Warteschlangen mancher Netzwerke tun das – ließe den Client damit
+/// dauerhaft stumm: kein Chat, kein `--cmd`, keine Regel. Deshalb hier eine Notbremse.
+const WORLD_LOAD_GRACE: Duration = Duration::from_secs(3);
+/// So lange darf eine getippte Spielaktion auf das Ende der Ladephase warten – siehe
+/// [`Shared::await_gameplay`]. Bewusst etwas mehr als [`WORLD_LOAD_GRACE`]: dann greift in
+/// jedem Fall zuerst die Notbremse, und die Aktion geht doch noch raus.
+#[cfg(any(feature = "state", feature = "menu", feature = "movement"))]
+pub(crate) const GAMEPLAY_WAIT: Duration = Duration::from_secs(4);
+/// Der von Vanilla für die Client-Kennung definierte Payload-Kanal.
+const BRAND_CHANNEL: &str = "minecraft:brand";
+const BRAND_PREFIX: &str = "example.invalid";
 
 /// So viele Zeilen dürfen höchstens warten. Mehr kann bei einem Mindestabstand von einer
 /// Sekunde ohnehin niemand sinnvoll abarbeiten; ohne Grenze könnte eine dauerfeuernde
@@ -58,6 +79,78 @@ struct Queue {
 
 /// Spielerposition: x, y, z, Gierwinkel, Neigung.
 pub type Position = (f64, f64, f64, f32, f32);
+
+/// Nachbau von `ChunkBatchSizeCalculator` aus dem Vanilla-Client.
+///
+/// Der Server schickt Chunks nicht am Stück, sondern in Stapeln, und wartet nach jedem Stapel auf
+/// eine Rückmeldung: `ServerboundChunkBatchReceived` mit der Zahl der Chunks, die der Client je
+/// Tick verkraftet. Bleibt sie aus, zählt der `PlayerChunkSender` des Servers die offenen Stapel
+/// hoch und **stellt die Chunk-Auslieferung ein**, sobald zehn unbestätigt sind. Genau das ist hier
+/// vorher passiert: nach dem ersten Stapel kam nichts mehr.
+///
+/// Die Rechnung ist die des Originals, damit auch der gemeldete Wert derselbe ist: gemessene
+/// Nanosekunden je Chunk, auf ein Drittel bis Dreifaches des bisherigen Mittels begrenzt, dann
+/// gleitend gemittelt (das alte Mittel wiegt bis zu 49-fach). Der gewünschte Durchsatz ist das
+/// Verhältnis eines Zeitbudgets von 7 ms zu diesem Mittel.
+struct ChunkBatch {
+    /// Zeitpunkt des `ChunkBatchStart`; `None`, solange kein Stapel offen ist.
+    started: Option<Instant>,
+    nanos_per_chunk: f64,
+    /// Gewicht des bisherigen Mittels, wächst bis [`ChunkBatch::MAX_OLD_SAMPLES`].
+    old_samples: f64,
+}
+
+impl ChunkBatch {
+    /// Startannahme des Originals: 2 ms je Chunk – also anfangs 3,5 Chunks je Tick.
+    const INITIAL_NANOS_PER_CHUNK: f64 = 2_000_000.0;
+    const MAX_OLD_SAMPLES: f64 = 49.0;
+    /// Ein einzelner Stapel darf das Mittel höchstens um den Faktor drei ziehen.
+    const CLAMP: f64 = 3.0;
+    /// Zeitbudget je Tick, das der Vanilla-Client fürs Einlesen von Chunks veranschlagt.
+    const TICK_BUDGET_NANOS: f64 = 7_000_000.0;
+
+    fn new() -> ChunkBatch {
+        ChunkBatch {
+            started: None,
+            nanos_per_chunk: ChunkBatch::INITIAL_NANOS_PER_CHUNK,
+            old_samples: 1.0,
+        }
+    }
+
+    fn start(&mut self) {
+        self.started = Some(Instant::now());
+    }
+
+    /// Stapel abgeschlossen. Ohne vorangegangenes `ChunkBatchStart` bleibt die Schätzung stehen –
+    /// aus einem Zeitstempel von irgendwann vorhin ließe sich nichts Sinnvolles ableiten.
+    fn finish(&mut self, size: i32) {
+        let Some(started) = self.started.take() else {
+            return;
+        };
+        if size <= 0 {
+            return;
+        }
+        let measured = started.elapsed().as_nanos() as f64 / size as f64;
+        let bounded = measured.clamp(
+            self.nanos_per_chunk / ChunkBatch::CLAMP,
+            self.nanos_per_chunk * ChunkBatch::CLAMP,
+        );
+        self.nanos_per_chunk =
+            (self.nanos_per_chunk * self.old_samples + bounded) / (self.old_samples + 1.0);
+        self.old_samples = (self.old_samples + 1.0).min(ChunkBatch::MAX_OLD_SAMPLES);
+    }
+
+    /// Gewünschte Chunks je Tick. Die Grenzen sind die, die der Server ohnehin anlegt; sie stehen
+    /// hier, damit aus einer entarteten Messung kein `inf` aufs Kabel geht.
+    fn desired_chunks_per_tick(&self) -> f32 {
+        let desired = ChunkBatch::TICK_BUDGET_NANOS / self.nanos_per_chunk;
+        if desired.is_finite() {
+            (desired as f32).clamp(0.01, 64.0)
+        } else {
+            (ChunkBatch::TICK_BUDGET_NANOS / ChunkBatch::INITIAL_NANOS_PER_CHUNK) as f32
+        }
+    }
+}
 
 pub struct Shared {
     pub(crate) console: Console,
@@ -80,6 +173,27 @@ pub struct Shared {
     /// Zuletzt bekannte eigene Position; `None`, solange der Server noch keine geschickt hat.
     /// Der Netz-Thread schreibt sie bei jedem Teleport, der Bewegungs-Thread bei jedem Schritt.
     position: Mutex<Option<Position>>,
+    /// Der erste Teleport ist nicht nur gelesen, sondern bereits bestätigt und gespiegelt.
+    /// Trennt diese kurze Phase von `in_game`, das schon mit dem Login-Paket wahr wird.
+    position_ready: AtomicBool,
+    /// Bei modernen Protokollen ist auch der erste Chunk-Stapel vollständig empfangen und mit
+    /// `PlayerLoaded` abgeschlossen. 1.21.1 kennt dieses Signal noch nicht.
+    world_loaded: AtomicBool,
+    /// Seit dem letzten Weltbeitritt kam mindestens ein vollständiger Chunk-Stapel an.
+    chunk_batch_done: AtomicBool,
+    /// `PlayerLoaded` wurde für diesen Weltbeitritt bereits gesendet – der Netz- und der
+    /// Tick-Thread bewerben sich beide darum, senden darf genau einer.
+    player_loaded_sent: AtomicBool,
+    /// Beginn der laufenden Weltladephase (ms seit [`Shared::started`]); daran hängt die
+    /// Notbremse [`WORLD_LOAD_GRACE`].
+    world_load_since: AtomicU64,
+    /// Wann zuletzt ein Positionspaket hinausging (ms seit [`Shared::started`]). Der Vanilla-Client
+    /// zählt dafür Ticks („positionReminder"); eine Uhr trifft dasselbe und übersteht einen
+    /// Standby des Rechners besser.
+    last_position_sent: AtomicU64,
+    /// Bezugspunkt aller Millisekundenstempel oben. Ein `Instant` ist monoton – anders als die
+    /// Systemuhr kann er nicht rückwärts springen.
+    started: Instant,
 
     /// Gesteuerte Bewegung (`:go`, `:look`, `:home`) – nur im Build mit `--features movement`.
     #[cfg(feature = "movement")]
@@ -107,6 +221,10 @@ pub struct Shared {
     pub(crate) entity_id: std::sync::atomic::AtomicI32,
 
     pub(crate) in_game: AtomicBool,
+    /// Diese Verbindung hat es bis in die Spielphase geschafft. Setzt den Reconnect-Backoff
+    /// zurück: Wer eine Stunde drin war und dann fliegt, soll wieder nach der kurzen Grundzeit
+    /// wiederkommen und nicht mit der langen Wartezeit von vorhin.
+    reached_game: AtomicBool,
     /// Solange `true`, arbeiten Netz-, Sende- und Bewegungs-Threads weiter.
     pub(crate) running: AtomicBool,
     /// Trennung wurde von uns ausgelöst (Server-Transfer) -> ohne Backoff neu verbinden.
@@ -145,6 +263,13 @@ impl Client {
             rules,
             idle: (Mutex::new(()), Condvar::new()),
             position: Mutex::new(None),
+            position_ready: AtomicBool::new(false),
+            world_loaded: AtomicBool::new(false),
+            chunk_batch_done: AtomicBool::new(false),
+            player_loaded_sent: AtomicBool::new(false),
+            world_load_since: AtomicU64::new(0),
+            last_position_sent: AtomicU64::new(0),
+            started: Instant::now(),
             #[cfg(feature = "movement")]
             mover: crate::movement::Mover::new(),
             #[cfg(feature = "extras")]
@@ -153,6 +278,7 @@ impl Client {
             entity_id: std::sync::atomic::AtomicI32::new(0),
             options,
             in_game: AtomicBool::new(false),
+            reached_game: AtomicBool::new(false),
             running: AtomicBool::new(true),
             intentional: AtomicBool::new(false),
             generation: AtomicU32::new(0),
@@ -161,7 +287,13 @@ impl Client {
         });
 
         #[cfg(feature = "pov")]
-        crate::pov::start_web(&shared);
+        {
+            // Erst den Viewer öffnen, dann die Ressourcen holen: Der Browser zeigt dadurch sofort
+            // eine Seite und darauf, was gerade geladen wird, statt bis dahin gar nicht zu
+            // antworten.
+            crate::pov::start_web(&shared);
+            crate::pov::start_assets(&shared);
+        }
 
         for (name, task) in [("afk-net", true), ("afk-sender", false)] {
             let owned = Arc::clone(&shared);
@@ -188,12 +320,16 @@ impl Client {
     }
 
     /// Nachricht oder Befehl in die rate-limitierte Warteschlange stellen.
+    ///
+    /// Auch dann, wenn der Beitritt noch läuft: Der Sender-Thread wartet ohnehin auf die
+    /// Spielphase, bevor er eine Zeile hinausschickt. Sie hier wegzuwerfen hieße, dass ein Panel,
+    /// das den Client startet und sofort eine Zeile schreibt, sie verliert – und zwar abhängig
+    /// davon, wer von beiden gerade schneller war.
     pub fn send_chat(&self, input: &str) {
-        if !self.shared.in_game.load(Ordering::Relaxed) {
+        if !self.shared.ready_for_gameplay() {
             self.shared
                 .console
-                .error("Nicht verbunden – Nachricht nicht gesendet.");
-            return;
+                .info("Noch nicht im Spiel – die Zeile geht raus, sobald der Beitritt steht.");
         }
         if !self.shared.queue.push(input.to_string()) {
             self.shared
@@ -250,7 +386,7 @@ impl Client {
         for line in [
             ":go vor|zurück|links|rechts [blöcke]   laufen (Richtung relativ zum Blick)",
             ":look <gier> [neigung] · nord|ost|…    Kopf drehen",
-            ":jump [richtung]  ·  :fall             springen · fallen lassen",
+            ":jump [richtung]                      springen",
             ":home set|on|off|go|delay|speed        Heimatposition",
             ":route rec|stop|add|del|go|clear       Wegpunkte zur Heimatposition",
             ":stop                                  Bewegung abbrechen",
@@ -303,6 +439,17 @@ impl Shared {
         }
     }
 
+    /// Leeres Paket ohne kurzlebigen Paketpuffer senden (Tick-Ende und Player-Loaded).
+    fn send_empty(&self, packet_id: i32) {
+        let mut guard = self.writer.lock().unwrap();
+        if let Some(writer) = guard.as_mut() {
+            if writer.send_empty(packet_id).is_err() {
+                writer.shutdown();
+                *guard = None;
+            }
+        }
+    }
+
     /// Letztes Klartextpaket senden und im selben Zug auf Verschlüsselung umschalten.
     ///
     /// Beides muss unter **einer** Sperre passieren. Zwischen zwei getrennten Aufrufen könnte ein
@@ -331,8 +478,137 @@ impl Shared {
         *self.position.lock().unwrap()
     }
 
+    /// Spielpakete mit einer Spieleraktion sind erst sinnvoll, wenn Login **und** der erste
+    /// autoritative Positionsteleport verarbeitet wurden.
+    pub(crate) fn ready_for_gameplay(&self) -> bool {
+        self.in_game.load(Ordering::Relaxed)
+            && self.position_ready.load(Ordering::SeqCst)
+            && self.world_loaded.load(Ordering::SeqCst)
+    }
+
+    /// Warten, bis Spielaktionen möglich sind – aber nur, wenn wir überhaupt schon im Spiel sind.
+    ///
+    /// Zwischen „Server hat uns abgesetzt" und „Umgebung ist da" liegen auf einem echten Server
+    /// ein paar Dutzend Millisekunden. Eine in genau diesem Fenster getippte Aktion mit einer
+    /// Fehlermeldung wegzuwerfen, ist für den, der sie getippt hat, nicht zu unterscheiden von
+    /// „geht nicht" – deshalb wird die kurze Ladezeit hier abgewartet.
+    ///
+    /// Wer dagegen noch gar nicht im Spiel ist (Login, Konfigurationsphase), bekommt weiterhin
+    /// sofort eine Absage: Da ist nichts, worauf sich zu warten lohnte.
+    ///
+    /// Nur Bauformen mit örtlichen Spielaktionen rufen das auf; der schlanke Client stellt seine
+    /// Chat-Zeilen einfach in die Warteschlange, und die wartet ohnehin.
+    #[cfg(any(feature = "state", feature = "menu", feature = "movement"))]
+    pub(crate) fn await_gameplay(&self, timeout: Duration) -> bool {
+        if self.ready_for_gameplay() {
+            return true;
+        }
+        if !self.in_game.load(Ordering::SeqCst) {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.idle.0.lock().unwrap();
+        loop {
+            if self.ready_for_gameplay() {
+                return true;
+            }
+            if !self.in_game.load(Ordering::SeqCst) || !self.running.load(Ordering::Relaxed) {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            // Der Weckruf kommt aus dem Netz-Thread; die Obergrenze ist nur die Rückfallebene,
+            // falls er genau zwischen Prüfung und Warten fällt.
+            let (next, _) = self
+                .idle
+                .1
+                .wait_timeout(guard, left.min(Duration::from_millis(50)))
+                .unwrap();
+            guard = next;
+        }
+    }
+
+    /// Auf den ersten autoritativen Positionsteleport dieser Verbindung warten.
+    ///
+    /// Das ist eine Zustandswartezeit, kein Polling: Der Netz-Thread weckt sie nach dem
+    /// bestätigten Teleport oder beim Verbindungsende. So gelangen keine Benutzeraktionen in
+    /// die kurze Phase zwischen Spiel-Login und der vom Server gesetzten Startposition.
+    fn wait_for_gameplay(&self, generation: u32) -> bool {
+        let mut guard = self.idle.0.lock().unwrap();
+        loop {
+            if !self.valid(generation) {
+                return false;
+            }
+            if self.ready_for_gameplay() {
+                return true;
+            }
+            guard = self.idle.1.wait(guard).unwrap();
+        }
+    }
+
     pub(crate) fn set_position(&self, position: Position) {
         *self.position.lock().unwrap() = Some(position);
+    }
+
+    /// Millisekunden seit dem Programmstart – Bezugspunkt der Zeitstempel in [`Shared`].
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Eine neue Welt beginnt: Beitritt, Respawn/Weltwechsel oder Rückkehr aus der
+    /// Konfigurationsphase. Danach ist die Welt wieder „am Laden", und die Notbremse
+    /// [`WORLD_LOAD_GRACE`] zählt von vorn.
+    ///
+    /// `forget_position` sagt, ob auch die bestätigte Startposition verfällt. Das darf nur, wo
+    /// **sicher** eine neue kommt – nach einem Login also, denn dort schickt der Server sie
+    /// unmittelbar hinterher. Bei einem Respawn bleibt sie stehen: Ein Plugin, das ein
+    /// Respawn-Paket ohne Teleport schickt, ließe den Client sonst dauerhaft stumm, weil die
+    /// Spielphase nie wieder erreicht würde.
+    fn restart_world_load(&self, forget_position: bool) {
+        if forget_position {
+            self.position_ready.store(false, Ordering::SeqCst);
+        }
+        self.world_loaded.store(false, Ordering::SeqCst);
+        self.chunk_batch_done.store(false, Ordering::SeqCst);
+        self.player_loaded_sent.store(false, Ordering::SeqCst);
+        self.world_load_since
+            .store(self.elapsed_ms(), Ordering::SeqCst);
+    }
+
+    /// Wartet die Welt schon länger als [`WORLD_LOAD_GRACE`] auf ihren ersten Chunk-Stapel?
+    fn world_load_overdue(&self) -> bool {
+        let since = self.world_load_since.load(Ordering::SeqCst);
+        self.elapsed_ms().saturating_sub(since) >= WORLD_LOAD_GRACE.as_millis() as u64
+    }
+
+    /// Ein Positionspaket ist hinausgegangen – der Erinnerungstakt beginnt von vorn.
+    /// Wird auch von [`crate::movement`] aufgerufen, damit eine laufende Bewegung und der
+    /// Erinnerungstakt nicht abwechselnd dasselbe senden.
+    pub(crate) fn mark_position_sent(&self) {
+        self.last_position_sent
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    /// Ist der Erinnerungstakt fällig? `false`, solange gerade erst etwas gesendet wurde.
+    fn position_reminder_due(&self) -> bool {
+        let last = self.last_position_sent.load(Ordering::Relaxed);
+        self.elapsed_ms().saturating_sub(last) >= POSITION_REMINDER.as_millis() as u64
+    }
+
+    /// Nur die Blickrichtung im lokalen Zustand ändern. Ein Rotationspaket trägt absichtlich
+    /// keine Koordinaten; deshalb darf eine gleichzeitig laufende Bewegung hier nicht durch
+    /// einen zuvor gelesenen Positions-Snapshot zurückgesetzt werden.
+    #[cfg(feature = "movement")]
+    pub(crate) fn set_rotation(&self, yaw: f32, pitch: f32) -> bool {
+        let mut position = self.position.lock().unwrap();
+        let Some(current) = position.as_mut() else {
+            return false;
+        };
+        current.3 = yaw;
+        current.4 = pitch;
+        true
     }
 
     /// Chat-/Serverzeile anzeigen – und, falls es Chat-Regeln gibt, gegen sie halten.
@@ -437,8 +713,9 @@ fn sender_loop(shared: Arc<Shared>) {
             }
         };
 
-        if !shared.in_game.load(Ordering::Relaxed) {
-            continue; // gerade nicht verbunden: still verwerfen
+        let generation = shared.generation.load(Ordering::SeqCst);
+        if !shared.wait_for_gameplay(generation) {
+            continue; // Verbindung endete, bevor die Startposition bestätigt war
         }
 
         // Erst säubern, dann senden: sonst könnte eine Nachricht wegfallen, deren
@@ -446,7 +723,10 @@ fn sender_loop(shared: Arc<Shared>) {
         let Some(outgoing) = prepare(&input) else {
             continue;
         };
-        if !sleep_until(&shared, next_allowed) || !shared.in_game.load(Ordering::Relaxed) {
+        if !sleep_until(&shared, next_allowed)
+            || shared.generation.load(Ordering::SeqCst) != generation
+            || !shared.ready_for_gameplay()
+        {
             continue;
         }
         match outgoing {
@@ -560,12 +840,15 @@ fn net_loop(shared: Arc<Shared>) {
     // Ein Server, der uns im Kreis weiterreicht, darf keine Endlosschleife auf voller Last
     // erzeugen: je Transfer in Folge wird ein Stück länger gewartet.
     let mut transfers: u32 = 0;
+    // Fehlversuche *in Folge* – ein erreichtes Spiel setzt sie zurück.
+    let mut attempts: u32 = 0;
     while shared.running.load(Ordering::Relaxed) {
         let started = Instant::now();
         let result = run_connection(&shared);
         let lasted = started.elapsed();
 
         shared.in_game.store(false, Ordering::SeqCst);
+        shared.restart_world_load(true);
         shared.generation.fetch_add(1, Ordering::SeqCst);
         *shared.writer.lock().unwrap() = None;
         *shared.position.lock().unwrap() = None;
@@ -609,9 +892,49 @@ fn net_loop(shared: Arc<Shared>) {
             }
             continue;
         }
-        shared
-            .console
-            .info("Verbindung beendet – kein automatischer Reconnect.");
+        if let Some(policy) = shared.options.reconnect {
+            // Eine Verbindung, die es bis ins Spiel geschafft hat, war keine Fehlkonfiguration:
+            // Sie fängt wieder bei der Grundwartezeit an. Nur *aufeinanderfolgende* Fehlversuche
+            // verlängern die Wartezeit, sonst stünde nach einem Tag Laufzeit die Obergrenze auch
+            // hinter einem einzelnen Wackler.
+            if shared.reached_game.swap(false, Ordering::SeqCst) {
+                attempts = 0;
+            }
+            attempts = attempts.saturating_add(1);
+            if policy.attempts != 0 && attempts > policy.attempts {
+                shared.console.error(&format!(
+                    "Nach {} Versuchen keine Verbindung – beende.",
+                    policy.attempts
+                ));
+            } else {
+                // Ein Kick ist das Ende der Sitzung: Die Cookies gehören zu ihr und dürfen nicht
+                // in die nächste hinüberlaufen. Nur der Transfer oben behält sie – genau dafür
+                // gibt es sie. Der Java-Client trennt beides seit jeher an derselben Stelle.
+                shared.cookies.lock().unwrap().clear();
+                let wait = backoff(&policy, attempts);
+                shared.console.warn(&format!(
+                    "Neuer Verbindungsversuch {} in {} s.",
+                    attempts,
+                    wait.as_secs()
+                ));
+                shared.console.event(
+                    "reconnect",
+                    &format!("versuch={} in={}", attempts, wait.as_secs()),
+                );
+                // Unterbrechbar warten: Ein Programmende soll nicht bis zu einer Minute lang in
+                // einem Schlaf hängen, den niemand mehr braucht.
+                let generation = shared.generation.load(Ordering::SeqCst);
+                if shared.wait(wait, generation) {
+                    continue;
+                }
+                // `wait` sagt „nein“ nur beim Programmende – dann fällt der Ablauf unten durch
+                // und beendet den Prozess wie ohne Reconnect.
+            }
+        } else {
+            shared
+                .console
+                .info("Verbindung beendet – kein automatischer Reconnect.");
+        }
         shared.running.store(false, Ordering::SeqCst);
         shared.queue.signal.notify_all();
         shared.wake();
@@ -626,6 +949,22 @@ fn net_loop(shared: Arc<Shared>) {
         shared.console.flush(Duration::from_secs(2));
         std::process::exit(1);
     }
+}
+
+/// Wartezeit vor dem `attempt`-ten Versuch in Folge: die Grundzeit, je vorangegangenem
+/// Fehlversuch verdoppelt und auf die Obergrenze gedeckelt – dieselbe Rechnung wie im
+/// Java-Client, damit ein Panel beiden dasselbe zutraut.
+///
+/// Der Schiebeschritt ist gedeckelt und die Multiplikation sättigend: Sonst wäre schon der
+/// 64. Fehlversuch in Folge ein Überlauf, und aus einer Minute Wartezeit würde ein Sekundentakt
+/// gegen einen Server, der ohnehin gerade nicht kann.
+fn backoff(policy: &crate::options::Reconnect, attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(32);
+    let seconds = policy
+        .delay_seconds
+        .saturating_mul(1u64 << doublings)
+        .min(policy.max_backoff_seconds);
+    Duration::from_secs(seconds)
 }
 
 fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
@@ -661,6 +1000,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     let (mut reader, writer) =
         conn::connect(&real_host, real_port, proxy).map_err(|e| e.to_string())?;
     *shared.writer.lock().unwrap() = Some(writer);
+    start_client_ticks(shared)?;
     // Cookies werden hier bewusst **nicht** geleert.
     //
     // Genau dafür gibt es sie: Server A legt eines ab, schickt einen Transfer, und Server B
@@ -702,6 +1042,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         state: State::Login,
         joined: false,
         dead: false,
+        chunk_batch: ChunkBatch::new(),
         last_signature: None,
     };
 
@@ -735,12 +1076,95 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     }
 }
 
+/// Der Client-Tick: derselbe 50-ms-Takt, in dem auch ein echter Client arbeitet.
+///
+/// Drei Aufgaben, alle unmittelbar dem Vanilla-Client abgeschaut:
+/// * **Tick-Ende** – ab 1.21.2 schließt jeder Tick mit einem leeren Paket ab. Das ist kein
+///   KeepAlive-Ersatz, sondern die Protokollgrenze für die in diesem Tick empfangenen Eingaben.
+/// * **Positionserinnerung** – auch wer stillsteht, meldet alle 20 Ticks erneut seine Position
+///   (siehe [`position_heartbeat`]).
+/// * **Notbremse der Ladephase** – falls der Server nie einen Chunk-Stapel schickt.
+///
+/// Der Thread lebt genau eine TCP-Verbindung lang (erkannt an der Generation) und taktet gegen
+/// einen **festen Termin**. Vorher wurde nach jeder Runde volle 50 ms gewartet: der Takt lief
+/// dadurch dauerhaft langsamer als 20 Hz, und zwar genau um die Arbeitszeit je Runde.
+/// Verpasste Ticks werden nicht nachgeholt – nach einem Standby zwanzig Pakete auf einmal
+/// nachzuschieben, täte kein echter Client.
+fn start_client_ticks(shared: &Arc<Shared>) -> Result<(), String> {
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let owned = Arc::clone(shared);
+    thread::Builder::new()
+        .name("afk-client-tick".into())
+        .spawn(move || {
+            let mut next = Instant::now() + CLIENT_TICK;
+            loop {
+                if !owned.wait(next.saturating_duration_since(Instant::now()), generation) {
+                    return;
+                }
+                let now = Instant::now();
+                next = if next + CLIENT_TICK > now {
+                    next + CLIENT_TICK
+                } else {
+                    now + CLIENT_TICK // hinterher: Takt neu aufsetzen statt aufholen
+                };
+                client_tick(&owned);
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("Client-Tick-Thread liess sich nicht starten: {}", e))
+}
+
+/// Eine Runde des Client-Ticks.
+fn client_tick(shared: &Arc<Shared>) {
+    // Die Notbremse zuerst: ohne sie käme der Client auf einem Server ohne Chunks nie in die
+    // Spielphase, und die beiden Pakete darunter gingen nie hinaus.
+    finish_world_load(shared);
+    if !shared.ready_for_gameplay() {
+        return;
+    }
+    position_heartbeat(shared);
+    if shared.proto.game.sb_client_tick_end >= 0 {
+        shared.send_empty(shared.proto.game.sb_client_tick_end);
+    }
+}
+
+/// Die Positionsmeldung eines stillstehenden Spielers.
+///
+/// `LocalPlayer.sendPosition()` prüft in jedem Tick, ob sich Position oder Blickrichtung geändert
+/// haben – und sendet spätestens alle 20 Ticks trotzdem, auch wenn sich nichts geändert hat. Ein
+/// Client, der nach dem Beitritt **überhaupt kein** Positionspaket mehr schickt, sieht auf dem
+/// Server anders aus als jeder echte Spieler; manche Anticheats stören sich daran, und der
+/// Leerlaufzähler des Servers sieht ihn ebenfalls nie.
+///
+/// Läuft gerade eine ausdrückliche Bewegung (`:go`, `:home`), hält der Takt sich heraus: die
+/// sendet ihre eigenen Pakete und meldet das über [`Shared::mark_position_sent`].
+fn position_heartbeat(shared: &Arc<Shared>) {
+    if !shared.position_reminder_due() {
+        return;
+    }
+    let Some((x, y, z, _, _)) = shared.position() else {
+        return;
+    };
+    // Genau wie im Original: unveränderte Blickrichtung heißt das kurze Pos-Paket, nicht PosRot.
+    let mut w = Writer::packet(shared.proto.game.sb_move_player_pos);
+    w.f64(x);
+    w.f64(y);
+    w.f64(z);
+    // In 1.21.1 ein Bool, ab 1.21.4 ein Flag-Byte – 0x01 heißt in beiden „am Boden".
+    w.u8(0x01);
+    shared.send(w);
+    shared.mark_position_sent();
+}
+
 struct Session {
     state: State,
     /// Erstes Login-Paket dieser TCP-Verbindung = echter Beitritt zum Proxy. Jedes weitere ist
     /// nur ein Wechsel zwischen Unterservern und zählt bewusst NICHT als neuer Beitritt.
     joined: bool,
     dead: bool,
+    /// Durchsatzschätzung für die Chunk-Stapel. Sie gehört dem Netz-Thread allein – nur er liest
+    /// Pakete, und nur aus ihnen speist sie sich.
+    chunk_batch: ChunkBatch,
     /// Signatur der letzten gezählten Nachricht. Der Server zählt zwei gleiche Signaturen
     /// direkt hintereinander nur einmal – der Vanilla-Client macht es genauso.
     last_signature: Option<Box<[u8; 256]>>,
@@ -904,6 +1328,14 @@ fn handle_game(
             w.i32(ping);
             shared.send(w);
         }
+        // Chunk-Flusskontrolle. Sie steht bewusst hier und nicht in einer Ausbaustufe: auch der
+        // schlanke Client, der keinen einzigen Chunk liest, muss den Stapel bestätigen – sonst
+        // hört der Server auf zu senden und wartet auf eine Antwort, die nie kommt.
+        In::ChunkBatchStart => session.chunk_batch.start(),
+        In::ChunkBatchFinished => {
+            let size = r.var_int().map_err(|e| e.to_string())?;
+            acknowledge_chunk_batch(shared, session, size);
+        }
         In::Login => {
             // Erstes Feld ist die eigene Entitäts-Nummer. Der schlanke Client braucht sie nicht,
             // das Schleich-Paket von 1.21.1 und die POV-Ansicht dagegen schon.
@@ -929,6 +1361,11 @@ fn handle_game(
         In::Respawn => {
             #[cfg(feature = "pov")]
             crate::pov::respawn(shared, r);
+            // Ein Respawn setzt die Welt neu auf – der Server schickt gleich einen neuen
+            // Chunk-Stapel. Der Vanilla-Client durchläuft die Ladephase deshalb ein zweites Mal
+            // und meldet danach erneut `PlayerLoaded`. Die bestätigte Position bleibt dabei
+            // stehen (siehe [`Shared::restart_world_load`]).
+            shared.restart_world_load(false);
             if !session.dead {
                 shared.console.info("Welt gewechselt.");
                 shared.trigger(Event::World, "");
@@ -982,6 +1419,7 @@ fn handle_game(
         In::StartConfiguration => {
             // Der Server holt uns zurück in die Konfigurationsphase (z. B. Ressourcen-Neuladen).
             shared.in_game.store(false, Ordering::SeqCst);
+            shared.restart_world_load(true);
             // Wir verlassen die Welt: die alte Position gilt nicht mehr, und alles, was sich
             // darauf stützt (Bewegung, Live-Ansicht), soll das sofort merken.
             *shared.position.lock().unwrap() = None;
@@ -1011,18 +1449,24 @@ fn handle_game(
 /// Beitritt zum (Velocity/BungeeCord-)Proxy. Nur dann starten die Befehle.
 fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     shared.in_game.store(true, Ordering::SeqCst);
+    shared.reached_game.store(true, Ordering::SeqCst);
     // Der Server beginnt mit einer frischen Quittungsliste – unser Zähler muss mit.
     shared.unacked.store(0, Ordering::Relaxed);
     shared.queue.clear();
     // Die alte Position gilt nicht mehr: der Server setzt uns gleich neu ab (auch bei einem
     // Unterserver-Wechsel, dort ist es sogar eine andere Welt).
     *shared.position.lock().unwrap() = None;
+    shared.restart_world_load(true);
     session.dead = false;
     session.last_signature = None;
 
     shared.send(client_information(
         shared,
         shared.proto.game.sb_client_information,
+    ));
+    shared.send(client_brand(
+        shared.proto.game.sb_custom_payload,
+        shared.proto.name,
     ));
 
     if first_join {
@@ -1062,6 +1506,11 @@ fn start_commands(shared: &Arc<Shared>) {
     thread::Builder::new()
         .name("afk-cmds".into())
         .spawn(move || {
+            // Erst nach der Startposition beginnen: ein Null-Delay-Befehl darf nicht zwischen
+            // Spiel-Login und Teleport in einem noch unvollständigen Weltzustand landen.
+            if !shared.wait_for_gameplay(generation) {
+                return;
+            }
             let list = &shared.options.commands;
             let start = Instant::now();
             // Nächster Termin je Eintrag, gemessen ab dem Beitritt. `None` = erledigt.
@@ -1084,11 +1533,12 @@ fn start_commands(shared: &Arc<Shared>) {
                 if !shared.wait(at.saturating_sub(start.elapsed()), generation) {
                     return;
                 }
-                // Serverwechsel o. Ä.: kurz warten, statt ins Leere zu senden.
-                if !shared.in_game.load(Ordering::Relaxed) {
-                    if !shared.wait(Duration::from_secs(2), generation) {
-                        return;
-                    }
+                // Ein Konfigurationswechsel kann die Spielphase kurz verlassen. Erst mit der
+                // neuen Startposition darf ein fälliger Befehl wieder in die Sendewarteschlange.
+                if !shared.wait_for_gameplay(generation) {
+                    return;
+                }
+                if shared.generation.load(Ordering::SeqCst) != generation {
                     continue;
                 }
 
@@ -1121,6 +1571,8 @@ fn start_commands(shared: &Arc<Shared>) {
 /// Teleport-Nummer hinten, heute umgekehrt und mit Bewegungsvektor dazwischen. Die Bedeutung der
 /// „relativ"-Bits ist in beiden gleich (0=x, 1=y, 2=z, 3=Gierwinkel, 4=Neigung).
 fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
+    // Während Bestätigung und Rückspiegelung darf kein Tick-/Aktions-Thread dazwischenfunken.
+    shared.position_ready.store(false, Ordering::SeqCst);
     let err = |e: io::Error| e.to_string();
 
     let (id, x, y, z, yaw, pitch, flags) = if shared.proto.modern {
@@ -1149,7 +1601,17 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         (r.var_int().map_err(err)?, x, y, z, yaw, pitch, flags)
     };
 
-    let previous = shared.position().unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
+    let previous_position = shared.position();
+    // Die erste Position setzt uns nur in die Welt. Jeder spätere Teleport ist dagegen eine
+    // autoritative Servervorgabe (Korrektur, Plugin-Teleport, Portal): eine laufende lokale
+    // Bewegung darf danach nicht weiter ihre alte Absicht gegen den Server durchsetzen.
+    #[cfg(feature = "movement")]
+    if previous_position.is_some() && shared.mover.stop() {
+        shared
+            .console
+            .warn("Server hat die Position vorgegeben – laufende Bewegung gestoppt.");
+    }
+    let previous = previous_position.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
     let relative = |bit: i32, old: f64, value: f64| -> f64 {
         if flags & (1 << bit) != 0 {
             old + value
@@ -1185,6 +1647,14 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     move_packet.f32(new.4);
     move_packet.u8(0x01);
     shared.send(move_packet);
+    shared.mark_position_sent();
+    shared.position_ready.store(true, Ordering::SeqCst);
+    shared.wake();
+    // Mit der Startposition kann die Ladephase enden – in 1.21.1 sofort, ab 1.21.4, sobald auch
+    // der erste Chunk-Stapel da ist (den kann der Server schon vorher geschickt haben).
+    finish_world_load(shared);
+    #[cfg(feature = "extras")]
+    crate::extras::on_position(shared, previous_position.is_none());
     Ok(())
 }
 
@@ -1327,6 +1797,62 @@ fn parse_chat_body(format: nbt::Fmt, r: &mut Reader) -> Option<String> {
     Some(format!("<{}> {}", nbt::render(&name, format), body))
 }
 
+// ===================== Weltladephase =====================
+
+/// Den Weltbeitritt abschließen, sobald beides steht: die vom Server gesetzte Startposition und
+/// die Welt um uns herum.
+///
+/// Ab 1.21.4 gehört dazu ein `ServerboundPlayerLoaded`. Der Server hält den Spieler bis dahin in
+/// einem geschützten Zustand (kein Schaden, keine Partikel) und setzt ihn erst nach 30 Sekunden
+/// von sich aus frei – wer das Paket nie schickt, hängt also eine halbe Minute in der Schwebe.
+/// 1.21.1 kennt das Paket noch nicht; dort ist die Welt mit der Startposition fertig.
+///
+/// Aufgerufen von beiden Seiten, die den Zustand ändern können: vom Netz-Thread (Position,
+/// Chunk-Stapel) und vom Tick-Thread (Notbremse). Gesendet wird trotzdem genau einmal.
+fn finish_world_load(shared: &Arc<Shared>) {
+    if shared.world_loaded.load(Ordering::SeqCst) {
+        return;
+    }
+    if !shared.in_game.load(Ordering::SeqCst) || !shared.position_ready.load(Ordering::SeqCst) {
+        return;
+    }
+    let packet = shared.proto.game.sb_player_loaded;
+    if packet >= 0
+        && !shared.chunk_batch_done.load(Ordering::SeqCst)
+        && !shared.world_load_overdue()
+    {
+        return;
+    }
+    // Erst den Zuschlag holen, dann senden: sonst schickten Netz- und Tick-Thread das Paket
+    // beide, und der Server bekäme zweimal dieselbe Meldung.
+    if shared
+        .player_loaded_sent
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    if packet >= 0 {
+        shared.send_empty(packet);
+    }
+    // Erst jetzt gilt die Welt als geladen – vorher dürfte eine Nachricht vor dem `PlayerLoaded`
+    // hinausgehen, und das ist keine Reihenfolge, die ein echter Client je erzeugt.
+    shared.world_loaded.store(true, Ordering::SeqCst);
+    shared.wake();
+}
+
+/// Chunk-Stapel bestätigen. Das ist Flusskontrolle des Servers, keine POV-Funktion: ohne diese
+/// Antwort hört der `PlayerChunkSender` nach zehn offenen Stapeln auf, überhaupt noch Chunks zu
+/// schicken – siehe [`ChunkBatch`].
+fn acknowledge_chunk_batch(shared: &Arc<Shared>, session: &mut Session, size: i32) {
+    session.chunk_batch.finish(size);
+    let mut w = Writer::packet(shared.proto.game.sb_chunk_batch_received);
+    w.f32(session.chunk_batch.desired_chunks_per_tick());
+    shared.send(w);
+    shared.chunk_batch_done.store(true, Ordering::SeqCst);
+    finish_world_load(shared);
+}
+
 /// Empfangene Chat-Nachrichten regelmäßig quittieren (sonst kickt der Server irgendwann).
 fn maybe_acknowledge(shared: &Arc<Shared>) {
     if shared.unacked.load(Ordering::Relaxed) >= ACK_THRESHOLD {
@@ -1349,7 +1875,10 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
 /// allergrößte Teil dieses Verkehrs einfach weg. Siehe [`crate::options::DEFAULT_VIEW_DISTANCE`].
 fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     let mut w = Writer::packet(packet_id);
-    w.string("de_DE");
+    // Minecraft-Sprachkennungen sind durchgehend kleingeschrieben (`en_us`, `de_de`) – das sind
+    // die Namen der Sprachdateien im Client. Ein „de_DE" nach BCP-47-Art gibt es dort nicht und
+    // verrät damit auf den ersten Blick einen Fremdclient.
+    w.string("de_de");
     w.u8(shared.options.view_distance.clamp(2, 32));
     w.var_int(0); // ChatVisibility: FULL
     w.bool(true); // Chatfarben
@@ -1363,14 +1892,27 @@ fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     w
 }
 
-/// Resource-Pack NICHT laden, aber bestätigen -> kein Kick bei erzwungenem Pack.
+/// Vanilla-Client-Brand zum Spielbeitritt.
+///
+/// Das Paket besteht ausschließlich aus der Resource-Location des Common-Custom-Payloads und
+/// dessen String-Nutzlast. Es wird pro Spielbeitritt genau einmal direkt nach
+/// `ClientInformation` gesendet – auch bei einem Unterserver-Wechsel, bei dem der Server ein
+/// neues Login-Paket ausliefert.
+fn client_brand(packet_id: i32, mc_version: &str) -> Writer {
+    let mut w = Writer::packet(packet_id);
+    w.string(BRAND_CHANNEL);
+    w.string(&format!("{} {}", BRAND_PREFIX, mc_version));
+    w
+}
+
+/// Dieser schlanke Client kann keine Resource-Packs laden und meldet deshalb ehrlich
+/// `DECLINED`. `SUCCESSFULLY_LOADED` zu behaupten, ohne auch nur die Datei geladen zu haben,
+/// widerspricht dem Vanilla-Zustandsablauf und kann serverseitige Pack-Logik desynchronisieren.
 fn acknowledge_resource_pack(shared: &Arc<Shared>, packet_id: i32, pack: &[u8; 16]) {
-    for status in [pack_status::ACCEPTED, pack_status::SUCCESSFULLY_LOADED] {
-        let mut w = Writer::packet(packet_id);
-        w.uuid(pack);
-        w.var_int(status);
-        shared.send(w);
-    }
+    let mut w = Writer::packet(packet_id);
+    w.uuid(pack);
+    w.var_int(pack_status::DECLINED);
+    shared.send(w);
 }
 
 /// So viele Cookies hebt der Client je Verbindung auf, und so groß darf eines höchstens sein.
@@ -1473,6 +2015,42 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(delay: u64, max: u64) -> crate::options::Reconnect {
+        crate::options::Reconnect {
+            delay_seconds: delay,
+            max_backoff_seconds: max,
+            attempts: 0,
+        }
+    }
+
+    /// Die Wartezeit verdoppelt sich je Fehlversuch und bleibt dann an der Obergrenze stehen.
+    #[test]
+    fn backoff_verdoppelt_bis_zur_obergrenze() {
+        let p = policy(5, 60);
+        let seconds = |attempt| backoff(&p, attempt).as_secs();
+        assert_eq!(seconds(1), 5, "der erste Versuch wartet die Grundzeit");
+        assert_eq!(seconds(2), 10);
+        assert_eq!(seconds(3), 20);
+        assert_eq!(seconds(4), 40);
+        assert_eq!(seconds(5), 60, "ab hier deckelt die Obergrenze");
+        assert_eq!(seconds(6), 60);
+    }
+
+    /// Ohne Deckelung wäre der 64. Fehlversuch in Folge ein Schiebe-Überlauf – und aus einer
+    /// Minute Wartezeit würde ausgerechnet dann ein Sekundentakt, wenn ein Server lange weg ist.
+    #[test]
+    fn backoff_laeuft_auch_nach_sehr_vielen_versuchen_nicht_ueber() {
+        let p = policy(5, 60);
+        for attempt in [32u32, 33, 64, 1000, u32::MAX] {
+            assert_eq!(
+                backoff(&p, attempt).as_secs(),
+                60,
+                "Versuch {} muss an der Obergrenze bleiben",
+                attempt
+            );
+        }
+    }
 
     /// § und Steuerzeichen führen sonst zum Kick „illegal_chat_characters".
     #[test]
@@ -1706,6 +2284,8 @@ mod tests {
             let g = &p.game;
             #[allow(unused_mut)]
             let mut ids = vec![
+                g.cb_chunk_batch_finished,
+                g.cb_chunk_batch_start,
                 g.cb_cookie_request,
                 g.cb_disconnect,
                 g.cb_keep_alive,
@@ -1748,7 +2328,6 @@ mod tests {
                     e.cb_forget_level_chunk,
                     e.cb_block_update,
                     e.cb_section_blocks_update,
-                    e.cb_chunk_batch_finished,
                     e.cb_add_entity,
                     e.cb_remove_entities,
                     e.cb_move_entity_pos,
@@ -1762,6 +2341,135 @@ mod tests {
                 }
                 assert_ne!(p.incoming(*a), In::Ignored, "unbekannte ID in {}", p.name);
             }
+        }
+    }
+
+    #[test]
+    fn ausgehende_tick_und_bewegungs_ids_folgen_dem_codec() {
+        for protocol in crate::proto::PROTOCOLS {
+            let game = &protocol.game;
+            if protocol.modern {
+                assert_eq!(game.sb_client_tick_end, game.sb_client_command + 1);
+                assert_eq!(game.sb_client_information, game.sb_client_tick_end + 1);
+            } else {
+                assert_eq!(game.sb_client_tick_end, -1);
+            }
+            #[cfg(feature = "movement")]
+            {
+                assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_pos + 1);
+                assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos_rot + 1);
+            }
+            assert_eq!(game.sb_custom_payload, game.sb_cookie_response + 1);
+        }
+    }
+
+    /// Dieselbe Ableitung für das Lichtpaket: Nach Registry-Namen sortiert liegen zwischen
+    /// `level_chunk_with_light` und `login` genau `level_event`, `level_particles` und
+    /// `light_update`. Beide Beziehungen gelten in allen vier Tabellen – wäre eine der IDs
+    /// geraten, träfe höchstens eine davon zu.
+    #[cfg(feature = "pov")]
+    #[test]
+    fn licht_id_liegt_vor_dem_login() {
+        for protocol in crate::proto::PROTOCOLS {
+            assert_eq!(
+                protocol.extra.cb_light_update,
+                protocol.game.cb_login - 1,
+                "{}: light_update steht unmittelbar vor login",
+                protocol.name
+            );
+            assert_eq!(
+                protocol.extra.cb_light_update,
+                protocol.extra.cb_level_chunk + 3,
+                "{}: zwischen level_chunk_with_light und light_update liegen zwei Pakete",
+                protocol.name
+            );
+            assert_eq!(
+                protocol.incoming(protocol.extra.cb_light_update),
+                In::LightUpdate,
+                "{}",
+                protocol.name
+            );
+        }
+    }
+
+    /// Die Pakete der Spielphase sind nach ihrem Registry-Namen registriert, und
+    /// `chunk_batch_finished` steht direkt vor `chunk_batch_start`. Damit ist die ID des
+    /// Start-Pakets keine Annahme, sondern ableitbar – und dieser Test hält die Ableitung fest,
+    /// falls jemand eine der beiden Tabellenzeilen anfasst.
+    #[test]
+    fn chunk_stapel_ids_liegen_nebeneinander() {
+        for protocol in crate::proto::PROTOCOLS {
+            assert_eq!(
+                protocol.game.cb_chunk_batch_start,
+                protocol.game.cb_chunk_batch_finished + 1,
+                "{}",
+                protocol.name
+            );
+            assert_eq!(
+                protocol.incoming(protocol.game.cb_chunk_batch_start),
+                In::ChunkBatchStart,
+                "{}",
+                protocol.name
+            );
+            assert_eq!(
+                protocol.incoming(protocol.game.cb_chunk_batch_finished),
+                In::ChunkBatchFinished,
+                "{}",
+                protocol.name
+            );
+        }
+    }
+
+    /// Die Schätzung muss der des Vanilla-Clients folgen: sie beginnt bei 3,5 Chunks je Tick,
+    /// steigt bei schnellen Stapeln und lässt sich von einem einzelnen Ausreißer nicht mehr als
+    /// um den Faktor drei ziehen.
+    #[test]
+    fn chunk_durchsatz_folgt_dem_vanilla_schaetzer() {
+        let mut batch = ChunkBatch::new();
+        assert!((batch.desired_chunks_per_tick() - 3.5).abs() < 1e-4);
+
+        // Ohne vorangegangenes Start-Paket bleibt die Schätzung, wie sie war.
+        batch.finish(25);
+        assert!((batch.desired_chunks_per_tick() - 3.5).abs() < 1e-4);
+
+        // Ein sehr schneller Stapel: der Ausreißer wird auf ein Drittel des Mittels begrenzt,
+        // und das alte Mittel wiegt noch voll mit.
+        batch.start();
+        batch.finish(4096);
+        let expected = (2_000_000.0 + 2_000_000.0 / 3.0) / 2.0;
+        assert!(
+            (batch.nanos_per_chunk - expected).abs() < 1.0,
+            "{}",
+            batch.nanos_per_chunk
+        );
+
+        // Ein leerer Stapel darf die Schätzung nicht anfassen (und nicht durch null teilen).
+        let before = batch.nanos_per_chunk;
+        batch.start();
+        batch.finish(0);
+        assert_eq!(batch.nanos_per_chunk, before);
+
+        // Und der gemeldete Wert bleibt in den Grenzen, die der Server ohnehin anlegt.
+        for _ in 0..200 {
+            batch.start();
+            batch.finish(4096);
+        }
+        let desired = batch.desired_chunks_per_tick();
+        assert!((0.01..=64.0).contains(&desired), "{}", desired);
+    }
+
+    #[test]
+    fn client_brand_hat_exakt_den_vanilla_payload_aufbau() {
+        for protocol in crate::proto::PROTOCOLS {
+            let packet = client_brand(protocol.game.sb_custom_payload, protocol.name);
+            let mut r = Reader::new(&packet.data);
+            assert_eq!(r.var_int().unwrap(), protocol.game.sb_custom_payload);
+            assert_eq!(r.string().unwrap(), BRAND_CHANNEL);
+            assert_eq!(
+                r.string().unwrap(),
+                format!("{} {}", BRAND_PREFIX, protocol.name)
+            );
+            assert_eq!(r.remaining(), 0);
         }
     }
 }

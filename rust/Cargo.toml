@@ -1,6 +1,6 @@
 [package]
 name = "afk"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2021"
 description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.21.11, 26.1 und 26.2"
 
@@ -87,6 +87,22 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # Auf minimalen Fußabdruck getrimmt: kleine Binary, ein Codegen-Unit, kein Unwind-Tabellen-Ballast.
+#
+# `opt-level = 3` ist hier nachgemessen und wieder verworfen worden – die Vermutung, die heißen
+# Schleifen (AES-CFB8 je Byte, Palettenauspacken je Block, Raycaster je Bildpunkt) würden davon
+# profitieren, hielt der Messung nicht stand:
+#
+#           opt-level = "s"        opt-level = 3
+#   CFB8    18,6 MB/s              19,0 MB/s
+#   64x32    3,1 ms je Bild         4,1 ms je Bild
+#   426x240  141 ms je Bild         137 ms je Bild
+#   Binary   3,41 MB                4,07 MB   (Ultra-Bauform)
+#
+# Also innerhalb der Messstreuung gleich schnell und 660 KB größer. Die Schleifen hängen an
+# Speicherzugriffen und Sprüngen, nicht an fehlendem Entrollen; wo wirklich Zeit lag, steht es
+# jetzt im Code (siehe `Ray::steps_in_section` und `render_pixels`). Wer das erneut ändern will,
+# messe bitte vorher mit
+#   cargo test --release --features ultra -- --ignored --nocapture messlauf_bildrate
 [profile.release]
 opt-level = "s"
 lto = "fat"

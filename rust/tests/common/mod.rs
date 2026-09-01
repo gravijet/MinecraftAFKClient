@@ -185,6 +185,16 @@ impl<'a> Cursor<'a> {
         self.pos += len;
         out
     }
+    pub fn f32(&mut self) -> f32 {
+        let out = f32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        out
+    }
+    pub fn f64(&mut self) -> f64 {
+        let out = f64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        out
+    }
 }
 
 // ===================== AES-128-CFB8 =====================
@@ -383,14 +393,25 @@ pub struct Ids {
     pub cb_keep_alive: i32,
     pub cb_level_chunk: i32,
     pub cb_chunk_batch_finished: i32,
+    /// Die Pakete der Spielphase stehen nach ihrem Registry-Namen sortiert; `chunk_batch_start`
+    /// folgt unmittelbar auf `chunk_batch_finished`.
+    pub cb_chunk_batch_start: i32,
     pub cb_block_update: i32,
     pub sb_chat_command: i32,
     pub sb_chat: i32,
     pub sb_chunk_batch_received: i32,
     pub sb_accept_teleportation: i32,
+    pub sb_client_tick_end: i32,
+    pub sb_custom_payload: i32,
     pub sb_keep_alive: i32,
+    pub sb_move_pos: i32,
     pub sb_move: i32,
+    pub sb_move_rot: i32,
+    pub sb_player_input: i32,
     pub sb_use_item: i32,
+    /// „Welt geladen" – erst ab 1.21.4, in 1.21.1 gibt es das Paket nicht (dann -1).
+    pub sb_player_loaded: i32,
+    pub cb_respawn: i32,
     pub cb_set_health: i32,
     pub cb_transfer: i32,
     pub cb_store_cookie: i32,
@@ -417,14 +438,22 @@ pub static MC_26_1: Ids = Ids {
     cb_keep_alive: 44,
     cb_level_chunk: 45,
     cb_chunk_batch_finished: 11,
+    cb_chunk_batch_start: 12,
     cb_block_update: 8,
     sb_chat_command: 7,
     sb_chat: 9,
     sb_chunk_batch_received: 11,
     sb_accept_teleportation: 0,
+    sb_client_tick_end: 13,
+    sb_custom_payload: 22,
     sb_keep_alive: 28,
+    sb_move_pos: 30,
     sb_move: 31,
+    sb_move_rot: 32,
+    sb_player_input: 43,
     sb_use_item: 67,
+    sb_player_loaded: 44,
+    cb_respawn: 82,
     cb_set_health: 104,
     cb_transfer: 129,
     cb_store_cookie: 120,
@@ -451,14 +480,22 @@ pub static MC_1_21_1: Ids = Ids {
     cb_keep_alive: 38,
     cb_level_chunk: 39,
     cb_chunk_batch_finished: 12,
+    cb_chunk_batch_start: 13,
     cb_block_update: 9,
     sb_chat_command: 4,
     sb_chat: 6,
     sb_chunk_batch_received: 8,
     sb_accept_teleportation: 0,
+    sb_client_tick_end: -1,
+    sb_custom_payload: 18,
     sb_keep_alive: 24,
+    sb_move_pos: 26,
     sb_move: 27,
+    sb_move_rot: 28,
+    sb_player_input: -1,
     sb_use_item: 57,
+    sb_player_loaded: -1,
+    cb_respawn: 71,
     cb_set_health: 93,
     cb_transfer: 115,
     cb_store_cookie: 107,
@@ -485,8 +522,20 @@ pub enum Note {
     Chat(String),
     /// Sichtweite aus `ClientInformation` – daran hängt, wie viele Chunkdaten der Server schickt.
     ViewDistance(u8),
+    /// Über den Vanilla-Kanal `minecraft:brand` gemeldete Client-Brand.
+    Brand(String),
     /// Antwort auf eine Cookie-Abfrage: Name und Inhalt (`None` = „habe ich nicht").
     Cookie(String, Option<Vec<u8>>),
+    /// Sequenznummer eines `UseItem`-Pakets.
+    UseSequence(i32),
+    /// Modernes Tastenzustands-Bitfeld.
+    PlayerInput(u8),
+    /// Koordinaten eines `MovePlayerPos`-Pakets. Die reine Paketlänge genügt hier nicht: der
+    /// Erinnerungstakt eines stillstehenden Clients schickt dasselbe Paket wie eine Bewegung,
+    /// nur eben mit unveränderter Position.
+    MovePos(f64, f64, f64),
+    /// Gewünschter Chunk-Durchsatz aus `ServerboundChunkBatchReceived`.
+    ChunkBatchReceived(f32),
     Joined,
     Closed,
 }
@@ -498,6 +547,12 @@ pub struct Server {
 
 #[derive(Clone, Default)]
 pub struct Plan {
+    /// Künstliche Pause zwischen Konfiguration und Spielphase. Damit lässt sich prüfen, dass
+    /// lokale Spielaktionen vor dem Join keine Pakete in den falschen Protokollzustand senden.
+    pub before_login_ms: u64,
+    /// Pause nach dem Spiel-Login, aber vor dem ersten Positionsteleport. Damit lässt sich
+    /// absichern, dass keine Nutzeraktion in diesen unvollständigen Weltzustand fällt.
+    pub before_position_ms: u64,
     /// Chunks (x, z) mit einer soliden Schicht in Abschnitt `solid_section`.
     pub chunks: Vec<(i32, i32)>,
     pub solid_section: usize,
@@ -549,6 +604,21 @@ pub struct Plan {
     /// Verschlüsseltes Login wie ein Online-Mode-Server – nur ohne Sitzungsprüfung bei Mojang
     /// (`shouldAuthenticate = false`, dieselbe Angabe, mit der ein Proxy sie übernimmt).
     pub encrypt: bool,
+    /// Auf den Respawn-Wunsch des Clients hin ein `Respawn`-Paket schicken – und **sonst
+    /// nichts**: keine neue Position, keinen neuen Chunk-Stapel.
+    ///
+    /// So verhält sich kein Vanilla-Server, aber sehr wohl manches Plugin. Der Client muss die
+    /// Spielphase trotzdem wiederfinden; täte er es nicht, bliebe er nach dem ersten Tod für
+    /// immer stumm.
+    pub respawn_after_death: bool,
+    /// So viele Verbindungen nacheinander bedienen (0 und 1 heißen beide: genau eine).
+    ///
+    /// Nur der Reconnect-Test braucht mehr als eine: Er wirft den Client absichtlich hinaus und
+    /// prüft, dass derselbe Port danach ein zweites Mal einen vollständigen Beitritt sieht.
+    pub connections: usize,
+    /// Himmelslicht, das der Server hinter jedem Chunk mitschickt (`None` = gar keins – so
+    /// verhält sich kein echter Server, prüft aber den Rückfall auf die geschätzte Helligkeit).
+    pub sky_light: Option<u8>,
 }
 
 /// Startet den Testserver auf einem freien Port.
@@ -557,7 +627,10 @@ pub fn start(ids: &'static Ids, plan: Plan) -> Server {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx): (Notes, Receiver<Note>) = channel();
     thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
+        for _ in 0..plan.connections.max(1) {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
             let out = Arc::new(Mutex::new(Wire {
@@ -656,6 +729,9 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     }
 
     // --- Spielphase ---
+    if plan.before_login_ms > 0 {
+        thread::sleep(Duration::from_millis(plan.before_login_ms));
+    }
     let mut login = Buf::packet(ids.cb_login);
     login
         .i32(42) // eigene Entity-Nummer
@@ -683,6 +759,9 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     let _ = tx.send(Note::Joined);
 
     // Position
+    if plan.before_position_ms > 0 {
+        thread::sleep(Duration::from_millis(plan.before_position_ms));
+    }
     let (x, y, z) = plan.position;
     let mut pos = Buf::packet(ids.cb_position);
     if ids.modern {
@@ -701,7 +780,10 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     }
     conn.send(&pos);
 
-    // Chunks
+    // Chunks – wie beim echten Server in einen Stapel geklammert: Start, Inhalt, Abschluss.
+    if !plan.chunks.is_empty() {
+        conn.send(&Buf::packet(ids.cb_chunk_batch_start));
+    }
     for (cx, cz) in &plan.chunks {
         conn.send(&chunk_packet(
             ids,
@@ -710,6 +792,7 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
             plan.solid_section,
             plan.mixed_palette,
             plan.filled_sections.max(1),
+            plan.sky_light,
         ));
     }
     if !plan.chunks.is_empty() {
@@ -822,14 +905,58 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     }
 
     let chat_command = ids.sb_chat_command;
+    let client_command = ids.sb_client_command;
+    let respawn_after_death = plan.respawn_after_death;
     let chat = ids.sb_chat;
+    let custom_payload = ids.sb_custom_payload;
+    let use_item = ids.sb_use_item;
+    let player_input = ids.sb_player_input;
+    let move_pos = ids.sb_move_pos;
+    let chunk_batch_received = ids.sb_chunk_batch_received;
     while let Some((id, payload)) = conn.recv() {
+        // Absichtlich karg: nur das Respawn-Paket, keine Position und kein Chunk-Stapel
+        // hinterher. Siehe [`Plan::respawn_after_death`].
+        if respawn_after_death && id == client_command {
+            let mut respawn = Buf::packet(ids.cb_respawn);
+            respawn
+                .var_int(0) // Dimension-Typ-ID
+                .string("minecraft:overworld")
+                .i64(0) // hashedSeed
+                .u8(0) // gameMode
+                .u8(255) // previousGameMode
+                .bool(false) // isDebug
+                .bool(false) // isFlat
+                .bool(false) // lastDeathPos: nein
+                .var_int(0) // portalCooldown
+                .var_int(63) // seaLevel
+                .u8(0); // dataToKeep
+            conn.send(&respawn);
+        }
+        if id == move_pos && payload.len() == 25 {
+            let mut c = Cursor::new(&payload);
+            let _ = tx.send(Note::MovePos(c.f64(), c.f64(), c.f64()));
+        } else if id == chunk_batch_received && payload.len() == 4 {
+            let mut c = Cursor::new(&payload);
+            let _ = tx.send(Note::ChunkBatchReceived(c.f32()));
+        }
         if id == chat_command {
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::Command(c.string()));
         } else if id == chat {
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::Chat(c.string()));
+        } else if id == custom_payload {
+            let mut c = Cursor::new(&payload);
+            if c.string() == "minecraft:brand" {
+                let _ = tx.send(Note::Brand(c.string()));
+            }
+        } else if id == use_item {
+            let mut c = Cursor::new(&payload);
+            let _hand = c.var_int();
+            let _ = tx.send(Note::UseSequence(c.var_int()));
+        } else if id == player_input {
+            let mut c = Cursor::new(&payload);
+            let _ = tx.send(Note::PlayerInput(c.u8()));
         }
         // Zusätzlich immer die rohe Länge: Sie verrät, ob ein Paket den Aufbau der jeweiligen
         // Protokollversion hat – ein Feld zu viel oder zu wenig fällt genau daran auf.
@@ -1029,6 +1156,7 @@ pub fn chunk_packet(
     solid_section: usize,
     mixed: bool,
     filled: usize,
+    sky_light: Option<u8>,
 ) -> Buf {
     let mut data = Buf::default();
     for section in 0..24usize {
@@ -1063,7 +1191,44 @@ pub fn chunk_packet(
     }
     packet.byte_array(&data.data);
     packet.var_int(0); // keine Blockentitäten
+    if let Some(sky) = sky_light {
+        write_light(&mut packet, solid_section, sky);
+    }
     packet
+}
+
+/// Die Lichtdaten, die ein echter Server hinter jedem Chunk mitschickt.
+///
+/// Nachgebaut wird der Normalfall einer Überwelt: Über dem Boden voller Himmel, darunter und im
+/// Boden selbst nichts. Blocklicht bleibt ganz aus – dafür gibt es im Testbaum keine Fackel.
+///
+/// Lichtabschnitte gibt es zwei mehr als Weltabschnitte (je einer unter und über der Welt);
+/// Abschnitt `i` der Welt ist deshalb Lichtabschnitt `i + 1`.
+fn write_light(packet: &mut Buf, solid_section: usize, sky: u8) {
+    const LIGHT_SECTIONS: usize = 24 + 2;
+    let mut mask = [0u64; 1];
+    let mut arrays: Vec<[u8; 2048]> = Vec::new();
+    for section in 0..LIGHT_SECTIONS {
+        // Der Boden liegt in Weltabschnitt `solid_section`; alles darüber sieht den Himmel.
+        let lit = section > solid_section + 1;
+        if !lit {
+            continue;
+        }
+        mask[0] |= 1 << section;
+        // Zwei Blöcke je Byte, beide auf dieselbe Stufe.
+        arrays.push([sky << 4 | sky; 2048]);
+    }
+
+    // Reihenfolge: Himmelsmaske, Blockmaske, „ganz dunkel"-Masken, dann die Felder.
+    packet.var_int(1).i64(mask[0] as i64); // Himmel: die oben gesammelten Abschnitte
+    packet.var_int(0); // Blocklicht: kein Abschnitt
+    packet.var_int(0); // leer-Himmel
+    packet.var_int(0); // leer-Block
+    packet.var_int(arrays.len() as i32);
+    for array in &arrays {
+        packet.byte_array(array);
+    }
+    packet.var_int(0); // keine Blocklichtfelder
 }
 
 /// Ein Abschnitt, wie ihn eine normal erzeugte Welt liefert: mehrere Zustände in einer
@@ -1282,6 +1447,26 @@ impl std::ops::DerefMut for Client {
     }
 }
 
+impl Client {
+    /// Auf das Programmende warten, aber nicht ewig. `None` = er läuft immer noch.
+    ///
+    /// `Child::wait` kennt kein Zeitlimit. Ein Test, der auf ein Ende wartet, das wegen eines
+    /// Fehlers nie kommt, hinge damit nicht bis zu seinem eigenen Zeitlimit, sondern bis zum
+    /// Abbruch der ganzen Testsitzung.
+    pub fn wait_within(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -1294,6 +1479,46 @@ impl Drop for Client {
 /// eine fertige Datei prüfen – praktisch, um eine ältere Fassung gegen die neue zu messen.
 pub fn spawn_client(port: u16, mc: &str, extra: &[&str]) -> Client {
     spawn_client_at("127.0.0.1", port, mc, extra)
+}
+
+/// Einen gerade freien TCP-Port besorgen: kurz binden, Nummer merken, wieder loslassen.
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("freien Port finden")
+        .local_addr()
+        .expect("Adresse")
+        .port()
+}
+
+/// Winziger HTTP-Client für den Browser-Viewer-Test: Statuszeile, Kopfzeilen und Rumpf.
+///
+/// Bewusst zu Fuß statt mit einer Bibliothek – geprüft werden soll, was der Viewer wirklich auf
+/// die Leitung schreibt, nicht das, was ein Client daraus zurechtbiegt.
+pub fn http_get(port: u16, target: &str) -> (u16, String, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("Viewer erreichbar");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("Zeitlimit");
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        target
+    );
+    stream.write_all(request.as_bytes()).expect("Anfrage");
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+
+    let split = raw
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .expect("Kopf und Rumpf sind getrennt");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("Statuszeile");
+    (status, head, raw[split + 4..].to_vec())
 }
 
 /// Wie [`spawn_client`], aber mit frei gewählter Zieladresse – für den Weg über einen Proxy,

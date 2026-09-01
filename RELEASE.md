@@ -16,10 +16,12 @@ mit `--mc <version>` gewählt. Windows-Dateien enden auf `.exe`, Linux-Dateien h
 | `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV, Browser-HUD, Menüs und Gegenstände; Terminalansicht ohne Browser automatisch | beobachten und im Browser Menüs/Hotbar bedienen |
 | `ultra-afk-windows.exe` | `ultra-afk-linux` | alles aus Premium + Gegenstände + Terminal- und Browser-POV | eine Datei mit allen Rust-Funktionen |
 
-Keine dieser Rust-Dateien enthält eine Tablist oder Playerlist. Nach einem Kick wird **nicht**
-automatisch neu verbunden; der Prozess beendet sich mit Fehlerstatus. Ein vom Server ausdrücklich
-angeordneter Transfer auf einen Unterserver wird weiterhin befolgt, weil er Teil derselben
-Spielsitzung ist.
+Keine dieser Rust-Dateien enthält eine Tablist oder Playerlist. Nach einem Kick oder
+Verbindungsabbruch wird neu verbunden – erst nach 5 Sekunden, dann mit verdoppelter Wartezeit bis
+höchstens 60. Mit `--no-reconnect` endet der Prozess stattdessen mit Fehlerstatus; `--reconnect-delay`,
+`--max-backoff` und `--reconnect-tries` stellen die Zeiten und die Zahl der Versuche um. Ein vom
+Server ausdrücklich angeordneter Transfer auf einen Unterserver wird davon unabhängig befolgt, weil
+er Teil derselben Spielsitzung ist.
 
 ## POV bedienen
 
@@ -32,7 +34,7 @@ lassen sich beim Start umstellen:
 | `--pov-size 160x80` | Bildgröße von Anfang an, ohne den Umweg über `:pov size` |
 | `--pov-fps 4` | Bilder je Sekunde (1–20, Standard 8) |
 | `--pov-web 8765` | token-geschützten Browser-Viewer auf `127.0.0.1:8765` starten |
-| `--pov-resources <client.jar>` | versionsgleiche Original-Client-JAR für Modelle, Texturen, HUD und Menüs |
+| `--pov-resources <jar\|auto\|aus>` | woher die echten Texturen kommen. Standard `auto`: vorhandene Minecraft-Installation benutzen, sonst einmalig von Mojang laden |
 
 Örtliche Befehle im laufenden Client:
 
@@ -43,16 +45,19 @@ lassen sich beim Start umstellen:
 | `:pov frame` | genau ein aktuelles Bild zeichnen |
 | `:pov size 80 40` | interne Bildgröße setzen (24–160 × 12–80 Pixel) |
 | `:pov fps 4` | Takt ändern |
-| `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Zahl und Zustand anzeigen |
+| `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Zahl, wie viele Chunks Licht haben, und Zustand |
 
 Die Bilder gehen auf die **Standardfehlerausgabe**; das genaue Format steht in
 [FEATURES.md](FEATURES.md#bildformat-der-live-pov) und ist als Schnittstelle zugesagt.
 
 Die Ansicht ist kein Textdump von Koordinaten: Der Client decodiert die tatsächlich geladenen
-Chunk-Paletten, hält Blockänderungen und Entities live nach und raycastet das Bild aus der aktuellen
-Kameraposition und Blickrichtung. Die Terminalausgabe bleibt eine farbige Voxelansicht. Der
-Browser-Viewer liest zusätzlich echte Blockmodelle, PNGs, HUD- und Containertexturen aus der vom
-Nutzer angegebenen Original-Client-JAR; die Release-Dateien selbst enthalten keine Minecraft-PNGs.
+Block- und Biom-Paletten samt dem mitgeschickten Himmels- und Blocklicht, hält Blockänderungen und
+Entities live nach und raycastet das Bild aus der aktuellen Kameraposition und Blickrichtung. Eine
+Höhle ist deshalb dunkel, eine Fackel wirft Schein, und eine Wiese hat den Farbton ihres Bioms. Die Terminalausgabe bleibt eine farbige Voxelansicht. Der
+Browser-Viewer liest zusätzlich echte Blockmodelle, PNGs, HUD- und Containertexturen aus einer
+originalen Client-JAR. Die sucht der Client selbst: eigene Ablage, vorhandene
+Minecraft-Installation, sonst einmalig der offizielle Download von Mojang (SHA-1 geprüft). Die
+Release-Dateien selbst enthalten keine Minecraft-PNGs und werden auch keine enthalten.
 Die beim Start ausgegebene URL enthält einen zufälligen 128-Bit-Token. Ohne ihn sind auch
 JAR-Ressourcen und Lese-Endpunkte nicht erreichbar.
 

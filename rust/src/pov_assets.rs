@@ -32,9 +32,122 @@ pub(crate) type TexturedHit = ((u8, u8, u8, u8), f64, usize);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Face {
     texture: u16,
-    tint: bool,
+    /// Woher diese Fläche ihren Farbton nimmt – `None` heißt „Textur unverändert".
+    ///
+    /// Beim Laden aufgelöst: Ob eine Fläche eingefärbt wird, sagt das Modell (`tintindex`);
+    /// **woraus**, hängt am Block und steht in Vanilla im Code, nicht in den Daten
+    /// (`BlockColors`). Siehe [`tint_for`].
+    tint: Option<TintKind>,
     uv: Option<[f64; 4]>,
     rotation: i32,
+}
+
+/// **Woraus** eine Fläche mit `tintindex` ihre Farbe bezieht.
+///
+/// Das Modell sagt nur, *dass* eingefärbt wird; *womit*, hängt am Block (`BlockColors`) und bei
+/// Gras, Laub und Wasser zusätzlich am Biom. Deshalb steht hier die Herkunft und nicht der
+/// fertige Ton – der entsteht erst beim Zeichnen, wenn das Biom an der getroffenen Stelle
+/// bekannt ist.
+///
+/// Blöcke, für die Vanilla gar keinen Einfärber kennt, bleiben **ungefärbt**. Vorher bekam jede
+/// Fläche mit `tintindex` denselben Grünton – auch Redstone, Kürbisstiele und Karten.
+#[derive(Clone, Copy, Debug)]
+enum TintKind {
+    Grass,
+    Foliage,
+    Water,
+    /// Diese Töne setzt Vanilla unabhängig vom Biom.
+    Fixed([u8; 3]),
+}
+
+fn tint_for(block: &str) -> Option<TintKind> {
+    let (_, name) = resource_id(block);
+    Some(match name {
+        "grass_block" | "grass" | "short_grass" | "tall_grass" | "fern" | "large_fern"
+        | "potted_fern" | "sugar_cane" | "pink_petals" | "attached_melon_stem"
+        | "attached_pumpkin_stem" => TintKind::Grass,
+        // Diese drei färbt Vanilla fest ein, unabhängig vom Biom.
+        "spruce_leaves" => TintKind::Fixed([0x61, 0x99, 0x61]),
+        "birch_leaves" => TintKind::Fixed([0x80, 0xA7, 0x55]),
+        "lily_pad" => TintKind::Fixed([0x71, 0xC3, 0x5C]),
+        "water" | "bubble_column" | "water_cauldron" => TintKind::Water,
+        other if other.ends_with("_leaves") || other == "vine" => TintKind::Foliage,
+        _ => return None,
+    })
+}
+
+/// Die drei Farbtöne, mit denen ein Biom Flächen einfärbt – für ein Biom einmal ausgerechnet.
+#[derive(Clone, Copy)]
+pub(crate) struct BiomeTint {
+    grass: [u8; 3],
+    foliage: [u8; 3],
+    water: [u8; 3],
+}
+
+impl BiomeTint {
+    /// Der Stand ohne Biomdaten: genau die Töne, die diese Ansicht schon vorher für alles
+    /// benutzt hat (gemäßigte Ebene/Wald). Damit sieht ein Server ohne Biom-Registry aus wie
+    /// bisher, statt plötzlich grau zu werden.
+    pub(crate) const PLAINS: BiomeTint = BiomeTint {
+        grass: [0x91, 0xBD, 0x59],
+        foliage: [0x77, 0xAB, 0x2F],
+        water: [0x3F, 0x76, 0xE4],
+    };
+
+    /// Ohne geladene Farbkarten: Wasser steht schon in der Registry, Gras und Laub nicht.
+    pub(crate) fn without_colormaps(params: &crate::pov::BiomeParams) -> BiomeTint {
+        BiomeTint {
+            water: rgb(params.water),
+            ..BiomeTint::PLAINS
+        }
+    }
+
+    #[inline]
+    fn of(&self, kind: TintKind) -> [u8; 3] {
+        match kind {
+            TintKind::Grass => self.grass,
+            TintKind::Foliage => self.foliage,
+            TintKind::Water => self.water,
+            TintKind::Fixed(color) => color,
+        }
+    }
+}
+
+fn rgb(value: u32) -> [u8; 3] {
+    [(value >> 16) as u8, (value >> 8) as u8, value as u8]
+}
+
+/// Eine Farbkarte der JAR als 256x256-Tabelle. Fehlt oder passt sie nicht, bleibt es beim
+/// Ebene-Ton – erfunden wird keine.
+fn load_colormap(archive: &mut ZipArchive<File>, name: &str) -> Option<Box<[[u8; 3]]>> {
+    let path = format!("assets/minecraft/textures/colormap/{}.png", name);
+    let bytes = read_zip(archive, &path, MAX_ARCHIVE_ASSET_BYTES)?;
+    let texture = decode_png(&bytes).ok()?;
+    if texture.width != 256 || texture.rgba.len() < 256 * 256 * 4 {
+        return None;
+    }
+    Some(
+        texture
+            .rgba
+            .chunks_exact(4)
+            .take(256 * 256)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect(),
+    )
+}
+
+/// Vanillas Griff in eine Farbkarte (`ColorMapColorUtil.get`).
+///
+/// Die Karte ist 256x256 groß und wird **nicht** linear abgetastet: Der Niederschlag geht mit der
+/// Temperatur multipliziert ein, und beide Achsen laufen rückwärts. Genau diese Rechnung steht
+/// hier – eine eigene, „vernünftigere" wäre eine andere Welt.
+fn colormap_sample(map: &[[u8; 3]], temperature: f32, downfall: f32) -> [u8; 3] {
+    let temperature = temperature.clamp(0.0, 1.0) as f64;
+    let downfall = downfall.clamp(0.0, 1.0) as f64 * temperature;
+    let x = ((1.0 - temperature) * 255.0) as usize;
+    let y = ((1.0 - downfall) * 255.0) as usize;
+    // Fehlt der Punkt, ist es dieselbe auffällige Fehlfarbe wie bei einer fehlenden Textur.
+    map.get((y << 8) | x).copied().unwrap_or([0xFF, 0x00, 0xFF])
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +183,10 @@ pub(crate) struct Assets {
     item_icons: Mutex<HashMap<String, Vec<u8>>>,
     archive: Mutex<ZipArchive<File>>,
     missing_png: Vec<u8>,
+    /// Die beiden Farbkarten der JAR, je 256x256 RGB. Aus ihnen kommt der Gras- und Laubton
+    /// eines Bioms – dieselbe Tabelle, die auch das Spiel selbst abtastet.
+    grass_map: Option<Box<[[u8; 3]]>>,
+    foliage_map: Option<Box<[[u8; 3]]>>,
 }
 
 impl Assets {
@@ -132,6 +249,8 @@ impl Assets {
 
         let missing_png = encode_rgba_png(16, 16, &loader.textures[0].rgba)
             .map_err(|error| format!("Fehlertextur konnte nicht codiert werden: {}", error))?;
+        let grass_map = load_colormap(&mut loader.archive, "grass");
+        let foliage_map = load_colormap(&mut loader.archive, "foliage");
         Ok(Assets {
             states,
             materials: loader.materials,
@@ -142,7 +261,47 @@ impl Assets {
             item_icons: Mutex::new(HashMap::new()),
             archive: Mutex::new(loader.archive),
             missing_png,
+            grass_map,
+            foliage_map,
         })
+    }
+
+    /// Die Farbtöne eines Bioms, so wie das Spiel sie rechnet.
+    ///
+    /// Ausdrücklich gesetzte Farben aus der Registry gewinnen; sonst kommt der Ton aus der
+    /// Farbkarte der JAR, abgetastet mit Temperatur und Niederschlag genau dieses Bioms.
+    pub(crate) fn biome_tint(&self, params: &crate::pov::BiomeParams) -> BiomeTint {
+        use crate::pov::GrassModifier;
+
+        let from_map = |map: &Option<Box<[[u8; 3]]>>, fallback: [u8; 3]| match map {
+            Some(map) => colormap_sample(map, params.temperature, params.downfall),
+            None => fallback,
+        };
+        let grass = match params.grass {
+            Some(color) => rgb(color),
+            None => from_map(&self.grass_map, BiomeTint::PLAINS.grass),
+        };
+        let grass = match params.modifier {
+            GrassModifier::None => grass,
+            // Vanilla würfelt im Sumpf über ein Rauschfeld zwischen zwei Tönen. Das Feld gehört
+            // zur Weltgenerierung und wird dem Client nie geschickt; genommen wird deshalb der
+            // Ton, den der Sumpf auf dem allergrößten Teil seiner Fläche hat.
+            GrassModifier::Swamp => rgb(6_975_545),
+            // `(farbe & 0xFEFEFE) + 0x28340A >> 1` – Vanillas Mischung zum Dunkelwald-Ton hin.
+            GrassModifier::DarkForest => {
+                let packed =
+                    (grass[0] as u32) << 16 | (grass[1] as u32) << 8 | grass[2] as u32;
+                rgb(((packed & 0xFE_FEFE) + 0x28_340A) >> 1)
+            }
+        };
+        BiomeTint {
+            grass,
+            foliage: match params.foliage {
+                Some(color) => rgb(color),
+                None => from_map(&self.foliage_map, BiomeTint::PLAINS.foliage),
+            },
+            water: rgb(params.water),
+        }
     }
 
     /// Naechster sichtbarer Modellelement-Treffer innerhalb eines Blocks. Das ist mehr als ein
@@ -157,6 +316,7 @@ impl Assets {
         direction: (f64, f64, f64),
         enter: f64,
         leave: f64,
+        biome: &BiomeTint,
     ) -> Option<TexturedHit> {
         let material_id = self.states.get(state as usize).copied().unwrap_or(0);
         let material = self
@@ -191,7 +351,7 @@ impl Assets {
                 };
                 let point = add_scaled(local_origin, local_direction, distance);
                 let (u, v) = face_uv(point, element.from, element.to, face_index, face.uv);
-                let rgba = self.sample_face(face, u, v);
+                let rgba = self.sample_face(face, u, v, biome);
                 if rgba.3 < 16 {
                     continue;
                 }
@@ -202,7 +362,7 @@ impl Assets {
         best
     }
 
-    fn sample_face(&self, face: Face, u: f64, v: f64) -> (u8, u8, u8, u8) {
+    fn sample_face(&self, face: Face, u: f64, v: f64, biome: &BiomeTint) -> (u8, u8, u8, u8) {
         let (u, v) = match face.rotation.rem_euclid(360) {
             90 => (1.0 - v, u),
             180 => (1.0 - u, 1.0 - v),
@@ -223,19 +383,22 @@ impl Assets {
             texture.rgba[at + 2],
             texture.rgba[at + 3],
         );
-        if face.tint {
-            // Ohne Biome-Palette ist exakt dieselbe Ortsfarbe nicht rekonstruierbar. Dieser
-            // Vanilla-Overworld-Ton ist nur fuer Texturen mit `tintindex` bestimmt; die echten
-            // Texturpixel bleiben darunter erhalten.
-            rgba.0 = (rgba.0 as u16 * 124 / 255) as u8;
-            rgba.1 = (rgba.1 as u16 * 189 / 255) as u8;
-            rgba.2 = (rgba.2 as u16 * 107 / 255) as u8;
+        if let Some(kind) = face.tint {
+            // Genau wie im Spiel: Der Farbton multipliziert die Textur, er ersetzt sie nicht.
+            // Die Struktur der echten Pixel bleibt darunter erhalten.
+            let tint = biome.of(kind);
+            rgba.0 = (rgba.0 as u16 * tint[0] as u16 / 255) as u8;
+            rgba.1 = (rgba.1 as u16 * tint[1] as u16 / 255) as u8;
+            rgba.2 = (rgba.2 as u16 * tint[2] as u16 / 255) as u8;
         }
         rgba
     }
 
+    /// Die Farbe, die ein Blockzustand auf einer bestimmten Seite an dieser Stelle wirklich
+    /// liefert – ohne Kamera, ohne Licht, ohne Nebel. Damit lässt sich blockgenau prüfen, ob die
+    /// Ressourcen richtig gelesen wurden.
     #[cfg(test)]
-    fn sample(&self, state: u32, face: usize, u: f64, v: f64) -> (u8, u8, u8, u8) {
+    pub(crate) fn sample(&self, state: u32, face: usize, u: f64, v: f64) -> (u8, u8, u8, u8) {
         let material_id = self.states.get(state as usize).copied().unwrap_or(0);
         let material = self
             .materials
@@ -247,11 +410,11 @@ impl Assets {
             .find_map(|element| element.faces[face.min(5)])
             .unwrap_or(Face {
                 texture: 0,
-                tint: false,
+                tint: None,
                 uv: None,
                 rotation: 0,
             });
-        self.sample_face(selected, u, v)
+        self.sample_face(selected, u, v, &BiomeTint::PLAINS)
     }
 
     pub(crate) fn raw(&self, path: &str) -> Option<Vec<u8>> {
@@ -454,7 +617,10 @@ impl Loader {
         if let Some(id) = self.material_ids.get(&key) {
             return *id;
         }
+        let tint = tint_for(block);
         let mut elements = Vec::new();
+        // Für den Ersatzweg weiter unten: das erste benutzte Modell samt seiner Texturliste.
+        let first_model = uses.first().map(|used| used.name.clone());
         for used in uses {
             let model = self.resolve_model(&used.name, 0);
             for raw in &model.elements {
@@ -476,7 +642,8 @@ impl Loader {
                         let name = resolve_texture(reference, &model.textures);
                         faces[index] = Some(Face {
                             texture: self.texture(&name),
-                            tint: face.get("tintindex").is_some(),
+                            // Das Modell sagt *ob*, die Blockliste sagt *womit*.
+                            tint: face.get("tintindex").and(tint),
                             uv: face.get("uv").and_then(vector4),
                             rotation: face.get("rotation").and_then(Value::as_i64).unwrap_or(0)
                                 as i32,
@@ -495,13 +662,27 @@ impl Loader {
         }
 
         if elements.is_empty() {
-            // Schlichte Packs duerfen ein Modell auslassen und nur eine gleichnamige
-            // Blocktextur liefern. Fehlt auch sie, ist die Fehlertextur absichtlich sichtbar.
+            // Ein Modell ohne Flächen ist kein Fehler: **Flüssigkeiten** haben genau das.
+            // `block/water.json` besteht in Vanilla nur aus `"particle": "block/water_still"`,
+            // weil das Spiel Wasser und Lava eigens zeichnet. Vorher endete das hier bei der
+            // Suche nach einer Textur namens `block/water` – die es nicht gibt – und jeder
+            // See wurde lila-schwarz. Die im Modell genannte Partikeltextur ist genau die
+            // Fläche, die gemeint ist.
+            //
+            // Danach erst der Ersatz für schlichte Resourcepacks, die ein Modell auslassen und
+            // nur eine gleichnamige Blocktextur mitbringen. Fehlt auch die, ist die Fehlertextur
+            // absichtlich sichtbar – lieber erkennbar falsch als still erfunden.
+            let particle = first_model.and_then(|name| {
+                let model = self.resolve_model(&name, 0);
+                let reference = model.textures.get("particle")?.clone();
+                let resolved = resolve_texture(&reference, &model.textures);
+                (!resolved.is_empty()).then_some(resolved)
+            });
             let direct = format!("{}:block/{}", resource_id(block).0, resource_id(block).1);
-            let texture = if self.texture_exists(&direct) {
-                self.texture(&direct)
-            } else {
-                0
+            let texture = match particle {
+                Some(name) => self.texture(&name),
+                None if self.texture_exists(&direct) => self.texture(&direct),
+                None => 0,
             };
             elements.push(Element {
                 from: [0.0, 0.0, 0.0],
@@ -509,7 +690,9 @@ impl Loader {
                 faces: std::array::from_fn(|_| {
                     Some(Face {
                         texture,
-                        tint: false,
+                        // Wasser trägt seine Farbe nicht in der Textur, sondern bekommt sie vom
+                        // Biom; ohne Einfärbung wäre es schlicht grau.
+                        tint,
                         uv: None,
                         rotation: 0,
                     })
@@ -959,7 +1142,9 @@ fn raster_triangle(
             }
             let u = wa * a.uv.0 + wb * b.uv.0 + wc * c.uv.0;
             let v = wa * a.uv.1 + wb * b.uv.1 + wc * c.uv.1;
-            let color = assets.sample_face(face, u, v);
+            // Ein Gegenstands-Icon hängt an keinem Ort in der Welt und hat deshalb kein Biom.
+            // Vanilla zeichnet Inventar-Icons genauso: mit dem Ton der gemäßigten Ebene.
+            let color = assets.sample_face(face, u, v, &BiomeTint::PLAINS);
             if color.3 < 16 {
                 continue;
             }
@@ -1250,6 +1435,65 @@ mod tests {
         let (matrix, offset) = element_transform(&raw, 0, 0);
         let center = add(matrix_vector(matrix, [8.0, 8.0, 8.0]), offset);
         assert!(center.iter().all(|value| (*value - 8.0).abs() < 1e-9));
+    }
+
+    /// Die Biomfarben gegen die echten Farbkarten der Original-JAR.
+    ///
+    /// Die erwarteten Werte sind nicht aus diesem Code gewonnen, sondern unabhängig aus
+    /// `colormap/grass.png` abgelesen (Vanillas `ColorMapColorUtil.get`). Der Wert für die Ebene
+    /// ist zugleich die Gegenprobe auf die alte Festfarbe: Sie war `#91BD59` – und genau das
+    /// liefert die Farbkarte für Temperatur 0,8 und Niederschlag 0,4. Die Umstellung ändert also
+    /// gerade dort nichts, wo bisher zufällig richtig geraten wurde, und alles dort, wo nicht.
+    ///
+    /// Die JAR wird selbst gesucht statt über `AFK_POV_RESOURCES` hereingereicht: Diese Variable
+    /// zeigt für `originale_client_jar` auf eine 26.2er JAR, und ein Testlauf, bei dem dieselbe
+    /// Variable je nach Testnamen eine andere Version meinen muss, geht irgendwann schief. Welche
+    /// Version es ist, spielt hier ohnehin keine Rolle: Die vier abgetasteten Punkte liefern in
+    /// 1.21.1 und 26.2 dieselben Werte.
+    ///
+    /// `XDG_CONFIG_HOME=$(mktemp -d) cargo test --features pov-client -- --ignored biomfarben`
+    #[test]
+    #[ignore]
+    fn biomfarben_kommen_aus_der_farbkarte() {
+        use crate::pov::{BiomeParams, GrassModifier};
+        let console = crate::console::Console::new(false, false, false);
+        let version = "1.21.1";
+        let path =
+            crate::pov_resources::locate(&console, version, &crate::pov_resources::Source::Auto)
+                .expect("Ressourcen beschaffen");
+        let assets = Assets::load(&path, version).expect("Assets laden");
+
+        let biome = |temperature: f32, downfall: f32| BiomeParams {
+            temperature,
+            downfall,
+            ..BiomeParams::PLAINS
+        };
+        // Ebene, Wüste, Taiga, Dschungel – vier deutlich verschiedene Klimapunkte.
+        assert_eq!(assets.biome_tint(&biome(0.8, 0.4)).grass, [0x91, 0xBD, 0x59]);
+        assert_eq!(assets.biome_tint(&biome(2.0, 0.0)).grass, [0xBF, 0xB7, 0x55]);
+        assert_eq!(assets.biome_tint(&biome(0.25, 0.8)).grass, [0x86, 0xB7, 0x83]);
+        assert_eq!(assets.biome_tint(&biome(0.95, 0.9)).grass, [0x59, 0xC9, 0x3C]);
+
+        // Eine ausdrücklich gesetzte Farbe schlägt die Farbkarte.
+        let fixed = BiomeParams {
+            grass: Some(0x123456),
+            ..BiomeParams::PLAINS
+        };
+        assert_eq!(assets.biome_tint(&fixed).grass, [0x12, 0x34, 0x56]);
+
+        // Der Sumpf färbt unabhängig von Temperatur und Niederschlag.
+        let swamp = BiomeParams {
+            modifier: GrassModifier::Swamp,
+            ..BiomeParams::PLAINS
+        };
+        assert_eq!(assets.biome_tint(&swamp).grass, [0x6A, 0x70, 0x39]);
+
+        // Wasser steht als Zahl in der Registry und braucht gar keine Farbkarte.
+        let water = BiomeParams {
+            water: 0x617B64,
+            ..BiomeParams::PLAINS
+        };
+        assert_eq!(assets.biome_tint(&water).water, [0x61, 0x7B, 0x64]);
     }
 
     /// Manueller Integrationslauf gegen eine unveraenderte Original-Client-JAR:

@@ -136,19 +136,24 @@ fn run(shared: &Arc<Shared>, generation: u32) {
 
 /// Eine Runde „Lebenszeichen": Arm schwingen, Kopf ein Stück drehen, Kopf zurückdrehen.
 ///
-/// Die Bewegung geht über [`crate::movement::send_move`], damit der gemerkte Zustand mitwandert –
-/// sonst würde ein späteres `:go` von der falschen Blickrichtung aus rechnen.
+/// Die Bewegung geht über das reine Rotationspaket, damit keine alten Koordinaten erneut gesendet
+/// werden. Das ist besonders wichtig, wenn zeitgleich ein ausdrücklicher `:go`-Befehl läuft.
 fn act(shared: &Arc<Shared>) {
+    // Eine ausdrücklich angeforderte Bewegung hat Vorrang. Zwei unabhängige Taktgeber würden
+    // sonst abwechselnd verschiedene Blickrichtungen senden.
+    if shared.mover.is_active() {
+        return;
+    }
     let mut swing = Writer::packet(shared.proto.extra.sb_swing);
     swing.var_int(0); // Haupthand
     shared.send(swing);
 
-    let Some((x, y, z, yaw, pitch)) = shared.position() else {
+    let Some((_, _, _, yaw, pitch)) = shared.position() else {
         return; // noch keine Position bekannt: der Armschwung muss reichen
     };
-    crate::movement::send_move(shared, (x, y, z, yaw + TURN_DEGREES, pitch));
+    crate::movement::send_rotation(shared, yaw + TURN_DEGREES, pitch);
     thread::sleep(Duration::from_millis(150));
-    crate::movement::send_move(shared, (x, y, z, yaw, pitch));
+    crate::movement::send_rotation(shared, yaw, pitch);
 }
 
 #[cfg(test)]

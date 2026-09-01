@@ -39,17 +39,52 @@ wissen, welche vor ihm steht. Dasselbe gilt für den Java-Client in beide Richtu
 | gemeldete Sichtweite | `--view-distance <2–32>`; Standard 2, in den POV-Bauformen 6 |
 | Zeitlimit beim Verbindungsaufbau | 20 s, danach eine klare Meldung statt stiller Wartezeit |
 | Server-Transfer | wird als Teil derselben Sitzung ohne Wartezeit befolgt |
-| Kick/Verbindungsabbruch | kein automatischer Neuverbindungsversuch; Prozess endet mit Status 1 |
+| Kick/Verbindungsabbruch | Neuverbindung mit wachsender Wartezeit; `--no-reconnect` beendet stattdessen mit Status 1 |
 
 Der Transfer ist absichtlich vom Reconnect nach einem Kick getrennt: Beim Transfer weist der
 bereits verbundene Server den Client ausdrücklich an, innerhalb derselben Sitzung ein neues Ziel
-zu öffnen. Ein Kick oder gewöhnlicher Netzabbruch beendet dagegen den Client.
+zu öffnen; die Sitzung geht mitsamt ihren Cookies weiter. Ein Kick oder gewöhnlicher Netzabbruch
+beginnt dagegen eine neue Sitzung – die abgelegten Cookies werden dabei verworfen, weil ein
+frischer Login sie beim Server neu abfragt.
+
+#### Neuverbinden
+
+| Schalter | Wirkung |
+| --- | --- |
+| *(ohne Angabe)* | an: erster Versuch nach 5 s, Verdopplung bis 60 s, unbegrenzt viele Versuche |
+| `--no-reconnect` | aus; der Prozess endet nach dem Abbruch mit Status 1 |
+| `--reconnect-delay <s>` | Wartezeit vor dem ersten Versuch (Standard 5) |
+| `--max-backoff <s>` | Obergrenze der Wartezeit (Standard 60) |
+| `--reconnect-tries <n>` | nach `n` erfolglosen Versuchen aufgeben; `0` = unbegrenzt |
+
+Die Wartezeit verdoppelt sich mit jedem erfolglosen Versuch und wird bei der Obergrenze gekappt –
+ein Server, der gerade neu startet, wird also nicht im Sekundentakt angeklopft, und einer, der
+nur kurz gestolpert ist, ist nach fünf Sekunden wieder da. Der Zähler springt auf null zurück,
+sobald der Client die Spielphase erreicht hat; eine Sitzung, die nach zwei Stunden abbricht,
+beginnt wieder bei 5 s statt bei der zuletzt erreichten Obergrenze.
+
+`--no-reconnect` gewinnt unabhängig von der Reihenfolge auf der Kommandozeile: Wer
+`--reconnect-delay 10 --no-reconnect` schreibt, bekommt keinen Reconnect. Umgekehrt schaltet jede
+der drei Feineinstellungen den Reconnect ein, falls er nicht ausdrücklich abgeschaltet wurde.
+
+Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<s>s`, damit ein Panel den Zustand
+mitbekommt, ohne die Fehlerausgabe zu lesen.
 
 ### Protokollbasierter Kick-Schutz
 
 - `KeepAlive` sofort beantworten;
 - `Ping` mit `Pong` beantworten;
 - Server-Teleports bestätigen und die Position zurückspiegeln;
+- **jeden Chunk-Stapel bestätigen** (`ChunkBatchReceived`) mit dem Durchsatz, den Vanillas
+  `ChunkBatchSizeCalculator` errechnet. Ohne diese Antwort zählt der `PlayerChunkSender` des
+  Servers die offenen Stapel hoch und **stellt bei zehn die Chunk-Auslieferung ein**;
+- **das Ende der Ladephase melden** (`PlayerLoaded`, ab 1.21.4), sobald Startposition und erster
+  Chunk-Stapel da sind. Ohne diese Meldung hält der Server den Spieler bis zu 30 Sekunden in
+  einem Schwebezustand;
+- **die eigene Position alle 20 Ticks erneut melden**, auch im Stillstand – genau das tut
+  `LocalPlayer.sendPosition()`. Ein Client, der nach dem Beitritt gar kein Positionspaket mehr
+  schickt, sieht auf dem Server anders aus als jeder echte Spieler;
+- ab 1.21.2 jeden 50-ms-Tick mit `ClientTickEnd` abschließen;
 - erzwungene Resource-Packs bestätigen, aber nicht laden;
 - Client-Information und ab 1.21.11 den Verhaltenskodex beantworten;
 - Cookies ablegen und beantworten – auch über einen Server-Transfer hinweg, denn genau dafür
@@ -57,7 +92,12 @@ zu öffnen. Ein Kick oder gewöhnlicher Netzabbruch beendet dagegen den Client.
 - signierte Chat-Nachrichten quittieren;
 - nach Tod automatisch respawnen.
 
-Das ist vom optionalen Anti-AFK getrennt. Der normale Client bewegt sich nicht von selbst.
+Die ausgehende zlib-Kompression läuft auf derselben Stufe wie in Vanilla (`new Deflater()`, also
+die zlib-Vorgabe). Das ist keine Geschmacksfrage: Die Stufe steht in den FLEVEL-Bits jedes
+gesendeten zlib-Kopfes.
+
+Das ist vom optionalen Anti-AFK getrennt. Der normale Client läuft nicht umher und dreht sich
+nicht; er meldet nur, wie jeder Client, weiterhin dieselbe Position.
 
 ### Konto, Chat und Automatisierung
 
@@ -173,8 +213,10 @@ ungefragt das Terminal übernimmt. Beides lässt sich mit `--pov an|aus` umdrehe
 
 ### Texturierte Browser-POV
 
-Mit `--pov-web <port>` und `--pov-resources <client.jar>` startet zusätzlich ein lokaler Viewer.
-Er liest aus der zur gewählten `--mc`-Version passenden Original-Client-JAR:
+Mit `--pov-web <port>` startet zusätzlich ein lokaler Viewer mit **echten Minecraft-Texturen**.
+Die Client-JAR dazu sucht sich der Client selbst; `--pov-resources` braucht es nur, wenn eine
+bestimmte Datei benutzt werden soll (siehe unten). Gelesen wird aus der zur gewählten
+`--mc`-Version passenden Original-Client-JAR:
 
 - Blockstates und vererbte Blockmodelle, einschließlich Varianten, Multipart-Teilen,
   Modellelementen und deren Drehungen;
@@ -188,16 +230,99 @@ Server gesendet; ein Klick außerhalb schließt das Fenster. Der Viewer benutzt 
 kopierten Texturdateien. Die beim Start ausgegebene URL enthält einen zufälligen Zugriffstoken.
 
 ```bash
-pov-afk-linux mc.example.net --mc 26.2 \
-  --pov-web 8765 \
-  --pov-resources "$HOME/.minecraft/versions/26.2/26.2.jar"
+pov-afk-linux mc.example.net --mc 26.2 --pov-web 8765
 ```
+
+#### Woher die Texturen kommen
+
+Die Binary enthält **keine** Minecraft-PNGs und wird auch keine enthalten. Sie liest sie aus einer
+originalen Client-JAR und sucht die in dieser Reihenfolge:
+
+1. den Pfad aus `--pov-resources <datei>`, falls angegeben;
+2. die eigene Ablage `<konfigverzeichnis>/assets/<version>.jar`;
+3. eine vorhandene Minecraft-Installation auf dem Rechner – der offizielle Launcher unter
+   `.minecraft/versions/<version>/<version>.jar` (Windows, Linux, macOS, Flatpak) sowie die
+   Bibliotheksablage von Prism/MultiMC;
+4. der Download von Mojang über dasselbe öffentliche Versionsmanifest, aus dem sich auch der
+   Launcher bedient. Geprüft wird die dort genannte SHA-1-Summe; die Datei landet unter (2) und
+   wird ab dann wiederverwendet.
+
+Das sind einmalig rund 30 MB. Wer das nicht will, schaltet es mit `--pov-resources aus` ab – dann
+läuft der Viewer ohne Texturen weiter. Das Suchen und Einlesen läuft in einem eigenen Thread: der
+Client verbindet sich sofort, und der Browser zeigt so lange an, was gerade passiert.
 
 Nur eine Portnummer bindet an `127.0.0.1`; für einen bewusst extern erreichbaren Viewer kann eine
 IP mitgegeben werden. Ist `--pov-web` gesetzt, bleibt der alte ANSI-Dauerstrom standardmäßig aus,
 damit nicht zwei Renderer parallel arbeiten. `--pov an` bzw. `:pov live` schaltet ihn bei Bedarf
-zusätzlich ein. Die Binary enthält keine Minecraft-PNGs. Die komprimierte State-ID-Zuordnung stammt
-aus Mojangs offiziellen Server-Reports; Herkunft und Regeneration stehen in `rust/data/README.md`.
+zusätzlich ein. Die komprimierte State-ID-Zuordnung stammt aus Mojangs offiziellen
+Server-Reports; Herkunft und Regeneration stehen in `rust/data/README.md`.
+
+#### Einfärbung
+
+Modelle sagen über `tintindex`, **dass** eine Fläche eingefärbt wird; **womit**, steht in Vanilla
+im Code (`BlockColors`) und hängt am Biom. Genau dieses Biom liest die Ansicht jetzt mit: Jeder
+Chunk-Abschnitt bringt neben der Block- auch eine **Biom-Palette** (ein Wert je 4×4×4-Zelle), und
+der Strahl schlägt am Treffer nach, in welchem Biom er steht.
+
+Die Farbe zu einem Biom entsteht so, wie Vanilla sie bildet:
+
+1. Nennt die Biom-Registry des Servers eine feste Farbe (`effects.grass_color`,
+   `foliage_color`, `water_color`), gilt die. Datenpakete setzen das häufig.
+2. Sonst wird `colormap/grass.png` bzw. `foliage.png` aus der Client-JAR an der Stelle abgetastet,
+   die sich aus `temperature` und `downfall` des Bioms ergibt – dieselbe Rechnung wie in
+   `ColorMapColorUtil.get`, samt der Multiplikation von `downfall` mit `temperature`.
+3. Danach greift `grass_color_modifier`: `swamp` setzt einen Festwert, `dark_forest` mischt den
+   Grundton mit `#28340A`.
+
+Blöcke ohne bekannten Einfärber bleiben ungefärbt; die Festwerte, die Vanilla unabhängig vom Biom
+setzt (Fichten- und Birkenlaub, Seerosen), bleiben fest.
+
+Was **nicht** nachgebaut wird, ist Vanillas Mittelung über die Nachbarschaft: Gezeichnet wird die
+Farbe des getroffenen Bioms, nicht der Durchschnitt eines 3×3-Chunk-Fensters. An einer Biomgrenze
+gibt es also eine harte Kante statt eines weichen Übergangs. Der Unterschied ist eine Kante
+gegenüber einem Verlauf – vorher war es der falsche Farbton in jedem Biom außer der Ebene.
+
+Der Aufwand dafür ist klein: Die Farben aller Biome werden einmal beim Empfang der Registry
+ausgerechnet und liegen als flache Tabelle bereit; je getroffenem Bildpunkt bleibt ein
+Feldzugriff. Ein Abschnitt, der nur ein Biom enthält – der Regelfall – behält genau einen Wert
+statt 64.
+
+Flüssigkeiten haben in Vanilla ein Modell **ohne Flächen** – `block/water.json` nennt nur die
+Partikeltextur, weil das Spiel Wasser und Lava eigens zeichnet. Genau diese Partikeltextur wird
+hier als Fläche benutzt.
+
+#### Licht
+
+Vorher waren alle Höhlen genauso hell wie die Oberfläche, und ein Fackelschein war nirgends zu
+sehen: Die Helligkeit einer Fläche hing allein an ihrer Ausrichtung. Jetzt kommt sie aus dem
+Licht, das der Server ohnehin mitschickt – im Chunk-Paket direkt hinter den Blockdaten und danach
+in `LightUpdate`, wenn sich etwas ändert.
+
+Gelesen werden Himmels- und Blocklicht getrennt, als je ein Nibble pro Block. Für einen Treffer
+wird das Licht **des Nachbarblocks vor der getroffenen Fläche** genommen – so, wie das Spiel es
+auch tut; das Licht im Block selbst ist bei einem festen Block null. Aus dem größeren der beiden
+Werte wird die Vanilla-Kurve `f / (4 - 3f)` gebildet und mit der Flächenausrichtung multipliziert.
+Ein Restwert von 0,06 bleibt stehen, damit ein unbeleuchteter Block noch als Umriss erkennbar ist
+statt als schwarze Fläche.
+
+Der Speicher dafür wird nicht einfach hingenommen: Roh sind das 2 × 2048 Byte je Abschnitt, bei
+24 Abschnitten also 96 KB je Chunk. Fast alle davon sind aber gleichförmig – tief unter Tage
+überall 0, hoch über dem Boden überall 15. Ein Abschnitt mit nur einem Wert wird deshalb als
+dieser eine Wert abgelegt. Nachgemessen am selben Arbeitspunkt wie oben:
+
+| | Resident |
+| --- | --- |
+| ohne Licht | 7 984 K |
+| mit Licht, verdichtet | 8 256 K |
+| mit Licht, ohne Verdichtung | 15 208 K |
+
+Die Verdichtung ist also nicht Kosmetik, sondern der Grund, warum das Feature überhaupt
+vertretbar ist: 272 KB statt 7,2 MB.
+
+Licht ist strikt additiv. Ein Server, der keins schickt, ein Paket in unerwarteter Form oder ein
+Abschnitt ohne Lichtdaten kosten weder den Chunk noch die Verbindung – die Ansicht fällt dann
+genau auf die frühere Flächenschattierung zurück. `:pov info` nennt deshalb neben der Chunk-Zahl,
+wie viele davon Licht mitbringen.
 
 ### Terminal-Fallback
 
@@ -208,7 +333,7 @@ aus Mojangs offiziellen Server-Reports; Herkunft und Regeneration stehen in `rus
 | `:pov frame` | ein einzelnes aktuelles Bild |
 | `:pov size <breite> <höhe>` | interne Auflösung 24–160 × 12–80 |
 | `:pov fps <n>` | Bilder je Sekunde, 1–20 |
-| `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Anzahl |
+| `:pov info` | Dimension, Welthöhe, Chunk-/Entity-Anzahl, wie viele Chunks Licht mitbringen |
 
 Dieselben Einstellungen gibt es als Startargument, damit ein Panel sie setzen kann, **bevor** das
 erste Bild rausgeht: `--pov an|aus`, `--pov-size <breite>x<höhe>`, `--pov-fps <n>`. Ohne Angabe
@@ -218,12 +343,14 @@ vor `:pov live` setzen.
 Die POV liest tatsächlich die Serverpakete:
 
 - Dimension-Registry für `min_y` und Welthöhe;
-- vollständige Chunk-Abschnitte und deren kompakte Block-Paletten;
+- Biom-Registry für Temperatur, Niederschlag und feste Farbwerte;
+- vollständige Chunk-Abschnitte und deren kompakte Block- und Biom-Paletten;
+- **Himmels- und Blocklicht** aus dem Chunk-Paket und aus `LightUpdate`;
 - einzelne und abschnittsweise Blockänderungen sowie Chunk-Unloads;
 - Spawn, Bewegung, Teleport und Entfernen von Entities;
 - aktuelle eigene Kameraposition, Yaw und Pitch.
 
-Das Bild entsteht über Raycasts aus der First-Person-Kamera, mit Tiefenverdeckung, Flächenlicht und
+Das Bild entsteht über Raycasts aus der First-Person-Kamera, mit Tiefenverdeckung, echtem Licht und
 Distanznebel. Es folgt Server-Teleports sowie `:look` und `:go` live. Minecraft schickt einem
 headless Protokollclient keine fertigen Frames. Der Terminal-Fallback bleibt deshalb eine farbige
 Voxelansicht; der Browser ergänzt die fehlenden Modelle und Texturen aus der Original-Client-JAR.
@@ -263,9 +390,10 @@ weg. Gemessen an einem identischen Arbeitspunkt (441 gesendete Chunks, Live-Ansi
 | | Resident |
 | --- | --- |
 | vorherige Fassung | 42 940 K |
-| jetzt | 10 132 K |
+| jetzt | 8 256 K |
 
-Der Messlauf steht als Test im Baum und lässt sich nachfahren:
+Im heutigen Wert sind Licht und Biome bereits enthalten; die Aufschlüsselung dazu steht oben unter
+[Licht](#licht). Der Messlauf steht als Test im Baum und lässt sich nachfahren:
 
 ```bash
 cd rust && cargo test --release --features pov-client -- --ignored --nocapture speicher
@@ -286,6 +414,36 @@ gefüllt, gemischte Palette):
 
 ```bash
 cd rust && cargo test --release --features pov -- --ignored --nocapture chunk_einlesen
+```
+
+### Rechenzeit je Bild
+
+Das Zeichnen selbst ist der teuerste Teil der Live-Ansicht – vor allem in der Browser-Auflösung,
+wo je Bild rund hunderttausend Strahlen laufen. Zwei Änderungen daran:
+
+* **Abschnitte werden einmal nachgeschlagen, nicht je Block.** Der Strahl merkt sich, wie viele
+  Blockschritte je Achse noch im aktuellen 16er-Abschnitt bleiben, und läuft ihn dann ohne jede
+  weitere Suche ab. In reiner Luft – bei einem Blick in den Himmel also fast überall – fällt damit
+  die gesamte Nachschlagearbeit weg. Die Schrittfolge bleibt dabei Byte für Byte dieselbe; ein
+  Test vergleicht über zehntausend Strahlen gegen die Lehrbuchfassung.
+* **Große Bilder laufen über mehrere Kerne**, zeilenweise auf Zuruf verteilt. Feste Bänder wären
+  hier falsch: Ein Strahl in den Himmel läuft die vollen 72 Blöcke ab, einer auf den Boden vor den
+  Füßen ist nach drei Schritten fertig – die Wanduhr richtet sich sonst nach dem langsamsten Band.
+  Terminalbilder (höchstens 160×80) bleiben einthreadig; dort kostet das Aufteilen mehr, als es
+  spart.
+
+Gemessen auf einem stark gedrosselten Testrechner, der selbst mit vier Prozessen nur den
+1,37-fachen Durchsatz eines einzelnen erreicht – auf einem echten Vierkerner fällt der zweite
+Schritt entsprechend deutlicher aus:
+
+| Bildgröße | vorher | nur Abschnittssprung | dazu mehrkernig |
+| --- | --- | --- | --- |
+| 64×32 (Terminal) | 3,1 ms | 2,8 ms | 2,8 ms (bewusst einthreadig) |
+| 160×80 (Terminal) | 18 ms | 15 ms | 15 ms (bewusst einthreadig) |
+| 426×240 (Browser) | 141 ms | 110 ms | 77 ms |
+
+```bash
+cd rust && cargo test --release --features ultra -- --ignored --nocapture messlauf_bildrate
 ```
 
 ## Tastenzustand und Anti-AFK
@@ -356,6 +514,13 @@ Alle Paket-IDs und versionsabhängigen Feldreihenfolgen stammen aus der Registri
 und den Lese-/Schreibcodecs der jeweils gepinnten MCProtocolLib-Fassung. Unterschiede liegen in
 `rust/src/proto.rs` und an den dokumentierten Parserzweigen. Tests prüfen unter anderem eindeutige
 Paket-IDs, Textformatierung, Item-Komponenten, Chunk-Paletten und Koordinaten-Packing.
+
+Geraten wird dabei nicht. Beispiel `LightUpdate`: Die Serverpakete werden in
+`MinecraftCodec.CODEC` alphabetisch nach Registrierungsnamen eingetragen, und `light_update` steht
+zwischen `level_particles` und `login`. Also gilt in **jeder** der vier Tabellen
+`cb_light_update == cb_login - 1 == cb_level_chunk + 3` – nachgerechnet ergibt das 42, 47 und 48.
+Ein Test hält diese Beziehung fest, damit sie beim nächsten Protokoll auffällt, statt still falsch
+zu werden.
 
 Dazu kommen Ende-zu-Ende-Tests: `rust/tests/` startet die **wirklich gebaute Datei** gegen einen
 nachgebauten Server und prüft Beitritt, Chat, Befehle, Teleportbestätigung, gemeldete Sichtweite,

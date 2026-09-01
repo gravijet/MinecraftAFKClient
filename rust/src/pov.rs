@@ -29,11 +29,12 @@
 //! Bildzeile. Das Format ist Teil der Schnittstelle nach außen – ein Panel liest es mit –, es
 //! wird deshalb nicht ohne Not geändert.
 
-use crate::buf::{Reader, Writer};
+use crate::buf::Reader;
 use crate::client::Shared;
 use crate::nbt::Nbt;
 use crate::options::Options;
 use crate::pov_assets::Assets;
+use crate::pov_assets::BiomeTint;
 use crate::proto::In;
 
 use std::collections::HashMap;
@@ -172,6 +173,8 @@ impl Indices {
 struct Section {
     palette: Vec<u32>,
     indices: Indices,
+    /// Biom je 4x4x4-Zelle – daraus kommt die Einfärbung von Gras, Laub und Wasser.
+    biomes: Biomes,
 }
 
 impl Section {
@@ -208,6 +211,10 @@ impl Section {
         Section {
             palette: vec![0],
             indices: Indices::Small(vec![0u8; SECTION_BLOCKS].into_boxed_slice()),
+            // Ein Abschnitt, der erst durch eine Blockänderung entsteht, war vorher reine Luft –
+            // und für die hat der Server nie eine Biompalette mitgeschickt. Er bleibt deshalb
+            // ohne Biom, statt eines zu erfinden.
+            biomes: Biomes::Single(0),
         }
     }
 }
@@ -287,6 +294,12 @@ struct Chunk {
     min_section: i32,
     /// `None` = reine Luft; solche Abschnitte belegen keinen Speicher.
     sections: Vec<Option<Arc<Section>>>,
+    /// Himmels- und Blocklicht, sofern der Server sie mitgeschickt hat. `None` heißt: keine
+    /// Angabe – dann bleibt es bei der geschätzten Flächenhelligkeit von früher.
+    ///
+    /// Hinter einem eigenen `Arc`, damit eine Blockänderung (die das Licht nicht anfasst) beim
+    /// Kopieren des Chunks nur einen Zähler erhöht statt das ganze Lichtfeld mitzunehmen.
+    light: Option<Arc<Light>>,
 }
 
 impl Chunk {
@@ -308,6 +321,7 @@ impl Chunk {
         Ok(Chunk {
             min_section: dimension.min_y.div_euclid(16),
             sections,
+            light: None,
         })
     }
 
@@ -388,10 +402,311 @@ fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section
     }
 
     let palette = read_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
-    // Biome braucht die Geometrie nicht – nur exakt überspringen.
-    skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
+    // Biome stehen im selben Abschnitt, nur gröber aufgelöst: eine Nummer je 4x4x4 Zelle.
+    // Aus ihr kommt die Einfärbung von Gras, Laub und Wasser (siehe [`crate::pov_assets`]).
+    let biomes = read_biomes(r, format.modern_palette)?;
 
-    Ok(compact(palette, block_count as usize).map(Arc::new))
+    Ok(compact(palette, block_count as usize).map(|mut section| {
+        section.biomes = biomes;
+        Arc::new(section)
+    }))
+}
+
+/// Was ein Biom zur Einfärbung beisteuert – genau die Felder, die der Server in seiner Registry
+/// mitschickt.
+///
+/// Gras- und Laubfarbe stehen dort nur in Ausnahmefällen ausdrücklich drin. Im Regelfall ergeben
+/// sie sich aus Temperatur und Niederschlag über die Farbkarten der Original-JAR – so, wie es
+/// auch das Spiel selbst rechnet. Wasser dagegen ist je Biom ein fester Wert.
+#[derive(Clone, Copy)]
+pub(crate) struct BiomeParams {
+    pub temperature: f32,
+    pub downfall: f32,
+    pub grass: Option<u32>,
+    pub foliage: Option<u32>,
+    pub water: u32,
+    pub modifier: GrassModifier,
+}
+
+/// Vanillas `GrassColorModifier`: Zwei Biome färben ihr Gras abweichend von der Farbkarte.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrassModifier {
+    None,
+    Swamp,
+    DarkForest,
+}
+
+impl BiomeParams {
+    /// Der Stand ohne jede Registry-Angabe: die Werte, die Vanilla für die Ebene benutzt.
+    pub(crate) const PLAINS: BiomeParams = BiomeParams {
+        temperature: 0.8,
+        downfall: 0.4,
+        grass: None,
+        foliage: None,
+        // `BiomeSpecialEffects` setzt für fast alle Biome genau diesen Wasserton.
+        water: 0x3F76E4,
+        modifier: GrassModifier::None,
+    };
+
+    /// Ein Registry-Eintrag. Fehlt ein Feld, gilt der Vanilla-Vorgabewert – geraten wird nichts.
+    pub(crate) fn from_registry(data: Option<&Nbt>) -> BiomeParams {
+        let Some(data) = data else {
+            return BiomeParams::PLAINS;
+        };
+        let effects = data.get("effects");
+        let color = |key: &str| {
+            effects
+                .and_then(|tag| tag.get_i32(key))
+                .map(|value| value as u32 & 0xFF_FFFF)
+        };
+        BiomeParams {
+            temperature: data.get_f32("temperature").unwrap_or(0.5),
+            downfall: data.get_f32("downfall").unwrap_or(0.5),
+            grass: color("grass_color"),
+            foliage: color("foliage_color"),
+            water: color("water_color").unwrap_or(BiomeParams::PLAINS.water),
+            modifier: match effects.and_then(|tag| tag.get_str("grass_color_modifier")) {
+                Some("swamp") => GrassModifier::Swamp,
+                Some("dark_forest") => GrassModifier::DarkForest,
+                _ => GrassModifier::None,
+            },
+        }
+    }
+}
+
+/// Die Biom-Nummern eines Abschnitts: 4x4x4 Zellen, Reihenfolge wie bei den Blöcken `y, z, x`.
+#[derive(Clone)]
+enum Biomes {
+    /// Der ganze Abschnitt liegt in einem Biom. Das ist weit weg von jeder Biomgrenze der
+    /// Normalfall – und dann kostet er zwei Byte statt 128.
+    Single(u16),
+    Cells(Box<[u16; SECTION_BIOMES]>),
+}
+
+impl Biomes {
+    #[inline]
+    fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+        match self {
+            Biomes::Single(id) => *id,
+            Biomes::Cells(cells) => cells[biome_index(x, y, z)],
+        }
+    }
+}
+
+/// Zellenindex innerhalb eines Abschnitts: je vier Blöcke eine Zelle, Reihenfolge `y, z, x`.
+#[inline]
+fn biome_index(x: i32, y: i32, z: i32) -> usize {
+    ((y.rem_euclid(16) as usize / 4) << 4)
+        | ((z.rem_euclid(16) as usize / 4) << 2)
+        | (x.rem_euclid(16) as usize / 4)
+}
+
+fn read_biomes(r: &mut Reader, modern: bool) -> io::Result<Biomes> {
+    let raw = read_palette(r, SECTION_BIOMES, 3, modern)?;
+    // Eine einwertige Palette ist der Normalfall; sie hier zusammenzufassen spart den Kasten.
+    if raw.values.len() == 1 {
+        return Ok(Biomes::Single(clamp_biome(raw.values[0])));
+    }
+    let mut cells = [0u16; SECTION_BIOMES];
+    for (cell, slot) in cells.iter_mut().zip(raw.indices) {
+        *cell = clamp_biome(raw.values.get(slot as usize).copied().unwrap_or(0));
+    }
+    Ok(Biomes::Cells(Box::new(cells)))
+}
+
+/// Biom-Nummern sind Registry-Indizes; mehr als 65 535 Biome hat keine Registry. Ein größerer
+/// Wert wäre ohnehin in keiner Tabelle zu finden und wird deshalb zu „unbekannt" (0).
+#[inline]
+fn clamp_biome(value: u32) -> u16 {
+    u16::try_from(value).unwrap_or(0)
+}
+
+// ===================== Licht =====================
+
+/// 4096 Blöcke zu je einem Nibble – zwei Blöcke teilen sich ein Byte.
+const LIGHT_BYTES: usize = SECTION_BLOCKS / 2;
+/// So viele Longs fasst ein Bitfeld über alle Lichtabschnitte (zwei mehr als Weltabschnitte).
+const MASK_LONGS: usize = (MAX_SECTIONS + 2).div_ceil(64);
+
+/// Das Licht **eines** Chunk-Abschnitts.
+#[derive(Clone)]
+enum LightSection {
+    /// Überall derselbe Wert. Das ist nicht der Sonderfall, sondern der Normalfall: Über Tage
+    /// steht der Himmel durchgehend auf 15, tief unten ist alles 0. Ein eingelesenes Feld wird
+    /// deshalb zusammengefasst, sobald alle 4096 Nibbles gleich sind – das spart je Abschnitt
+    /// 2 KiB und beim Nachschlagen den Speicherzugriff gleich mit.
+    Uniform(u8),
+    Nibbles(Arc<[u8; LIGHT_BYTES]>),
+}
+
+impl LightSection {
+    #[inline]
+    fn get(&self, index: usize) -> u8 {
+        match self {
+            LightSection::Uniform(value) => *value,
+            // Zwei Blöcke je Byte: der gerade im unteren, der ungerade im oberen Nibble.
+            LightSection::Nibbles(data) => (data[index >> 1] >> ((index & 1) * 4)) & 0xF,
+        }
+    }
+}
+
+/// Himmels- und Blocklicht eines Chunks, wie der Server sie im selben Paket wie die Blöcke
+/// mitschickt.
+///
+/// Die Lichtabschnitte reichen je einen Abschnitt **unter** und **über** die Welt hinaus – daher
+/// zwei mehr als Weltabschnitte.
+#[derive(Clone)]
+struct Light {
+    /// Unterster Lichtabschnitt in Abschnittskoordinaten (ein Abschnitt unter der Welt).
+    min_section: i32,
+    sky: Box<[LightSection]>,
+    block: Box<[LightSection]>,
+}
+
+impl Light {
+    /// Himmels- und Blocklicht an dieser Stelle, jeweils 0..15.
+    #[inline]
+    fn get(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+        let section = y.div_euclid(16) - self.min_section;
+        if section < 0 {
+            return (0, 0); // unter der Welt: kein Licht
+        }
+        let index = section as usize;
+        if index >= self.sky.len() {
+            // Über der Welt steht nichts mehr im Weg – dort ist voller Himmel.
+            return (15, 0);
+        }
+        let local = local_index(x, y, z);
+        (self.sky[index].get(local), self.block[index].get(local))
+    }
+}
+
+/// Bitfeld über die Lichtabschnitte. Fest dimensioniert: 258 Bits passen in fünf Longs, und
+/// damit kostet das Einlesen eines Chunks hier keine einzige Allokation.
+#[derive(Default, Clone, Copy)]
+struct SectionMask([u64; MASK_LONGS]);
+
+impl SectionMask {
+    #[inline]
+    fn has(&self, index: usize) -> bool {
+        self.0
+            .get(index >> 6)
+            .is_some_and(|word| (word >> (index & 63)) & 1 == 1)
+    }
+}
+
+fn read_mask(r: &mut Reader) -> io::Result<SectionMask> {
+    let longs = r.var_int()?;
+    if !(0..=MASK_LONGS as i32).contains(&longs) {
+        return Err(crate::buf::err("POV: Lichtmaske unplausibel"));
+    }
+    let mut mask = SectionMask::default();
+    for slot in mask.0.iter_mut().take(longs as usize) {
+        *slot = r.i64()? as u64;
+    }
+    Ok(mask)
+}
+
+/// Ein Lichtfeld übernehmen – zusammengefasst, wenn alle 4096 Nibbles gleich sind.
+///
+/// Das Zusammenfassen ist hier keine Kosmetik, sondern der Grund, warum Licht überhaupt bezahlbar
+/// ist. Nachgemessen mit `speicherbedarf_der_live_ansicht` (169 Chunks, 845 Abschnitte):
+///
+/// ```text
+///   ohne Licht                       7984 kB
+///   mit Licht, zusammengefasst       8256 kB   (+272 kB)
+///   mit Licht, jedes Feld einzeln   15208 kB   (+7224 kB)
+/// ```
+///
+/// Der Grund ist die Beschaffenheit der Daten und nicht ein Trick: Über Tage steht der Himmel
+/// durchgehend auf 15, unter dem Boden durchgehend auf 0. Nur die paar Abschnitte an der
+/// Geländekante sind wirklich uneinheitlich – und genau die behalten ihr volles Feld.
+fn compact_light(data: &[u8]) -> LightSection {
+    let first = data[0];
+    // „Alle gleich" heißt: jedes Byte gleich *und* die beiden Nibbles darin gleich.
+    if first >> 4 == first & 0xF && data.iter().all(|byte| *byte == first) {
+        return LightSection::Uniform(first & 0xF);
+    }
+    let mut array = [0u8; LIGHT_BYTES];
+    array.copy_from_slice(data);
+    LightSection::Nibbles(Arc::new(array))
+}
+
+/// Die Felder einer Lichtrichtung einlesen und den Abschnitten zuordnen.
+///
+/// Sie kommen in der Reihenfolge der gesetzten Bits der Maske. Ein Abschnitt ohne Feld ist
+/// entweder ausdrücklich als dunkel gemeldet (`empty`) oder gar nicht erwähnt – für die Ansicht
+/// ist beides dasselbe, und geraten wird in keinem der beiden Fälle.
+fn read_light_arrays(
+    r: &mut Reader,
+    count: usize,
+    present: &SectionMask,
+) -> io::Result<Box<[LightSection]>> {
+    let sent = r.var_int()?;
+    if !(0..=count as i32).contains(&sent) {
+        return Err(crate::buf::err("POV: Lichtfelder unplausibel"));
+    }
+    let mut arrays = Vec::with_capacity(sent as usize);
+    for _ in 0..sent {
+        let data = r.byte_slice()?;
+        if data.len() != LIGHT_BYTES {
+            return Err(crate::buf::err("POV: Lichtfeld hat die falsche Groesse"));
+        }
+        arrays.push(compact_light(data));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    let mut next = 0usize;
+    for index in 0..count {
+        out.push(if present.has(index) {
+            let section = arrays.get(next).cloned().unwrap_or(LightSection::Uniform(0));
+            next += 1;
+            section
+        } else {
+            LightSection::Uniform(0)
+        });
+    }
+    Ok(out.into_boxed_slice())
+}
+
+/// Die Lichtdaten am Ende eines Chunk-Pakets und im `LightUpdate`-Paket.
+///
+/// Aufbau: vier Bitfelder (welche Abschnitte ein Feld mitbringen und welche bekanntermaßen ganz
+/// dunkel sind), danach die Felder selbst.
+fn read_light(r: &mut Reader, min_section: i32, sections: usize) -> io::Result<Light> {
+    let count = sections + 2;
+    let sky_mask = read_mask(r)?;
+    let block_mask = read_mask(r)?;
+    // Die beiden „ist ganz dunkel"-Masken werden gelesen, aber nicht ausgewertet: Ein Abschnitt
+    // ohne Feld ist für die Ansicht ohnehin dunkel. Überspringen ginge nicht – sie sind
+    // längenvariabel und stehen mitten im Paket.
+    let _empty_sky = read_mask(r)?;
+    let _empty_block = read_mask(r)?;
+    let sky = read_light_arrays(r, count, &sky_mask)?;
+    let block = read_light_arrays(r, count, &block_mask)?;
+    Ok(Light {
+        min_section: min_section - 1,
+        sky,
+        block,
+    })
+}
+
+/// Die Blockentitäten zwischen Chunkdaten und Licht überspringen.
+///
+/// Gelesen wird davon nichts – die Ansicht zeichnet keine Truhenmodelle und keine Schilder. Der
+/// Lesezeiger muss aber exakt hinter ihnen stehen, sonst beginnt das Licht an der falschen Stelle.
+fn skip_block_entities(r: &mut Reader) -> io::Result<()> {
+    let count = r.var_int()?;
+    if !(0..=(SECTION_BLOCKS * MAX_SECTIONS) as i32).contains(&count) {
+        return Err(crate::buf::err("POV: Blockentitaeten unplausibel"));
+    }
+    for _ in 0..count {
+        r.u8()?; // x und z, je vier Bit
+        r.i16()?; // y
+        r.var_int()?; // Typ
+        crate::nbt::read_network(r)?;
+    }
+    Ok(())
 }
 
 // ===================== Welt =====================
@@ -472,6 +787,9 @@ struct Scene {
     entities: Vec<Entity>,
     /// Stand von [`World::revision`], zu dem `chunks` gehört.
     chunk_revision: u64,
+    /// Farbton je Biom, fertig ausgerechnet. Leer heißt: keine Registry – dann färbt die
+    /// Ansicht wie früher mit dem Ton der gemäßigten Ebene.
+    biome_tints: Arc<[BiomeTint]>,
 }
 
 /// Wiederverwendete Puffer des Zeichners.
@@ -545,14 +863,43 @@ impl<'a> Cursor<'a> {
         self.section
     }
 
-    /// `false` heißt „Luft **oder** Chunk nicht geladen" – durch beides läuft der Strahl weiter.
+    /// Der Farbton des Bioms an dieser Stelle. Ohne Biom-Registry oder in einem Abschnitt, für
+    /// den nie eine Palette kam, ist es der Ton der gemäßigten Ebene – also genau der, den diese
+    /// Ansicht vorher für alles benutzt hat.
     #[inline]
+    fn biome_tint(&mut self, x: i32, y: i32, z: i32) -> BiomeTint {
+        let tints = &self.scene.biome_tints;
+        if tints.is_empty() {
+            return BiomeTint::PLAINS;
+        }
+        let id = self
+            .section(x, y, z)
+            .map_or(0, |section| section.biomes.get(x, y, z));
+        tints.get(id as usize).copied().unwrap_or(BiomeTint::PLAINS)
+    }
+
+    /// Himmels- und Blocklicht an dieser Stelle, oder `None`, wenn der Server für den Chunk
+    /// keins geschickt hat. Läuft über denselben Chunk-Merker wie die Blöcke – im Regelfall ist
+    /// es derselbe Chunk, den der Strahl ohnehin gerade liest.
+    #[inline]
+    fn light(&mut self, x: i32, y: i32, z: i32) -> Option<(u8, u8)> {
+        let chunk = self.chunk(x, z)?;
+        Some(chunk.light.as_ref()?.get(x, y, z))
+    }
+
+    /// `false` heißt „Luft **oder** Chunk nicht geladen" – durch beides läuft der Strahl weiter.
+    ///
+    /// Der Strahl selbst benutzt diesen Einzelzugriff nicht mehr: er holt sich den Abschnitt
+    /// einmal und läuft ihn dann Block für Block ab (siehe [`Ray::steps_in_section`]). Die beiden
+    /// bleiben als **Prüfpfad** stehen – nur über sie lässt sich zeigen, dass der Merker dieselben
+    /// Blöcke liefert wie ein direkter Griff in die Hashtabelle.
+    #[cfg(test)]
     fn solid(&mut self, x: i32, y: i32, z: i32) -> bool {
         self.section(x, y, z)
             .is_some_and(|section| !section.is_air(local_index(x, y, z)))
     }
 
-    #[inline]
+    #[cfg(test)]
     fn block(&mut self, x: i32, y: i32, z: i32) -> u32 {
         self.section(x, y, z)
             .map_or(0, |section| section.state(local_index(x, y, z)))
@@ -562,6 +909,12 @@ impl<'a> Cursor<'a> {
 pub struct Pov {
     world: Mutex<World>,
     dimensions: Mutex<Vec<Dimension>>,
+    /// Die Biome des Servers in Registry-Reihenfolge – die Chunk-Paletten nennen genau diese
+    /// Nummern. Daraus und aus den Farbkarten der Original-JAR entsteht [`Pov::biome_tints`].
+    biomes: Mutex<Vec<BiomeParams>>,
+    /// Fertig ausgerechnete Farbtöne je Biom. Einmal gebaut, wenn Registry **und** Ressourcen
+    /// da sind; der Zeichner reicht nur noch den `Arc` weiter, statt je Bild zu rechnen.
+    biome_tints: Mutex<Arc<[BiomeTint]>>,
     live: AtomicBool,
     renderer_running: AtomicBool,
     width: AtomicUsize,
@@ -578,29 +931,50 @@ pub struct Pov {
     started: Instant,
     /// Puffer, die von Bild zu Bild weiterverwendet werden.
     scratch: Mutex<Scratch>,
-    /// Originale Modelle/Texturen aus der vom Nutzer angegebenen Client-JAR.
-    assets: Option<Arc<Assets>>,
-    asset_error: Option<String>,
+    /// Originale Modelle und Texturen aus einer echten Client-JAR.
+    assets: Assets_,
     web_running: AtomicBool,
+}
+
+/// Die originalen Ressourcen samt ihrem Zustand.
+///
+/// Sie werden **nebenher** geladen: Das Auspacken von rund dreißigtausend Blockzuständen samt
+/// ihren Modellen dauert je nach Rechner ein paar Sekunden, und vorher lief das mitten im Start –
+/// der Client hing also erst am Einlesen von Texturen, ehe er überhaupt eine Verbindung aufbaute.
+/// Beim allerersten Mal kommt sogar noch ein Download davor. Für den AFK-Betrieb ist das genau
+/// die falsche Reihenfolge: Erst verbinden, dann hübsch werden.
+#[derive(Default)]
+struct Assets_ {
+    ready: std::sync::OnceLock<Arc<Assets>>,
+    /// Klartext für Terminal und Browser: was gerade läuft, oder warum es keine Texturen gibt.
+    /// `None` heißt „alles in Ordnung".
+    note: Mutex<Option<String>>,
+}
+
+impl Assets_ {
+    fn get(&self) -> Option<&Assets> {
+        self.ready.get().map(|assets| assets.as_ref())
+    }
+
+    fn note(&self) -> Option<String> {
+        self.note.lock().ok().and_then(|note| note.clone())
+    }
+
+    fn set_note(&self, note: Option<String>) {
+        if let Ok(mut slot) = self.note.lock() {
+            *slot = note;
+        }
+    }
 }
 
 impl Pov {
     pub fn new(options: &Options) -> Pov {
         let (width, height) = options.pov_size.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
-        let (assets, asset_error) = match (options.pov_web, options.pov_resources.as_deref()) {
-            (Some(_), Some(path)) => match Assets::load(path, options.protocol.name) {
-                Ok(assets) => (Some(Arc::new(assets)), None),
-                Err(error) => (None, Some(error)),
-            },
-            (Some(_), None) => (
-                None,
-                Some("keine Client-JAR angegeben (--pov-resources)".to_string()),
-            ),
-            (None, _) => (None, None),
-        };
         Pov {
             world: Mutex::new(World::default()),
             dimensions: Mutex::new(Vec::new()),
+            biomes: Mutex::new(Vec::new()),
+            biome_tints: Mutex::new(Arc::from(Vec::new())),
             live: AtomicBool::new(false),
             renderer_running: AtomicBool::new(false),
             width: AtomicUsize::new(width.clamp(MIN_WIDTH, MAX_WIDTH)),
@@ -612,22 +986,44 @@ impl Pov {
             last_frame_ms: AtomicU64::new(0),
             started: Instant::now(),
             scratch: Mutex::new(Scratch::default()),
-            assets,
-            asset_error,
+            assets: Assets_::default(),
             web_running: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn assets(&self) -> Option<&Assets> {
-        self.assets.as_deref()
+        self.assets.get()
     }
 
-    pub(crate) fn asset_error(&self) -> Option<&str> {
-        self.asset_error.as_deref()
+    /// Was gerade mit den Ressourcen ist – oder `None`, wenn sie einsatzbereit sind.
+    pub(crate) fn asset_note(&self) -> Option<String> {
+        self.assets.note()
     }
 
     pub(crate) fn set_dimensions(&self, dimensions: Vec<Dimension>) {
         *self.dimensions.lock().unwrap() = dimensions;
+    }
+
+    /// Die Biom-Registry des Servers übernehmen und die Farbtöne daraus neu ausrechnen.
+    pub(crate) fn set_biomes(&self, biomes: Vec<BiomeParams>) {
+        *self.biomes.lock().unwrap() = biomes;
+        self.rebuild_biome_tints();
+    }
+
+    /// Farbtöne je Biom ausrechnen. Muss laufen, sobald sich Registry **oder** Ressourcen
+    /// ändern – ohne Farbkarten fehlt der Gras-/Laubton, ohne Registry fehlen die Biome.
+    ///
+    /// Bewusst hier und nicht im Zeichner: Es sind ein paar Dutzend Einträge, aber sie stünden
+    /// sonst in der Schleife, die achtmal je Sekunde läuft.
+    pub(crate) fn rebuild_biome_tints(&self) {
+        let biomes = self.biomes.lock().unwrap();
+        let tints: Vec<BiomeTint> = match self.assets() {
+            Some(assets) => biomes.iter().map(|p| assets.biome_tint(p)).collect(),
+            // Ohne Ressourcen zeichnet die Browser-Ansicht ohnehin nicht; der Wasserton steht
+            // aber schon in der Registry und braucht keine Farbkarte.
+            None => biomes.iter().map(BiomeTint::without_colormaps).collect(),
+        };
+        *self.biome_tints.lock().unwrap() = Arc::from(tints);
     }
 
     pub fn clear(&self) {
@@ -664,6 +1060,10 @@ impl Pov {
         }
         scene.entities.clear();
         scene.entities.extend(world.entities.values().copied());
+        drop(world);
+        // Nur ein Zählerinkrement je Bild: Die Tabelle selbst entsteht beim Eintreffen der
+        // Registry, nicht hier.
+        scene.biome_tints = Arc::clone(&self.biome_tints.lock().unwrap());
     }
 
     fn select_dimension(&self, id: i32, world_name: Option<&str>) {
@@ -785,14 +1185,8 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
                 .set_block(x, y, z, state);
             Ok(())
         }
+        In::LightUpdate => read_light_update(shared, r),
         In::SectionBlocks => read_section_blocks(shared, r),
-        In::ChunkBatchFinished => {
-            r.var_int()?;
-            let mut w = Writer::packet(shared.proto.extra.sb_chunk_batch_received);
-            w.f32(8.0);
-            shared.send(w);
-            Ok(())
-        }
         In::AddEntity => read_add_entity(shared, r),
         In::RemoveEntities => {
             let count = r.var_int()?;
@@ -838,7 +1232,16 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let pov = &shared.extras.pov;
     let dimension = pov.world.lock().unwrap().dimension.clone();
     let preferred = pov.preferred_format(shared);
-    let (chunk, format) = Format::probe(preferred, &dimension, data)?;
+    let (mut chunk, format) = Format::probe(preferred, &dimension, data)?;
+
+    // Hinter den Blöcken stehen erst die Blockentitäten, dann das Licht. Beides ist eine Zugabe:
+    // Misslingt es, behält der Chunk seine Blöcke und die Ansicht rechnet wie früher mit
+    // geschätzter Flächenhelligkeit weiter. Ein Lesefehler darf hier weder den Chunk noch – über
+    // die Fehlerkette – die Verbindung kosten.
+    chunk.light = skip_block_entities(r)
+        .and_then(|()| read_light(r, chunk.min_section, chunk.sections.len()))
+        .ok()
+        .map(Arc::new);
     if pov.format.swap(format.code(), Ordering::Relaxed) != format.code() {
         // Nur beim Wechsel melden – sonst stünde es bei jedem Chunk in der Ausgabe.
         if format != preferred {
@@ -870,6 +1273,28 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     if center.is_some() {
         world.prune();
     }
+    Ok(())
+}
+
+/// Nachgereichtes Licht zu einem Chunk, den wir schon haben.
+///
+/// Der Server schickt das, sobald sich die Beleuchtung ändert – eine gesetzte Fackel, ein
+/// abgebauter Block, oder schlicht, weil die Lichtberechnung beim Beitritt noch nicht fertig war.
+/// Ohne dieses Paket bliebe die Ansicht auf dem Stand des Chunk-Pakets stehen.
+fn read_light_update(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
+    let x = r.var_int()?;
+    let z = r.var_int()?;
+    let mut world = shared.extras.pov.world.lock().unwrap();
+    // Nur für bereits bekannte Chunks: Die Abschnittszahl steht im Chunk, nicht im Lichtpaket.
+    let Some(chunk) = world.chunks.get(&(x, z)) else {
+        return Ok(());
+    };
+    let (min_section, sections) = (chunk.min_section, chunk.sections.len());
+    let light = Arc::new(read_light(r, min_section, sections)?);
+    // `make_mut` kopiert den Chunk nur, solange ihn ein Bild gerade liest; die Abschnitte selbst
+    // hängen an eigenen `Arc`s und werden dabei nicht mitkopiert.
+    Arc::make_mut(world.chunks.get_mut(&(x, z)).unwrap()).light = Some(light);
+    world.touch();
     Ok(())
 }
 
@@ -1211,7 +1636,12 @@ fn compact(raw: RawPalette, non_air: usize) -> Option<Section> {
     }
 
     let indices = Indices::remapped(&indices, &remap, palette.len());
-    Some(Section { palette, indices })
+    // Die Biome setzt der Aufrufer: Sie stehen im Paket erst hinter der Blockpalette.
+    Some(Section {
+        palette,
+        indices,
+        biomes: Biomes::Single(0),
+    })
 }
 
 /// Welche Paletteneinträge sind Luft? `air_total` ist die Zahl der Luftblöcke im Abschnitt.
@@ -1343,14 +1773,20 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
                 .sum();
             let dimension = world.dimension.clone();
             let chunks = world.chunks.len();
+            let lit = world
+                .chunks
+                .values()
+                .filter(|chunk| chunk.light.is_some())
+                .count();
             let entities = world.entities.len();
             drop(world);
             shared.console.info(&format!(
-                "POV: {} · y={}..{} · {} Chunks · {} Abschnitte · {} Entities · {}x{} · {} fps · {}",
+                "POV: {} · y={}..{} · {} Chunks · {} mit Licht · {} Abschnitte · {} Entities · {}x{} · {} fps · {}",
                 dimension.name,
                 dimension.min_y,
                 dimension.min_y + dimension.height - 1,
                 chunks,
+                lit,
                 sections,
                 entities,
                 pov.width.load(Ordering::Relaxed),
@@ -1366,6 +1802,70 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         _ => shared
             .console
             .error("Nutzung: :pov live|stop|frame|size <breite> <hoehe>|fps <1-20>|info"),
+    }
+}
+
+/// Die originalen Ressourcen im Hintergrund beschaffen und einlesen.
+///
+/// Läuft nebenher, damit weder der Download noch das Auspacken der Modelle den Verbindungsaufbau
+/// aufhält. Bis der Thread fertig ist, sagt [`Pov::asset_note`], was gerade passiert – die
+/// Browser-Ansicht zeigt genau diesen Text an, statt einfach schwarz zu bleiben.
+pub(crate) fn start_assets(shared: &Arc<Shared>) {
+    if shared.options().pov_web.is_none() {
+        return; // Ohne Browser-Ansicht liest niemand die Texturen.
+    }
+    let pov = &shared.extras.pov;
+    if matches!(
+        shared.options().pov_resources,
+        crate::pov_resources::Source::Off
+    ) {
+        pov.assets
+            .set_note(Some("ohne Texturen (--pov-resources aus)".to_string()));
+        return;
+    }
+    pov.assets
+        .set_note(Some("Ressourcen werden geladen ...".to_string()));
+
+    let owned = Arc::clone(shared);
+    let started = thread::Builder::new()
+        .name("afk-pov-assets".into())
+        .spawn(move || {
+            let version = owned.proto.name;
+            let source = &owned.options().pov_resources;
+            let pov = &owned.extras.pov;
+            let path = match crate::pov_resources::locate(&owned.console, version, source) {
+                Ok(path) => path,
+                Err(error) => {
+                    owned
+                        .console
+                        .warn(&format!("Live-Ansicht ohne Texturen: {}", error));
+                    return pov.assets.set_note(Some(error));
+                }
+            };
+            match Assets::load(&path, version) {
+                Ok(assets) => {
+                    // `set` kann nur fehlschlagen, wenn schon jemand geladen hätte – den Thread
+                    // gibt es aber genau einmal.
+                    let _ = pov.assets.ready.set(Arc::new(assets));
+                    pov.assets.set_note(None);
+                    // Erst jetzt gibt es die Farbkarten. Die Biome sind längst da (sie kommen in
+                    // der Konfigurationsphase, das Laden hier läuft nebenher) – ohne dieses
+                    // Nachrechnen bliebe jedes Biom auf dem Ebene-Ton stehen.
+                    pov.rebuild_biome_tints();
+                    owned.console.ok("Live-Ansicht: Texturen sind geladen.");
+                }
+                Err(error) => {
+                    owned
+                        .console
+                        .warn(&format!("Live-Ansicht ohne Texturen: {}", error));
+                    pov.assets.set_note(Some(error));
+                }
+            }
+        });
+    if started.is_err() {
+        pov.assets.set_note(Some(
+            "Ressourcen-Thread liess sich nicht starten".to_string(),
+        ));
     }
 }
 
@@ -1402,8 +1902,8 @@ pub(crate) fn web_world(shared: &Arc<Shared>) -> serde_json::Value {
         "dimension": &world.dimension.name,
         "chunks": world.chunks.len(),
         "entities": world.entities.len(),
-        "textures": shared.extras.pov.assets.is_some(),
-        "texture_error": shared.extras.pov.asset_error(),
+        "textures": shared.extras.pov.assets().is_some(),
+        "texture_error": shared.extras.pov.asset_note(),
     })
 }
 
@@ -1548,6 +2048,126 @@ struct Pixel {
     depth: f64,
 }
 
+/// Wie viele Kerne die Live-Ansicht höchstens benutzt.
+///
+/// Die Strahlen eines Bildes hängen nicht voneinander ab, das Bild lässt sich also in Bänder
+/// zerlegen. Gedeckelt, weil dieser Client nebenher laufen soll und nicht die Maschine belegt:
+/// Vier Bänder holen den Löwenanteil, alles darüber teilt vor allem den Speicherzugriff auf.
+const MAX_RENDER_THREADS: usize = 4;
+/// Ab dieser Bildgröße lohnt das Aufteilen. Ein Terminalbild ist höchstens 160x80 groß und in
+/// wenigen Millisekunden gerechnet – dort kostet das Anlegen der Threads mehr, als es spart.
+const PARALLEL_PIXELS: usize = 20_000;
+
+/// Richtung des Strahls durch einen Bildpunkt. Echte Zentralprojektion statt gleichmäßig
+/// verteilter Winkel: sonst „biegt" sich der Horizont bei 90° Blickfeld sichtbar nach außen.
+#[inline]
+fn pixel_direction(
+    basis: Basis,
+    half: (f64, f64),
+    size: (usize, usize),
+    px: usize,
+    py: usize,
+) -> (f64, f64, f64) {
+    let sx = ((px as f64 + 0.5) / size.0 as f64 - 0.5) * 2.0 * half.0;
+    let sy = (0.5 - (py as f64 + 0.5) / size.1 as f64) * 2.0 * half.1;
+    normalize((
+        basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
+        basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
+        basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
+    ))
+}
+
+/// Jeden Bildpunkt mit `shade` berechnen – auf großen Bildern über mehrere Kerne.
+///
+/// Verteilt wird **zeilenweise auf Zuruf**, nicht in feste Bänder. Das ist kein Selbstzweck: Der
+/// Aufwand je Zeile geht weit auseinander. Ein Strahl in den Himmel läuft die vollen 72 Blöcke
+/// ab, ein Strahl auf den Boden vor den Füßen ist nach drei Schritten fertig. Bei festen Bändern
+/// bekäme der Thread mit dem Himmel ein Vielfaches der Arbeit, und die anderen drei warteten auf
+/// ihn – die Wanduhr richtet sich nach dem langsamsten Band, nicht nach dem Mittel.
+///
+/// Jeder Thread bekommt seinen eigenen [`Cursor`]; geteilt wird nur die Szene, und die wird nur
+/// gelesen.
+fn render_pixels(
+    scene: &Scene,
+    width: usize,
+    height: usize,
+    pixels: &mut Vec<Pixel>,
+    shade: impl Fn(&mut Cursor, usize, usize) -> Pixel + Sync,
+) {
+    let workers = render_workers(width * height, height);
+    render_pixels_with(scene, width, height, workers, pixels, shade)
+}
+
+/// Wie [`render_pixels`], aber mit vorgegebener Thread-Zahl.
+///
+/// Getrennt, damit der Test beide Wege auf **derselben** Szene und Größe vergleichen kann: Ob ein
+/// Bild geteilt gerechnet wird, darf an keinem einzigen Bildpunkt zu sehen sein.
+fn render_pixels_with(
+    scene: &Scene,
+    width: usize,
+    height: usize,
+    workers: usize,
+    pixels: &mut Vec<Pixel>,
+    shade: impl Fn(&mut Cursor, usize, usize) -> Pixel + Sync,
+) {
+    pixels.clear();
+    pixels.resize(
+        width * height,
+        Pixel {
+            rgb: (0, 0, 0),
+            depth: MAX_DISTANCE,
+        },
+    );
+
+    if workers <= 1 {
+        let mut cursor = Cursor::new(scene);
+        for (py, row) in pixels.chunks_mut(width).enumerate() {
+            for (px, pixel) in row.iter_mut().enumerate() {
+                *pixel = shade(&mut cursor, px, py);
+            }
+        }
+        return;
+    }
+
+    // Die Zeilen liegen als getrennte Ausschnitte vor; jeder gehört genau einem Thread, sobald er
+    // ihn aus der Ausgabe genommen hat. Die Sperre wird je Zeile einmal kurz genommen – bei ein
+    // paar hundert Zeilen je Bild ist das nicht messbar.
+    let rows: Vec<(usize, &mut [Pixel])> = pixels.chunks_mut(width).enumerate().collect();
+    let queue = Mutex::new(rows.into_iter());
+    let shade = &shade;
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let queue = &queue;
+            scope.spawn(move || {
+                let mut cursor = Cursor::new(scene);
+                loop {
+                    // Sperre nur fürs Herausnehmen halten, nicht fürs Rechnen.
+                    let next = queue.lock().map(|mut queue| queue.next());
+                    let Ok(Some((py, row))) = next else {
+                        return;
+                    };
+                    for (px, pixel) in row.iter_mut().enumerate() {
+                        *pixel = shade(&mut cursor, px, py);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Wie viele Threads ein Bild dieser Größe bekommt. `1` heißt „ohne Threads".
+fn render_workers(pixels: usize, height: usize) -> usize {
+    if pixels < PARALLEL_PIXELS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_RENDER_THREADS)
+        .min(height)
+        .max(1)
+}
+
 /// Ein Bild in bereitgestellte Puffer zeichnen. `pixels` und `out` dürfen (und sollen) von einem
 /// Bild zum nächsten weiterverwendet werden; ihr Inhalt wird hier vollständig ersetzt.
 #[allow(clippy::too_many_arguments)]
@@ -1561,44 +2181,24 @@ fn render_into(
     out: &mut String,
 ) {
     let origin = (position.0, position.1 + 1.62, position.2);
-    // Nur Platz schaffen, nicht füllen: jeder Bildpunkt wird gleich darunter ohnehin geschrieben.
-    // Das vorherige `resize` legte 160x80 Werte an, die im selben Atemzug wieder überschrieben
-    // wurden – bei zwanzig Bildern je Sekunde reine Verschwendung.
-    pixels.clear();
-    pixels.reserve(width * height);
-
-    // Echte Zentralprojektion statt gleichmäßig verteilter Winkel: sonst „biegt" sich der
-    // Horizont bei 90° Blickfeld sichtbar nach außen.
     let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
     let half_height = half_width * height as f64 / width as f64;
     let basis = camera_basis(position.3 as f64, position.4 as f64);
-    // Ein Merker für das ganze Bild: benachbarte Strahlen beginnen im selben Chunk.
-    let mut cursor = Cursor::new(scene);
 
-    for py in 0..height {
-        let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
+    render_pixels(scene, width, height, pixels, |cursor, px, py| {
         let sky = sky_color(py, height);
-        for px in 0..width {
-            let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
-            let direction = normalize((
-                basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
-                basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
-                basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
-            ));
-            // Zeilenweise von links nach rechts – genau die Reihenfolge, in der `pixels`
-            // gelesen wird, deshalb reicht Anhängen statt Indizieren.
-            pixels.push(match cast(&mut cursor, origin, direction) {
-                Some((state, distance, face)) => Pixel {
-                    rgb: fog(block_color(state, face, distance), sky, distance),
-                    depth: distance,
-                },
-                None => Pixel {
-                    rgb: sky,
-                    depth: MAX_DISTANCE,
-                },
-            });
+        let direction = pixel_direction(basis, (half_width, half_height), (width, height), px, py);
+        match cast(cursor, origin, direction) {
+            Some((state, distance, face)) => Pixel {
+                rgb: fog(block_color(state, face, distance), sky, distance),
+                depth: distance,
+            },
+            None => Pixel {
+                rgb: sky,
+                depth: MAX_DISTANCE,
+            },
         }
-    }
+    });
     overlay_entities(
         origin,
         basis,
@@ -1660,14 +2260,11 @@ pub(crate) fn web_frame(
     let position = shared
         .position()
         .ok_or_else(|| "Position noch unbekannt".to_string())?;
-    let assets = shared.extras.pov.assets().ok_or_else(|| {
-        shared
-            .extras
-            .pov
-            .asset_error()
-            .unwrap_or("keine Ressourcen")
-            .to_string()
-    })?;
+    let assets = shared
+        .extras
+        .pov
+        .assets()
+        .ok_or_else(|| shared.extras.pov.asset_note().unwrap_or_else(|| "keine Ressourcen".to_string()))?;
     let width = width.clamp(160, 640);
     let height = height.clamp(90, 360);
     if width.saturating_mul(height) > 640 * 360 {
@@ -1716,50 +2313,24 @@ fn render_textured(
     pixels: &mut Vec<Pixel>,
 ) {
     let origin = (position.0, position.1 + 1.62, position.2);
-    pixels.clear();
-    pixels.reserve(width * height);
     let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
     let half_height = half_width * height as f64 / width as f64;
     let basis = camera_basis(position.3 as f64, position.4 as f64);
-    let mut cursor = Cursor::new(scene);
 
-    for py in 0..height {
-        let sy = (0.5 - (py as f64 + 0.5) / height as f64) * 2.0 * half_height;
+    render_pixels(scene, width, height, pixels, |cursor, px, py| {
         let sky = sky_color(py, height);
-        for px in 0..width {
-            let sx = ((px as f64 + 0.5) / width as f64 - 0.5) * 2.0 * half_width;
-            let direction = normalize((
-                basis.0 .0 + basis.1 .0 * sx + basis.2 .0 * sy,
-                basis.0 .1 + basis.1 .1 * sx + basis.2 .1 * sy,
-                basis.0 .2 + basis.1 .2 * sx + basis.2 .2 * sy,
-            ));
-            pixels.push(
-                match cast_textured(&mut cursor, origin, direction, assets) {
-                    Some((rgba, distance, face)) => {
-                        let light = match face {
-                            3 => 1.0,
-                            2 => 0.55,
-                            4 | 5 => 0.82,
-                            _ => 0.70,
-                        };
-                        let color = (
-                            (rgba.0 as f64 * light).min(255.0) as u8,
-                            (rgba.1 as f64 * light).min(255.0) as u8,
-                            (rgba.2 as f64 * light).min(255.0) as u8,
-                        );
-                        Pixel {
-                            rgb: fog(color, sky, distance),
-                            depth: distance,
-                        }
-                    }
-                    None => Pixel {
-                        rgb: sky,
-                        depth: MAX_DISTANCE,
-                    },
-                },
-            );
+        let direction = pixel_direction(basis, (half_width, half_height), (width, height), px, py);
+        match cast_textured(cursor, origin, direction, assets) {
+            Some(((rgba, distance, face), light)) => Pixel {
+                rgb: fog(shade_face(rgba, face, light), sky, distance),
+                depth: distance,
+            },
+            None => Pixel {
+                rgb: sky,
+                depth: MAX_DISTANCE,
+            },
         }
-    }
+    });
     // Der Browser legt absichtlich keine pinken/tuerkisen Ersatzrechtecke ueber die echten
     // Texturen. Fuer originalgetreue Entities braeuchte er Entity-Modelle, Metadaten, Ausruestung
     // und Skins, die dieser schlanke Weltzustand noch nicht fuehrt. Die alte Terminalausgabe
@@ -1821,38 +2392,120 @@ fn view_direction(yaw: f64, pitch: f64) -> (f64, f64, f64) {
     )
 }
 
-/// Voxel-DDA: höchstens ein Zugriff je durchquertem Block, nicht hunderte kleine Ray-Schritte.
+/// Ein laufender Voxel-DDA: höchstens ein Schritt je durchquertem Block, nicht hunderte kleine
+/// Ray-Schritte.
+///
+/// Ausgelagert, weil der farbige und der texturierte Strahl **denselben** Durchlauf brauchen und
+/// sich nur darin unterscheiden, was sie bei einem Treffer tun. Vorher stand die Schrittlogik
+/// zweimal da, und die beiden Fassungen waren bereits leicht auseinandergelaufen (die eine führte
+/// die getroffene Seite mit, die andere nicht).
+struct Ray {
+    cell: (i32, i32, i32),
+    /// Parameter, bei dem der Strahl die nächste Blockgrenze der jeweiligen Achse überschreitet.
+    next: (f64, f64, f64),
+    /// Parameterzuwachs je Blockschritt der jeweiligen Achse.
+    delta: (f64, f64, f64),
+    step: (i32, i32, i32),
+    distance: f64,
+    /// Achse, über deren Grenze der Strahl zuletzt eingetreten ist (0 = x, 1 = y, 2 = z).
+    face: usize,
+}
+
+impl Ray {
+    fn new(origin: (f64, f64, f64), dir: (f64, f64, f64)) -> Ray {
+        let cell = (
+            origin.0.floor() as i32,
+            origin.1.floor() as i32,
+            origin.2.floor() as i32,
+        );
+        Ray {
+            cell,
+            next: (
+                first_boundary(origin.0, dir.0, cell.0),
+                first_boundary(origin.1, dir.1, cell.1),
+                first_boundary(origin.2, dir.2, cell.2),
+            ),
+            delta: (inv_abs(dir.0), inv_abs(dir.1), inv_abs(dir.2)),
+            step: (sign(dir.0), sign(dir.1), sign(dir.2)),
+            distance: 0.0,
+            // Startet die Kamera in einem Block, gilt dessen Oberseite als getroffene Seite.
+            face: 1,
+        }
+    }
+
+    /// Ein Schritt: Es rückt die Achse weiter, deren nächste Blockgrenze am nächsten liegt.
+    #[inline(always)]
+    fn advance(&mut self) {
+        if self.next.0 <= self.next.1 && self.next.0 <= self.next.2 {
+            self.cell.0 += self.step.0;
+            self.distance = self.next.0;
+            self.next.0 += self.delta.0;
+            self.face = 0;
+        } else if self.next.1 <= self.next.2 {
+            self.cell.1 += self.step.1;
+            self.distance = self.next.1;
+            self.next.1 += self.delta.1;
+            self.face = 1;
+        } else {
+            self.cell.2 += self.step.2;
+            self.distance = self.next.2;
+            self.next.2 += self.delta.2;
+            self.face = 2;
+        }
+    }
+
+    /// Wie viele Blockschritte je Achse noch bleiben, bis der Strahl den 16er-Abschnitt verlässt,
+    /// in dem er gerade steht.
+    ///
+    /// Damit lässt sich der Abschnitt genau einmal nachschlagen, statt bei jedem einzelnen Block
+    /// erneut. Der Zähler ersetzt keinen Rechenschritt des Durchlaufs – die Schrittfolge bleibt
+    /// Byte für Byte dieselbe wie ohne ihn; es fällt nur die Suche weg. Genau deshalb ist er
+    /// gegenüber einer echten Abkürzung über die Abschnittsgrenze der sichere Weg: Dort müsste
+    /// die Austrittsfläche geteilt, die Blockgrenzen dagegen aufaddiert werden, und bei einer
+    /// Kamera genau auf einer Blockecke fallen beide Rechnungen um eine Zelle auseinander.
+    #[inline(always)]
+    fn steps_in_section(&self) -> (i32, i32, i32) {
+        // `& 15` ist der Rest zur Sechzehn auch für negative Koordinaten (Zweierkomplement) –
+        // dasselbe, was `local_index` mit `rem_euclid(16)` rechnet.
+        let axis = |cell: i32, step: i32| {
+            if step > 0 {
+                16 - (cell & 15)
+            } else {
+                (cell & 15) + 1
+            }
+        };
+        (
+            axis(self.cell.0, self.step.0),
+            axis(self.cell.1, self.step.1),
+            axis(self.cell.2, self.step.2),
+        )
+    }
+}
+
+/// Farbiger Strahl für die Terminalansicht: liefert Blockzustand, Abstand und getroffene Achse.
 fn cast(
     cursor: &mut Cursor,
     origin: (f64, f64, f64),
     dir: (f64, f64, f64),
 ) -> Option<(u32, f64, usize)> {
-    let mut cell = (
-        origin.0.floor() as i32,
-        origin.1.floor() as i32,
-        origin.2.floor() as i32,
-    );
-    let step = (sign(dir.0), sign(dir.1), sign(dir.2));
-    let delta = (inv_abs(dir.0), inv_abs(dir.1), inv_abs(dir.2));
-    let mut next = (
-        first_boundary(origin.0, dir.0, cell.0),
-        first_boundary(origin.1, dir.1, cell.1),
-        first_boundary(origin.2, dir.2, cell.2),
-    );
-    let mut distance = 0.0;
-    let mut face = 1usize;
-    while distance <= MAX_DISTANCE {
-        // Erst die billige Sichtprüfung; die Zustands-ID kostet einen Palettenzugriff mehr.
-        //
-        // Einen ganzen leeren Abschnitt in einem Zug zu überspringen wäre verlockend, geht aber
-        // nicht sauber: Die Austrittsfläche müsste geteilt, die Blockgrenzen dagegen aufaddiert
-        // werden, und bei einer Kamera genau auf einer Blockecke fallen beide Rechnungen um eine
-        // Zelle auseinander. Das wäre ein sichtbar falscher Bildpunkt für kaum gesparte Arbeit –
-        // der Abschnittsmerker in [`Cursor`] holt den Löwenanteil ohnehin.
-        if cursor.solid(cell.0, cell.1, cell.2) {
-            return Some((cursor.block(cell.0, cell.1, cell.2), distance, face));
+    let mut ray = Ray::new(origin, dir);
+    while ray.distance <= MAX_DISTANCE {
+        // Einmal je Abschnitt nachschlagen, dann darin Block für Block laufen. `None` heißt
+        // „reine Luft oder gar nicht geladen" – durch beides läuft der Strahl ohne jede weitere
+        // Prüfung durch, und das ist bei einer Ansicht in den Himmel der Normalfall.
+        let section = cursor.section(ray.cell.0, ray.cell.1, ray.cell.2);
+        let mut left = ray.steps_in_section();
+        loop {
+            if let Some(section) = section {
+                let index = local_index(ray.cell.0, ray.cell.1, ray.cell.2);
+                if !section.is_air(index) {
+                    return Some((section.state(index), ray.distance, ray.face));
+                }
+            }
+            if !step_within_section(&mut ray, &mut left) {
+                break;
+            }
         }
-        advance(&mut cell, &mut next, &mut distance, &mut face, step, delta);
     }
     None
 }
@@ -1860,84 +2513,84 @@ fn cast(
 /// DDA fuer den Textur-Renderer. Der Treffer enthaelt die konkrete Seite und ihre UV-Koordinate;
 /// ein voll transparenter Texel gilt nicht als Treffer. Dadurch werden Alpha-Ausschnitte echter
 /// Vanilla-Texturen nicht wieder zu undurchsichtigen Farbklotzen.
+/// Nachbarblock jenseits einer Fläche – dort steht das Licht, das sie beleuchtet, und nicht im
+/// getroffenen Block selbst (der ist undurchsichtig und deshalb stockdunkel).
+///
+/// Reihenfolge wie in [`crate::pov_assets`]: west, ost, unten, oben, nord, süd.
+const FACE_OFFSET: [(i32, i32, i32); 6] = [
+    (-1, 0, 0),
+    (1, 0, 0),
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+];
+
 fn cast_textured(
     cursor: &mut Cursor,
     origin: (f64, f64, f64),
     dir: (f64, f64, f64),
     assets: &Assets,
-) -> Option<crate::pov_assets::TexturedHit> {
-    let mut cell = (
-        origin.0.floor() as i32,
-        origin.1.floor() as i32,
-        origin.2.floor() as i32,
-    );
-    let step = (sign(dir.0), sign(dir.1), sign(dir.2));
-    let delta = (inv_abs(dir.0), inv_abs(dir.1), inv_abs(dir.2));
-    let mut next = (
-        first_boundary(origin.0, dir.0, cell.0),
-        first_boundary(origin.1, dir.1, cell.1),
-        first_boundary(origin.2, dir.2, cell.2),
-    );
-    let mut distance = 0.0;
-    while distance <= MAX_DISTANCE {
-        if cursor.solid(cell.0, cell.1, cell.2) {
-            let leave = next.0.min(next.1).min(next.2).min(MAX_DISTANCE);
-            if let Some(hit) = assets.hit(
-                cursor.block(cell.0, cell.1, cell.2),
-                cell,
-                origin,
-                dir,
-                distance,
-                leave,
-            ) {
-                return Some(hit);
+) -> Option<(crate::pov_assets::TexturedHit, Option<u8>)> {
+    let mut ray = Ray::new(origin, dir);
+    while ray.distance <= MAX_DISTANCE {
+        let section = cursor.section(ray.cell.0, ray.cell.1, ray.cell.2);
+        let mut left = ray.steps_in_section();
+        loop {
+            if let Some(section) = section {
+                let index = local_index(ray.cell.0, ray.cell.1, ray.cell.2);
+                if !section.is_air(index) {
+                    let leave = ray
+                        .next
+                        .0
+                        .min(ray.next.1)
+                        .min(ray.next.2)
+                        .min(MAX_DISTANCE);
+                    let biome = cursor.biome_tint(ray.cell.0, ray.cell.1, ray.cell.2);
+                    if let Some(hit) = assets.hit(
+                        section.state(index),
+                        ray.cell,
+                        origin,
+                        dir,
+                        ray.distance,
+                        leave,
+                        &biome,
+                    ) {
+                        // Vanilla nimmt den helleren der beiden Werte: Eine Fackel erhellt eine
+                        // Wand genauso wie die Sonne, und beides addiert sich nicht.
+                        let (dx, dy, dz) = FACE_OFFSET[hit.2.min(5)];
+                        let light = cursor
+                            .light(ray.cell.0 + dx, ray.cell.1 + dy, ray.cell.2 + dz)
+                            .map(|(sky, block)| sky.max(block));
+                        return Some((hit, light));
+                    }
+                }
             }
-        }
-
-        if next.0 <= next.1 && next.0 <= next.2 {
-            cell.0 += step.0;
-            distance = next.0;
-            next.0 += delta.0;
-        } else if next.1 <= next.2 {
-            cell.1 += step.1;
-            distance = next.1;
-            next.1 += delta.1;
-        } else {
-            cell.2 += step.2;
-            distance = next.2;
-            next.2 += delta.2;
+            if !step_within_section(&mut ray, &mut left) {
+                break;
+            }
         }
     }
     None
 }
 
-/// Ein Schritt des Voxel-DDA: Es rückt die Achse weiter, deren nächste Blockgrenze am
-/// nächsten liegt.
-#[inline]
-fn advance(
-    cell: &mut (i32, i32, i32),
-    next: &mut (f64, f64, f64),
-    distance: &mut f64,
-    face: &mut usize,
-    step: (i32, i32, i32),
-    delta: (f64, f64, f64),
-) {
-    if next.0 <= next.1 && next.0 <= next.2 {
-        cell.0 += step.0;
-        *distance = next.0;
-        next.0 += delta.0;
-        *face = 0;
-    } else if next.1 <= next.2 {
-        cell.1 += step.1;
-        *distance = next.1;
-        next.1 += delta.1;
-        *face = 1;
-    } else {
-        cell.2 += step.2;
-        *distance = next.2;
-        next.2 += delta.2;
-        *face = 2;
+/// Einen Block weiterrücken. `false` = der Strahl hat den Abschnitt verlassen oder seine
+/// Reichweite erschöpft; dann muss der Aufrufer wieder nachschlagen.
+#[inline(always)]
+fn step_within_section(ray: &mut Ray, left: &mut (i32, i32, i32)) -> bool {
+    ray.advance();
+    if ray.distance > MAX_DISTANCE {
+        return false;
     }
+    // `advance` hat die Achse gesetzt, über deren Grenze wir gerade getreten sind – genau deren
+    // Restzähler sinkt.
+    let remaining = match ray.face {
+        0 => &mut left.0,
+        1 => &mut left.1,
+        _ => &mut left.2,
+    };
+    *remaining -= 1;
+    *remaining > 0
 }
 
 fn sign(value: f64) -> i32 {
@@ -1964,6 +2617,43 @@ fn first_boundary(origin: f64, direction: f64, cell: i32) -> f64 {
     } else {
         f64::INFINITY
     }
+}
+
+/// Vanillas Helligkeitskurve zu einer Lichtstufe: `f / (4 - 3f)` mit `f = stufe / 15`.
+///
+/// Sie ist deutlich nicht-linear – Stufe 7 ergibt nicht die halbe, sondern rund ein Fünftel der
+/// Helligkeit. Genau das macht den Unterschied zwischen „Höhle" und „Abend" sichtbar.
+///
+/// Der Boden von 0,06 ist bewusst keine Physik: Vanilla käme bei Stufe 0 auf glatt Null. Ein
+/// vollständig schwarzes Bild ist aber keine Auskunft mehr, und die Ansicht soll auch in einer
+/// unbeleuchteten Höhle noch zeigen, wo Wände stehen.
+#[inline]
+fn brightness(level: u8) -> f64 {
+    let f = level.min(15) as f64 / 15.0;
+    (f / (4.0 - 3.0 * f)).max(0.06)
+}
+
+/// Seitenabhängige Helligkeit wie im Spiel: Oberseiten hell, Unterseiten dunkel, die vier
+/// Seitenflächen dazwischen. Dieselben Faktoren benutzt auch das Gegenstands-Icon in
+/// [`crate::pov_assets`].
+///
+/// `light` ist die echte Lichtstufe aus dem Chunk-Paket, sofern der Server sie geschickt hat.
+/// Ohne sie bleibt es bei der reinen Flächenhelligkeit – dann sieht die Ansicht aus wie vorher,
+/// statt eine Beleuchtung zu erfinden, die niemand gemeldet hat.
+#[inline]
+fn shade_face(rgba: (u8, u8, u8, u8), face: usize, light: Option<u8>) -> (u8, u8, u8) {
+    let side = match face {
+        3 => 1.0,
+        2 => 0.55,
+        4 | 5 => 0.82,
+        _ => 0.70,
+    };
+    let factor = side * light.map_or(1.0, brightness);
+    (
+        (rgba.0 as f64 * factor).min(255.0) as u8,
+        (rgba.1 as f64 * factor).min(255.0) as u8,
+        (rgba.2 as f64 * factor).min(255.0) as u8,
+    )
 }
 
 fn sky_color(y: usize, height: usize) -> (u8, u8, u8) {
@@ -2079,6 +2769,101 @@ fn overlay_entities(
 mod tests {
     use super::*;
     use crate::buf::Writer;
+
+    /// Ein Lichtpaket für `sections` Weltabschnitte bauen: Himmelslicht nur in den in `lit`
+    /// genannten **Licht**abschnitten, Blocklicht nirgends.
+    fn light_bytes(sections: usize, lit: &[usize], level: u8) -> Vec<u8> {
+        let mut w = Writer::default();
+        let mut mask = 0u64;
+        for index in lit {
+            mask |= 1 << index;
+        }
+        w.var_int(1);
+        w.i64(mask as i64);
+        w.var_int(0); // Blockmaske: nichts
+        w.var_int(0); // leer-Himmel
+        w.var_int(0); // leer-Block
+        w.var_int(lit.len() as i32);
+        for _ in lit {
+            w.var_int(LIGHT_BYTES as i32);
+            for _ in 0..LIGHT_BYTES {
+                w.u8(level << 4 | level);
+            }
+        }
+        w.var_int(0); // keine Blocklichtfelder
+        let _ = sections;
+        w.data
+    }
+
+    /// Der Normalfall eines Chunks: Über Tage überall 15, darunter 0. Genau dafür gibt es die
+    /// Zusammenfassung – ohne sie kostete jeder dieser Abschnitte 2 KiB.
+    #[test]
+    fn gleichmaessiges_licht_wird_zusammengefasst() {
+        let bytes = light_bytes(24, &[10, 11], 15);
+        let mut r = Reader::new(&bytes);
+        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        assert!(
+            matches!(light.sky[10], LightSection::Uniform(15)),
+            "ein durchgehend helles Feld muss zusammengefasst werden"
+        );
+        assert!(
+            matches!(light.sky[0], LightSection::Uniform(0)),
+            "ein Abschnitt ohne Feld ist dunkel – geraten wird nichts"
+        );
+        assert_eq!(r.remaining(), 0, "das Paket muss restlos gelesen sein");
+    }
+
+    /// Die Lichtabschnitte sind gegen die Weltabschnitte um einen verschoben: Lichtabschnitt 0
+    /// liegt **unter** der Welt. Ein Fehler um eins wäre sonst genau ein Stockwerk daneben.
+    #[test]
+    fn lichtabschnitte_sind_um_einen_verschoben() {
+        // min_section = -4 heißt: die Welt beginnt bei y = -64.
+        let bytes = light_bytes(24, &[5], 12);
+        let mut r = Reader::new(&bytes);
+        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        // Lichtabschnitt 5 = Weltabschnitt 4 = y 0..15.
+        assert_eq!(light.get(0, 0, 0).0, 12);
+        assert_eq!(light.get(0, 15, 0).0, 12);
+        assert_eq!(light.get(0, 16, 0).0, 0, "der Abschnitt darüber ist dunkel");
+        assert_eq!(light.get(0, -1, 0).0, 0, "der darunter auch");
+    }
+
+    /// Zwei Blöcke teilen sich ein Byte. Werden die Nibbles vertauscht, sieht jeder zweite Block
+    /// falsch aus – und zwar so gleichmäßig, dass es wie ein Muster wirkt statt wie ein Fehler.
+    #[test]
+    fn nibbles_liegen_richtig_herum() {
+        let mut data = [0u8; LIGHT_BYTES];
+        // Block 0 (unteres Nibble) hell, Block 1 (oberes Nibble) dunkel.
+        data[0] = 0x0F;
+        let section = compact_light(&data);
+        assert_eq!(section.get(0), 15);
+        assert_eq!(section.get(1), 0);
+        assert!(
+            matches!(section, LightSection::Nibbles(_)),
+            "ein ungleiches Feld darf nicht zusammengefasst werden"
+        );
+    }
+
+    /// Über der Welt steht nichts mehr im Weg – dort ist voller Himmel, nicht Dunkelheit.
+    /// Andernfalls bekäme die oberste Blockschicht der Welt eine schwarze Oberseite.
+    #[test]
+    fn ueber_der_welt_ist_voller_himmel() {
+        let bytes = light_bytes(24, &[], 0);
+        let mut r = Reader::new(&bytes);
+        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        assert_eq!(light.get(0, 5000, 0), (15, 0));
+        assert_eq!(light.get(0, -5000, 0), (0, 0));
+    }
+
+    /// Vanillas Kurve ist deutlich nicht-linear: Halbes Licht ist längst nicht halbe Helligkeit.
+    #[test]
+    fn helligkeitskurve_folgt_vanilla() {
+        assert!((brightness(15) - 1.0).abs() < 1e-9);
+        // 7/15 ergibt 0,4667 / (4 - 1,4) = 0,1795.
+        assert!((brightness(7) - 0.1795).abs() < 0.001);
+        assert!(brightness(0) > 0.0, "ganz schwarz ist keine Auskunft mehr");
+        assert!(brightness(4) < brightness(8) && brightness(8) < brightness(12));
+    }
 
     const LEGACY: Format = Format {
         modern_palette: false,
@@ -2282,12 +3067,99 @@ mod tests {
                 w.i64(long as i64);
             }
         }
-        // Biome: Singleton
-        w.u8(0);
-        w.var_int(1);
-        if !format.modern_palette {
-            w.var_int(0);
+        write_biomes(w, format, &[1; SECTION_BIOMES]);
+    }
+
+    /// Die Biompalette eines Abschnitts schreiben – einwertig oder mit echten Zellen.
+    fn write_biomes(w: &mut Writer, format: Format, biomes: &[u32; SECTION_BIOMES]) {
+        let mut palette: Vec<u32> = Vec::new();
+        for biome in biomes {
+            if !palette.contains(biome) {
+                palette.push(*biome);
+            }
         }
+        if palette.len() == 1 {
+            w.u8(0);
+            w.var_int(palette[0] as i32);
+            if !format.modern_palette {
+                w.var_int(0);
+            }
+            return;
+        }
+        // Biome benutzen 1..=3 Bit indirekt; darüber wäre es die globale Palette.
+        let bits = (1u8..=3).find(|b| 1usize << b >= palette.len()).unwrap();
+        w.u8(bits);
+        w.var_int(palette.len() as i32);
+        for value in &palette {
+            w.var_int(*value as i32);
+        }
+        let per_long = 64 / bits as usize;
+        let longs = SECTION_BIOMES.div_ceil(per_long);
+        if !format.modern_palette {
+            w.var_int(longs as i32);
+        }
+        let mut data = vec![0u64; longs];
+        for (index, biome) in biomes.iter().enumerate() {
+            let slot = palette.iter().position(|v| v == biome).unwrap() as u64;
+            data[index / per_long] |= slot << ((index % per_long) * bits as usize);
+        }
+        for long in data {
+            w.i64(long as i64);
+        }
+    }
+
+    /// Die Biompalette steht **hinter** der Blockpalette im selben Abschnitt. Sie zu lesen heißt
+    /// also auch, die Blockpalette exakt zu Ende gelesen zu haben – ein Byte daneben, und die
+    /// Biome sind Zufallszahlen.
+    #[test]
+    fn biompalette_kommt_zellengenau_zurueck() {
+        let mut biomes = [0u32; SECTION_BIOMES];
+        for (index, biome) in biomes.iter_mut().enumerate() {
+            *biome = (index % 3) as u32;
+        }
+        for format in [LEGACY, MODERN, MODERN_FLUID] {
+            let mut w = Writer::default();
+            w.u16(SECTION_BLOCKS as u16);
+            if format.fluid_count {
+                w.u16(0);
+            }
+            // Blockpalette: durchgehend Stein, damit der Abschnitt erhalten bleibt.
+            w.u8(0);
+            w.var_int(1);
+            if !format.modern_palette {
+                w.var_int(0);
+            }
+            write_biomes(&mut w, format, &biomes);
+
+            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            let section = chunk.section(0).expect("Abschnitt");
+            for (index, biome) in biomes.iter().enumerate() {
+                // Zellenreihenfolge y, z, x – je vier Blöcke eine Zelle.
+                let (x, y, z) = (
+                    ((index & 3) * 4) as i32,
+                    ((index >> 4) * 4) as i32,
+                    (((index >> 2) & 3) * 4) as i32,
+                );
+                assert_eq!(
+                    section.biomes.get(x, y, z) as u32,
+                    *biome,
+                    "Zelle {} in {:?}",
+                    index,
+                    format
+                );
+            }
+        }
+    }
+
+    /// Der Normalfall: ein Abschnitt, ein Biom – dann steht dort keine Zellentabelle.
+    #[test]
+    fn einwertige_biompalette_bleibt_einwertig() {
+        let mut w = Writer::default();
+        write_section(&mut w, MODERN, &[1u32; SECTION_BLOCKS], SECTION_BLOCKS);
+        let chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        let section = chunk.section(0).expect("Abschnitt");
+        assert!(matches!(section.biomes, Biomes::Single(1)));
+        assert_eq!(section.biomes.get(7, 9, 11), 1);
     }
 
     #[test]
@@ -2415,6 +3287,7 @@ mod tests {
         Arc::new(Chunk {
             min_section: -4,
             sections,
+            light: None,
         })
     }
 
@@ -2438,11 +3311,79 @@ mod tests {
         Arc::new(Chunk {
             min_section: -4,
             sections,
+            light: None,
         })
     }
 
-    /// Der Voxel-Durchlauf **ohne** jede Abkürzung: Block für Block, genau nach Lehrbuch.
-    /// Maßstab für den optimierten [`cast`].
+    /// Eine kleine Landschaft aus **echten** Blockzuständen von 1.21.1: Gras auf Stein, ein See,
+    /// Sand am Ufer und ein Baum aus Stamm und Laub.
+    ///
+    /// Nur für die beiden Sichtprüfungen gedacht (`pov_als_png`): Erst mit richtigen Zuständen
+    /// lässt sich sehen, ob Wasser blau, Laub grün und Sand sandfarben herauskommt.
+    fn landscape_chunk(chunk_x: i32, chunk_z: i32) -> Arc<Chunk> {
+        const STONE: u32 = 1;
+        const GRASS: u32 = 9;
+        const WATER: u32 = 80;
+        const SAND: u32 = 112;
+        const LOG: u32 = 131;
+        const LEAVES: u32 = 264;
+
+        let mut section = Section::empty();
+        for x in 0..16i32 {
+            for z in 0..16i32 {
+                let world_x = chunk_x * 16 + x;
+                let world_z = chunk_z * 16 + z;
+                // Eine Senke um den Ursprung herum, gefüllt mit Wasser.
+                let lake = world_x * world_x + world_z * world_z < 26 * 26;
+                for y in 0..4i32 {
+                    section.set(local_index(x, y, z), STONE);
+                }
+                if lake {
+                    section.set(local_index(x, 4, z), SAND);
+                    for y in 5..7i32 {
+                        section.set(local_index(x, y, z), WATER);
+                    }
+                } else {
+                    section.set(local_index(x, 4, z), STONE);
+                    section.set(local_index(x, 5, z), GRASS);
+                }
+            }
+        }
+        // Ein Baum je Chunk, damit auch Stamm und Laub im Bild sind.
+        if (chunk_x + chunk_z).rem_euclid(2) == 0 {
+            let (tx, tz) = (4i32, 11i32);
+            for y in 6..10i32 {
+                section.set(local_index(tx, y, tz), LOG);
+            }
+            for dx in -2..=2i32 {
+                for dz in -2..=2i32 {
+                    for y in 9..12i32 {
+                        if dx == 0 && dz == 0 && y < 11 {
+                            continue;
+                        }
+                        let (lx, lz) = (tx + dx, tz + dz);
+                        if (0..16).contains(&lx) && (0..16).contains(&lz) {
+                            section.set(local_index(lx, y, lz), LEAVES);
+                        }
+                    }
+                }
+            }
+        }
+        let mut sections: Vec<Option<Arc<Section>>> = vec![None; 24];
+        sections[4] = Some(Arc::new(section));
+        Arc::new(Chunk {
+            min_section: -4,
+            sections,
+            light: None,
+        })
+    }
+
+    /// Der Voxel-Durchlauf **ohne** jede Abkürzung: Block für Block, genau nach Lehrbuch, und mit
+    /// einem direkten Griff in die Hashtabelle statt über [`Cursor`] und [`Ray`].
+    ///
+    /// Maßstab für den optimierten [`cast`]. Bewusst mit eigener Schrittlogik statt mit
+    /// [`Ray::advance`]: Ein Maßstab, der sich denselben Code teilt wie das Geprüfte, prüft nur
+    /// noch, dass er sich selbst gleicht.
     fn cast_naive(
         scene: &Scene,
         origin: (f64, f64, f64),
@@ -2471,7 +3412,22 @@ mod tests {
             if let Some(state) = block {
                 return Some((state, distance, face));
             }
-            advance(&mut cell, &mut next, &mut distance, &mut face, step, delta);
+            if next.0 <= next.1 && next.0 <= next.2 {
+                cell.0 += step.0;
+                distance = next.0;
+                next.0 += delta.0;
+                face = 0;
+            } else if next.1 <= next.2 {
+                cell.1 += step.1;
+                distance = next.1;
+                next.1 += delta.1;
+                face = 1;
+            } else {
+                cell.2 += step.2;
+                distance = next.2;
+                next.2 += delta.2;
+                face = 2;
+            }
         }
         None
     }
@@ -2500,6 +3456,7 @@ mod tests {
             chunks,
             entities: Vec::new(),
             chunk_revision: 0,
+            ..Scene::default()
         };
 
         // Auch genau auf Blockgrenzen und Abschnittsgrenzen: dort trifft die Rundung zu.
@@ -2579,7 +3536,8 @@ mod tests {
         let mut pixels = Vec::new();
         let mut frame = String::new();
 
-        for (width, height) in [(64usize, 32usize), (160, 80)] {
+        // Die dritte Größe ist die des Browser-Viewers: dort liegt die eigentliche Rechenlast.
+        for (width, height) in [(64usize, 32usize), (160, 80), (426, 240)] {
             // Einmal warmlaufen, damit die Messung nicht den ersten Zugriff mitzählt.
             pov.fill_scene(&mut scene);
             render_into(
@@ -2618,6 +3576,269 @@ mod tests {
         }
     }
 
+    /// Ob ein Bild auf einem oder auf vier Kernen gerechnet wird, darf an keinem einzigen
+    /// Bildpunkt zu sehen sein.
+    ///
+    /// Der Browser-Viewer nimmt immer den geteilten Weg, die Terminalansicht nie – ohne diesen
+    /// Vergleich liefe die geteilte Fassung also völlig ungeprüft. Gerechnet wird deshalb
+    /// dieselbe Szene zweimal und Bildpunkt gegen Bildpunkt verglichen, samt Tiefenwert.
+    #[test]
+    fn geteiltes_rechnen_ergibt_dasselbe_bild() {
+        let mut chunks = HashMap::new();
+        for x in -3..=3i32 {
+            for z in -3..=3i32 {
+                // Ein paar Löcher: dort ist gar kein Chunk geladen.
+                if (x + z).rem_euclid(7) == 0 {
+                    continue;
+                }
+                chunks.insert((x, z), hilly_chunk(x * 17 + z));
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+            chunk_revision: 0,
+            ..Scene::default()
+        };
+
+        // Auch eine Zeilenzahl, die nicht glatt aufgeht (77 Zeilen auf 3 Threads).
+        for (width, height, workers) in [(40usize, 20usize, 4usize), (33, 77, 3), (16, 9, 8)] {
+            let position = (8.0, 18.0, 8.0, 37.0f32, -12.0f32);
+            let half_width = (HORIZONTAL_FOV.to_radians() / 2.0).tan();
+            let half_height = half_width * height as f64 / width as f64;
+            let basis = camera_basis(position.3 as f64, position.4 as f64);
+            let shade = |cursor: &mut Cursor, px: usize, py: usize| {
+                let sky = sky_color(py, height);
+                let direction =
+                    pixel_direction(basis, (half_width, half_height), (width, height), px, py);
+                match cast(cursor, (position.0, position.1 + 1.62, position.2), direction) {
+                    Some((state, distance, face)) => Pixel {
+                        rgb: fog(block_color(state, face, distance), sky, distance),
+                        depth: distance,
+                    },
+                    None => Pixel {
+                        rgb: sky,
+                        depth: MAX_DISTANCE,
+                    },
+                }
+            };
+
+            let mut single = Vec::new();
+            render_pixels_with(&scene, width, height, 1, &mut single, shade);
+            let mut many = Vec::new();
+            render_pixels_with(&scene, width, height, workers, &mut many, shade);
+
+            assert_eq!(single.len(), width * height);
+            for (index, (a, b)) in single.iter().zip(many.iter()).enumerate() {
+                assert_eq!(
+                    a.rgb,
+                    b.rgb,
+                    "Bildpunkt {}/{} weicht ab ({}x{}, {} Threads)",
+                    index % width,
+                    index / width,
+                    width,
+                    height,
+                    workers
+                );
+                assert_eq!(a.depth.to_bits(), b.depth.to_bits(), "Tiefe bei {}", index);
+            }
+            // Und das Bild darf nicht einfach überall Himmel sein, sonst prüft der Test nichts.
+            assert!(
+                single.iter().any(|pixel| pixel.depth < MAX_DISTANCE),
+                "{}x{}: kein einziger Treffer im Bild",
+                width,
+                height
+            );
+        }
+    }
+
+    /// Der Kern des Versprechens: Die Browser-Ansicht zeigt **echte** Minecraft-Texturen.
+    ///
+    /// Geprüft wird gegen eine wirklich geladene Original-JAR, nicht gegen eine Nachbildung: Boden
+    /// aus Stein, Kamera darüber, Bild rendern – und dann nachsehen, ob unten wirklich der
+    /// Steinton steht und nirgends die lila-schwarze Fehlertextur.
+    ///
+    /// Läuft nicht im normalen Testlauf mit (braucht Netz bzw. eine vorhandene Installation):
+    /// `XDG_CONFIG_HOME=$(mktemp -d) cargo test --release --features ultra -- --ignored --nocapture echte_texturen`
+    #[test]
+    #[ignore]
+    fn echte_texturen_landen_im_bild() {
+        let console = crate::console::Console::new(false, false, false);
+        let version = "1.21.1";
+        let path = crate::pov_resources::locate(
+            &console,
+            version,
+            &crate::pov_resources::Source::Auto,
+        )
+        .expect("Ressourcen beschaffen");
+        let assets = Assets::load(&path, version).expect("Assets lesen");
+
+        // Stein grau, Gras grün, Wasser blau, Sand sandfarben, ein Baum – alles echte
+        // Blockzustände von 1.21.1 (siehe data/block-states-1.21.1.txt.gz).
+        let mut chunks = HashMap::new();
+        for x in -3..=3i32 {
+            for z in -3..=3i32 {
+                chunks.insert((x, z), landscape_chunk(x, z));
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+            chunk_revision: 0,
+            ..Scene::default()
+        };
+
+        let (width, height) = (256usize, 144usize);
+        let mut pixels = Vec::new();
+        // Positive Neigung heißt in Minecraft „nach unten": die untere Bildhälfte ist Landschaft.
+        render_textured(
+            &scene,
+            (8.0, 20.0, 8.0, 35.0, 25.0),
+            width,
+            height,
+            &assets,
+            &mut pixels,
+        );
+        assert_eq!(pixels.len(), width * height);
+
+        // --- Teil 1: blockgenau, ohne Kamera. Hier ist nichts zu verwechseln. ---
+        //
+        // Die Fehlertextur ist knallig lila (248, 0, 248); alles, was sie liefert, ist falsch
+        // gelesen. Für jeden Block dazu die Erwartung an die Farbe selbst.
+        let is_missing = |(r, g, b, _): (u8, u8, u8, u8)| r > 200 && g < 40 && b > 200;
+        // (Zustand, Seite, Beschreibung, Prüfung)
+        #[allow(clippy::type_complexity)]
+        let cases: [(u32, usize, &str, fn(u8, u8, u8) -> bool); 5] = [
+            // Wasser hat in Vanilla ein Modell **ohne Flächen**: `block/water.json` nennt nur
+            // die Partikeltextur. Die Suche nach `block/water` ging deshalb ins Leere, und jeder
+            // See wurde lila. Das ist der eigentliche Regressionstest hier.
+            (80, 3, "Wasser", |r, g, b| b > r + 30 && b > g + 10),
+            // `grass_block_top.png` ist grau – grün wird die Fläche erst durch die Einfärbung.
+            (9, 3, "Grasoberseite", |r, g, b| g > r + 15 && g > b + 15),
+            (264, 3, "Eichenlaub", |r, g, b| g > r + 15 && g > b + 15),
+            // Stein ist grau: alle drei Kanäle dicht beieinander.
+            (1, 3, "Stein", |r, g, b| {
+                (r.max(g).max(b) as i32 - r.min(g).min(b) as i32) < 25
+            }),
+            // Sand ist warm getönt und wird **nicht** eingefärbt.
+            (112, 3, "Sand", |r, g, b| r > b + 30 && g > b + 10),
+        ];
+        for (state, face, name, check) in cases {
+            // Die ganze Fläche abtasten, nicht nur einen Punkt: Ein einzelner Texel beweist
+            // nichts, und Blattwerk ist absichtlich löchrig – dort liefert die Textur
+            // durchsichtige Stellen, die der Strahl im Bild ebenfalls überspringt.
+            let mut opaque = 0;
+            for row in 0..8 {
+                for column in 0..8 {
+                    let (u, v) = ((column as f64 + 0.5) / 8.0, (row as f64 + 0.5) / 8.0);
+                    let sample = assets.sample(state, face, u, v);
+                    assert!(
+                        !is_missing(sample),
+                        "{} (Zustand {}) liefert die Fehlertextur: {:?}",
+                        name,
+                        state,
+                        sample
+                    );
+                    if sample.3 < 16 {
+                        continue; // durchsichtig – im Bild ebenfalls kein Treffer
+                    }
+                    opaque += 1;
+                    assert!(
+                        check(sample.0, sample.1, sample.2),
+                        "{} (Zustand {}) hat bei {:.2}/{:.2} die falsche Farbe: {:?}",
+                        name,
+                        state,
+                        u,
+                        v,
+                        sample
+                    );
+                }
+            }
+            assert!(
+                opaque >= 16,
+                "{} (Zustand {}) ist fast vollstaendig durchsichtig – da wurde nichts gelesen",
+                name,
+                state
+            );
+        }
+
+        // --- Teil 2: im fertigen Bild. Der Himmel ist selbst blau, deshalb zählen hier nur
+        // Bildpunkte, die wirklich einen Block getroffen haben. ---
+        let hits: Vec<(u8, u8, u8)> = pixels
+            .iter()
+            .filter(|pixel| pixel.depth < MAX_DISTANCE)
+            .map(|pixel| pixel.rgb)
+            .collect();
+        assert!(
+            hits.len() > width * height / 4,
+            "nur {} von {} Bildpunkten treffen ueberhaupt einen Block",
+            hits.len(),
+            width * height
+        );
+        let magenta = hits
+            .iter()
+            .filter(|(r, g, b)| *r > 150 && *g < 70 && *b > 150)
+            .count();
+        assert_eq!(magenta, 0, "{} Bildpunkte zeigen die Fehlertextur", magenta);
+        // Und es sind wirklich Texturen und kein Farbklotz: die Töne schwanken.
+        let shades: std::collections::HashSet<(u8, u8, u8)> = hits.iter().copied().collect();
+        assert!(
+            shades.len() > 200,
+            "das Bild hat nur {} Farbtoene – das sieht nach Farbklötzen aus, nicht nach Texturen",
+            shades.len()
+        );
+    }
+
+    /// Dasselbe Bild einmal zum Ansehen: legt ein PNG ab, damit sich die texturierte Ansicht
+    /// wirklich mit dem Auge prüfen lässt statt nur über Zahlen.
+    ///
+    /// `XDG_CONFIG_HOME=$(mktemp -d) AFK_POV_PNG=/tmp/pov.png \
+    ///   cargo test --release --features ultra -- --ignored --nocapture pov_als_png`
+    #[test]
+    #[ignore]
+    fn pov_als_png() {
+        let Ok(target) = std::env::var("AFK_POV_PNG") else {
+            println!("AFK_POV_PNG nicht gesetzt – nichts zu tun");
+            return;
+        };
+        let console = crate::console::Console::new(false, false, false);
+        let version = std::env::var("AFK_POV_VERSION").unwrap_or_else(|_| "1.21.1".to_string());
+        let path =
+            crate::pov_resources::locate(&console, &version, &crate::pov_resources::Source::Auto)
+                .expect("Ressourcen beschaffen");
+        let assets = Assets::load(&path, &version).expect("Assets lesen");
+
+        let mut chunks = HashMap::new();
+        for x in -4..=4i32 {
+            for z in -4..=4i32 {
+                chunks.insert((x, z), landscape_chunk(x, z));
+            }
+        }
+        let scene = Scene {
+            chunks,
+            entities: Vec::new(),
+            chunk_revision: 0,
+            ..Scene::default()
+        };
+        let (width, height) = (426usize, 240usize);
+        let mut pixels = Vec::new();
+        render_textured(
+            &scene,
+            (8.0, 20.0, 8.0, 35.0, 25.0),
+            width,
+            height,
+            &assets,
+            &mut pixels,
+        );
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for pixel in &pixels {
+            rgba.extend_from_slice(&[pixel.rgb.0, pixel.rgb.1, pixel.rgb.2, 255]);
+        }
+        let png = crate::pov_assets::encode_rgba_png(width, height, &rgba).expect("PNG");
+        std::fs::write(&target, png).expect("schreiben");
+        println!("Bild geschrieben: {}", target);
+    }
+
     /// Der Chunk-Merker darf am Ergebnis nichts ändern – er spart nur Nachschlagevorgänge.
     /// Deshalb hier dieselbe Szene zweimal: einmal Block für Block direkt aus der Hashtabelle,
     /// einmal über den Merker, wie ihn der Strahl benutzt.
@@ -2633,6 +3854,7 @@ mod tests {
             chunks,
             entities: Vec::new(),
             chunk_revision: 0,
+            ..Scene::default()
         };
         let mut cursor = Cursor::new(&scene);
         // Quer durch mehrere Chunks und auch daneben, wo keiner geladen ist.

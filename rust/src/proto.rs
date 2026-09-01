@@ -40,6 +40,16 @@ pub struct Protocol {
 /// Paket-IDs der Spielphase.
 pub struct Game {
     // Server -> Client
+    /// Abschluss eines Chunk-Stapels; jeder Vanilla-Client bestätigt ihn, auch ohne POV.
+    pub cb_chunk_batch_finished: i32,
+    /// Beginn eines Chunk-Stapels (Paket ohne Nutzdaten). Der Vanilla-Client nimmt hier die Zeit
+    /// und schätzt daraus, wie viele Chunks er je Tick verkraftet – siehe
+    /// [`crate::client::ChunkBatch`].
+    ///
+    /// Die ID ist nicht geraten: die Pakete der Spielphase stehen nach ihrem Registry-Namen
+    /// sortiert, und `chunk_batch_finished` liegt unmittelbar vor `chunk_batch_start`. Der Test
+    /// `chunk_stapel_ids_liegen_nebeneinander` hält das fest.
+    pub cb_chunk_batch_start: i32,
     pub cb_cookie_request: i32,
     pub cb_disconnect: i32,
     pub cb_keep_alive: i32,
@@ -60,12 +70,26 @@ pub struct Game {
     pub sb_chat: i32,
     pub sb_chat_ack: i32,
     pub sb_chat_command: i32,
+    /// Durchsatz-Rückmeldung nach jedem empfangenen Chunk-Stapel.
+    pub sb_chunk_batch_received: i32,
+    /// Leeres Paket am Ende jedes Client-Ticks (erst ab 1.21.2; in 1.21.1 `-1`).
+    pub sb_client_tick_end: i32,
     pub sb_client_command: i32,
     pub sb_client_information: i32,
     pub sb_configuration_acknowledged: i32,
     pub sb_cookie_response: i32,
+    /// Allgemeine Vanilla-Nutzdaten, u. a. die bei jedem Beitritt gemeldete Client-Brand.
+    pub sb_custom_payload: i32,
     pub sb_keep_alive: i32,
+    /// Positionsänderung ohne erneut behauptete Blickrichtung. Auch der schlanke Client braucht
+    /// sie: ein stillstehender Vanilla-Client meldet seine Position alle 20 Ticks erneut.
+    pub sb_move_player_pos: i32,
     pub sb_move_player_pos_rot: i32,
+    /// Blickrichtung ohne erneut behauptete Koordinaten.
+    #[cfg(feature = "movement")]
+    pub sb_move_player_rot: i32,
+    /// „Ladewelt geschlossen" (seit 1.21.4; in 1.21.1 `-1`).
+    pub sb_player_loaded: i32,
     pub sb_pong: i32,
     pub sb_resource_pack: i32,
 }
@@ -106,14 +130,14 @@ pub struct Extra {
 
     // ---- Live-Ansicht: Welt ----
     pub cb_level_chunk: i32,
+    /// Nachgereichtes Licht zu einem bereits geschickten Chunk. Die ID ist nicht geraten: Die
+    /// Pakete der Spielphase stehen nach ihrem Registry-Namen sortiert, und zwischen
+    /// `level_chunk_with_light` und `login` liegen genau `level_event`, `level_particles` und
+    /// `light_update`. Der Test `licht_id_liegt_vor_dem_login` hält beide Beziehungen fest.
+    pub cb_light_update: i32,
     pub cb_forget_level_chunk: i32,
     pub cb_block_update: i32,
     pub cb_section_blocks_update: i32,
-    /// Nach jedem Chunk-Stapel erwartet der Server eine Bestätigung; ohne sie hört er nach ein
-    /// paar Stapeln auf, weitere Chunks zu schicken.
-    pub cb_chunk_batch_finished: i32,
-    pub sb_chunk_batch_received: i32,
-
     // ---- Live-Ansicht: Entitäten ----
     pub cb_add_entity: i32,
     pub cb_remove_entities: i32,
@@ -196,6 +220,10 @@ pub enum In {
     CookieRequest,
     Transfer,
     Disconnect,
+    /// Beginn eines Chunk-Stapels – nur der Zeitstempel dahinter zählt.
+    ChunkBatchStart,
+    /// Muss jede Bauform beantworten; das ist Flusskontrolle, keine POV-Funktion.
+    ChunkBatchFinished,
 
     // ---- Anzeigetafel ----
     /// Ziel angelegt/geändert/entfernt.
@@ -230,14 +258,15 @@ pub enum In {
     // ---- Live-Ansicht ----
     #[cfg(feature = "pov")]
     LevelChunk,
+    /// Nachgereichtes Licht zu einem schon bekannten Chunk.
+    #[cfg(feature = "pov")]
+    LightUpdate,
     #[cfg(feature = "pov")]
     ForgetChunk,
     #[cfg(feature = "pov")]
     BlockUpdate,
     #[cfg(feature = "pov")]
     SectionBlocks,
-    #[cfg(feature = "pov")]
-    ChunkBatchFinished,
     #[cfg(feature = "pov")]
     AddEntity,
     #[cfg(feature = "pov")]
@@ -288,6 +317,10 @@ impl Protocol {
         let g = &self.game;
         if id == g.cb_keep_alive {
             In::KeepAlive
+        } else if id == g.cb_chunk_batch_finished {
+            In::ChunkBatchFinished
+        } else if id == g.cb_chunk_batch_start {
+            In::ChunkBatchStart
         } else if id == g.cb_system_chat {
             In::SystemChat
         } else if id == g.cb_player_chat {
@@ -340,6 +373,8 @@ impl Protocol {
         {
             if id == e.cb_level_chunk {
                 return In::LevelChunk;
+            } else if id == e.cb_light_update {
+                return In::LightUpdate;
             } else if id == e.cb_block_update {
                 return In::BlockUpdate;
             } else if id == e.cb_move_entity_pos {
@@ -358,8 +393,6 @@ impl Protocol {
                 return In::SectionBlocks;
             } else if id == e.cb_forget_level_chunk {
                 return In::ForgetChunk;
-            } else if id == e.cb_chunk_batch_finished {
-                return In::ChunkBatchFinished;
             }
         }
 
@@ -430,12 +463,10 @@ const P1_21_1: Protocol = Protocol {
         sb_use_item: 57,
 
         cb_level_chunk: 39,
+        cb_light_update: 42,
         cb_forget_level_chunk: 33,
         cb_block_update: 9,
         cb_section_blocks_update: 73,
-        cb_chunk_batch_finished: 12,
-        sb_chunk_batch_received: 8,
-
         cb_add_entity: 1,
         cb_remove_entities: 66,
         cb_move_entity_pos: 46,
@@ -455,6 +486,8 @@ const P1_21_1: Protocol = Protocol {
         },
     },
     game: Game {
+        cb_chunk_batch_finished: 12,
+        cb_chunk_batch_start: 13,
         cb_cookie_request: 22,
         cb_disconnect: 29,
         cb_keep_alive: 38,
@@ -474,12 +507,19 @@ const P1_21_1: Protocol = Protocol {
         sb_chat: 6,
         sb_chat_ack: 3,
         sb_chat_command: 4,
+        sb_chunk_batch_received: 8,
+        sb_client_tick_end: -1, // gibt es erst ab 1.21.2
         sb_client_command: 9,
         sb_client_information: 10,
         sb_configuration_acknowledged: 12,
         sb_cookie_response: 17,
+        sb_custom_payload: 18,
         sb_keep_alive: 24,
+        sb_move_player_pos: 26,
         sb_move_player_pos_rot: 27,
+        #[cfg(feature = "movement")]
+        sb_move_player_rot: 28,
+        sb_player_loaded: -1, // gibt es erst ab 1.21.4
         sb_pong: 39,
         sb_resource_pack: 43,
     },
@@ -512,12 +552,10 @@ const P1_21_11: Protocol = Protocol {
         sb_use_item: 64,
 
         cb_level_chunk: 44,
+        cb_light_update: 47,
         cb_forget_level_chunk: 37,
         cb_block_update: 8,
         cb_section_blocks_update: 82,
-        cb_chunk_batch_finished: 11,
-        sb_chunk_batch_received: 10,
-
         cb_add_entity: 1,
         cb_remove_entities: 75,
         cb_move_entity_pos: 51,
@@ -537,6 +575,8 @@ const P1_21_11: Protocol = Protocol {
         },
     },
     game: Game {
+        cb_chunk_batch_finished: 11,
+        cb_chunk_batch_start: 12,
         cb_cookie_request: 21,
         cb_disconnect: 32,
         cb_keep_alive: 43,
@@ -556,12 +596,19 @@ const P1_21_11: Protocol = Protocol {
         sb_chat: 8,
         sb_chat_ack: 5,
         sb_chat_command: 6,
+        sb_chunk_batch_received: 10,
+        sb_client_tick_end: 12,
         sb_client_command: 11,
         sb_client_information: 13,
         sb_configuration_acknowledged: 15,
         sb_cookie_response: 20,
+        sb_custom_payload: 21,
         sb_keep_alive: 27,
+        sb_move_player_pos: 29,
         sb_move_player_pos_rot: 30,
+        #[cfg(feature = "movement")]
+        sb_move_player_rot: 31,
+        sb_player_loaded: 43,
         sb_pong: 44,
         sb_resource_pack: 48,
     },
@@ -634,12 +681,10 @@ const EXTRA_26: Extra = Extra {
     sb_use_item: 67,
 
     cb_level_chunk: 45,
+        cb_light_update: 48,
     cb_forget_level_chunk: 37,
     cb_block_update: 8,
     cb_section_blocks_update: 84,
-    cb_chunk_batch_finished: 11,
-    sb_chunk_batch_received: 11,
-
     cb_add_entity: 1,
     cb_remove_entities: 77,
     cb_move_entity_pos: 53,
@@ -663,6 +708,8 @@ const EXTRA_26: Extra = Extra {
 };
 
 const GAME_26: Game = Game {
+    cb_chunk_batch_finished: 11,
+    cb_chunk_batch_start: 12,
     cb_cookie_request: 21,
     cb_disconnect: 32,
     cb_keep_alive: 44,
@@ -682,12 +729,19 @@ const GAME_26: Game = Game {
     sb_chat: 9,
     sb_chat_ack: 6,
     sb_chat_command: 7,
+    sb_chunk_batch_received: 11,
+    sb_client_tick_end: 13,
     sb_client_command: 12,
     sb_client_information: 14,
     sb_configuration_acknowledged: 16,
     sb_cookie_response: 21,
+    sb_custom_payload: 22,
     sb_keep_alive: 28,
+    sb_move_player_pos: 30,
     sb_move_player_pos_rot: 31,
+    #[cfg(feature = "movement")]
+    sb_move_player_rot: 32,
+    sb_player_loaded: 44,
     sb_pong: 45,
     sb_resource_pack: 49,
 };
@@ -883,8 +937,7 @@ pub const CLIENT_COMMAND_RESPAWN: i32 = 0;
 
 /// ResourcePackStatus-Ordinalwerte (siehe ResourcePackStatus in MCProtocolLib).
 pub mod pack_status {
-    pub const SUCCESSFULLY_LOADED: i32 = 0;
-    pub const ACCEPTED: i32 = 3;
+    pub const DECLINED: i32 = 1;
 }
 
 /// Zahlenwerte in den Zusatzpaketen der Ausbaustufen. Alle aus denselben Klassen abgelesen wie

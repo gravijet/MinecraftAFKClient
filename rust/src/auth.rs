@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 ///
 /// TLS kommt unter Windows von SChannel (`native-tls`), sonst von rustls – so braucht der
 /// Linux-Build weder OpenSSL-Header noch `pkg-config` (siehe Cargo.toml).
-fn agent() -> &'static ureq::Agent {
+pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         let builder = ureq::builder()
@@ -669,7 +669,7 @@ fn now_ms() -> i64 {
 }
 
 /// ureq-Fehler kurz und lesbar machen (der Volltext enthält teils die ganze URL samt Token).
-fn short(e: ureq::Error) -> String {
+pub(crate) fn short(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, _) => format!("HTTP {}", code),
         ureq::Error::Transport(t) => format!("Netzwerkfehler ({})", t.kind()),

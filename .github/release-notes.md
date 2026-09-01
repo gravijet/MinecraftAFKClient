@@ -19,6 +19,229 @@ Ultra-Varianten gibt es bewusst nur für Rust.
 
 ---
 
+# Rust-Client 2.6.0 – Spielphase repariert, Neuverbinden, echtes Licht und Biomfarben
+
+Stand: 1. September 2026
+
+## Das Wichtigste zuerst
+
+**In 2.5.0 kam der Client nie in die Spielphase.** Der Zustand „Welt geladen" wurde geprüft, aber
+nie gesetzt. Damit war alles wirkungslos, was daran hängt: kein Chat, keine `--cmd`-Befehle, keine
+`--on`-Regeln, keine `:go`/`:look`-Bewegung, kein `:use`, kein `ClientTickEnd`. Der Client verband
+sich, blieb aber stumm. 13 der 38 Ablauftests liefen deshalb in ihren Zeitablauf.
+
+Ursache war eine unfertige Stelle: Die Ladephase eines modernen Clients endet erst, wenn er dem
+Server das Ende meldet – und dafür fehlte der ganze Ablauf.
+
+## Was jetzt richtig läuft (und vorher gar nicht)
+
+* **Chunk-Stapel werden bestätigt.** Der Server schickt Chunks in Stapeln und wartet nach jedem
+  auf ein `ChunkBatchReceived` mit dem gewünschten Durchsatz. Blieb es aus, zählte der
+  `PlayerChunkSender` die offenen Stapel hoch und **stellte bei zehn die Chunk-Auslieferung
+  ein**. Der Wert stammt jetzt aus einem Nachbau von Vanillas `ChunkBatchSizeCalculator`, damit
+  auch die gemeldete Zahl dieselbe ist.
+* **Das Ende der Ladephase wird gemeldet** (`PlayerLoaded`, ab 1.21.4), sobald Startposition und
+  erster Chunk-Stapel da sind. Ohne diese Meldung hält der Server den Spieler bis zu 30 Sekunden
+  in einem Schwebezustand. Schickt ein Server gar keine Chunks (manche Limbo-Warteschlangen tun
+  das), greift nach drei Sekunden eine Notbremse – der Client bleibt nicht stumm.
+* **Die eigene Position wird alle 20 Ticks erneut gemeldet**, auch im Stillstand. Genau das tut
+  `LocalPlayer.sendPosition()`. Ein Client, der nach dem Beitritt überhaupt kein Positionspaket
+  mehr schickt, sieht auf dem Server anders aus als jeder echte Spieler.
+* **Der Client-Tick läuft ohne Drift.** Er wartete bisher nach jeder Runde volle 50 ms und lief
+  dadurch dauerhaft langsamer als 20 Hz.
+* Zwei kleinere Vanilla-Abweichungen: Die Sprachkennung in `ClientInformation` lautet jetzt
+  `de_de` statt `de_DE` – Minecraft-Sprachkennungen sind kleingeschrieben. Und die ausgehende
+  zlib-Kompression läuft auf der Vanilla-Stufe; die Stufe steht in den FLEVEL-Bits jedes
+  gesendeten zlib-Kopfes.
+
+Eine getippte Eingabe geht außerdem nicht mehr verloren, wenn sie ein paar Millisekunden zu früh
+kommt: Chat wandert immer in die Warteschlange, und örtliche Spielaktionen warten die kurze
+Ladephase ab, statt sofort abgelehnt zu werden. Wer noch gar nicht im Spiel ist, bekommt weiterhin
+sofort eine Absage.
+
+## Der Client verbindet sich wieder neu
+
+Bisher endete der Rust-Client nach jedem Kick und jedem Netzabbruch mit Status 1 – der Java-Client
+tat es seit jeher anders. Wer den Rust-Client benutzte, brauchte eine Aufsicht drumherum, die ihn
+neu startet. Jetzt liegt es im Client:
+
+| Schalter | Wirkung |
+| --- | --- |
+| *(ohne Angabe)* | an: erster Versuch nach 5 s, Verdopplung bis 60 s, unbegrenzt viele Versuche |
+| `--no-reconnect` | aus; der Prozess endet mit Status 1 wie bisher |
+| `--reconnect-delay <s>` | Wartezeit vor dem ersten Versuch |
+| `--max-backoff <s>` | Obergrenze der Wartezeit |
+| `--reconnect-tries <n>` | nach `n` erfolglosen Versuchen aufgeben; `0` = unbegrenzt |
+
+Der Zähler springt auf null, sobald der Client wieder in der Spielphase ist – eine Sitzung, die
+nach zwei Stunden abbricht, beginnt also wieder bei 5 s und nicht bei der zuletzt erreichten
+Obergrenze. Jeder Versuch meldet sich als `@event reconnect versuch=<n> in=<s>s`. Abgelegte
+Cookies werden bei einer Neuverbindung verworfen, bei einem Server-Transfer nicht: Nur der
+Transfer setzt dieselbe Sitzung fort.
+
+`--reconnect-tries` und `--reconnect` gibt es jetzt auch im **Java-Client**, damit ein Panel
+weiterhin allen Bauformen dieselbe Befehlszeile schicken kann. Bei beiden gilt jetzt außerdem:
+`--no-reconnect` gewinnt unabhängig von der Reihenfolge auf der Kommandozeile.
+
+## Live-POV: echtes Licht
+
+Vorher waren Höhlen genauso hell wie die Oberfläche und eine Fackel war nirgends zu sehen – die
+Helligkeit einer Fläche hing allein an ihrer Ausrichtung. Jetzt kommt sie aus dem Licht, das der
+Server ohnehin mitschickt: hinten im Chunk-Paket und danach in `LightUpdate`.
+
+Genommen wird das Licht **des Nachbarblocks vor der getroffenen Fläche** – so, wie das Spiel es
+auch tut; im festen Block selbst ist es null. Aus dem größeren von Himmels- und Blocklicht wird
+die Vanilla-Kurve `f / (4 - 3f)` gebildet. Ein Rest von 0,06 bleibt stehen, damit ein
+unbeleuchteter Block noch ein Umriss ist und keine schwarze Fläche.
+
+Roh wären das 96 KB je Chunk. Fast alle Abschnitte sind aber gleichförmig – tief unten überall 0,
+hoch oben überall 15 – und werden deshalb als ein einziger Wert abgelegt. Nachgemessen an 169
+Chunks:
+
+| | Resident |
+| --- | --- |
+| ohne Licht | 7 984 K |
+| mit Licht, verdichtet | 8 256 K |
+| mit Licht, ohne Verdichtung | 15 208 K |
+
+Licht ist strikt additiv: Ein Server, der keins schickt, oder ein Paket in unerwarteter Form
+kosten weder den Chunk noch die Verbindung – die Ansicht fällt dann auf die frühere
+Flächenschattierung zurück.
+
+## Live-POV: Biomfarben statt eines Grüntons für alles
+
+Bisher bekam jede eingefärbte Fläche den Ton der Ebene, egal wo sie stand. Jetzt liest die Ansicht
+die **Biom-Palette** jedes Chunk-Abschnitts mit und schlägt am Treffer nach, in welchem Biom sie
+steht. Die Farbe entsteht so, wie Vanilla sie bildet: feste Farbwerte aus der Biom-Registry gehen
+vor, sonst wird `colormap/grass.png` bzw. `foliage.png` aus der Client-JAR an der Stelle
+abgetastet, die sich aus Temperatur und Niederschlag ergibt (dieselbe Rechnung wie in
+`ColorMapColorUtil.get`), und danach greift `grass_color_modifier` für Sumpf und Dunkelwald.
+
+Dass das stimmt, ist nachprüfbar und nicht nur behauptet: Die Ebene ergibt aus der Farbkarte
+`#91BD59` – genau den Wert, der vorher fest im Code stand. Wüste, Taiga und Dschungel ergeben
+jetzt `#BFB755`, `#86B783` und `#59C93C` statt desselben Ebenen-Grüns.
+
+Nicht nachgebaut ist Vanillas Mittelung über 3×3 Chunks: An einer Biomgrenze gibt es eine harte
+Kante statt eines weichen Übergangs. Das ist der bewusste Rest – vorher war es der falsche Ton in
+jedem Biom außer der Ebene.
+
+Der Aufwand bleibt klein: Die Farben aller Biome werden einmal beim Empfang der Registry
+ausgerechnet, je getroffenem Bildpunkt bleibt ein Feldzugriff, und ein Abschnitt mit nur einem
+Biom – der Regelfall – behält einen Wert statt 64.
+
+## Live-POV: echte Texturen ohne Handarbeit
+
+`--pov-resources` ist keine Pflicht mehr. Der Client sucht die passende Client-JAR selbst:
+eigene Ablage, dann eine vorhandene Minecraft-Installation (offizieller Launcher unter Windows,
+Linux, macOS und Flatpak sowie Prism/MultiMC), und erst dann der Download von Mojang über dasselbe
+öffentliche Versionsmanifest, aus dem sich auch der Launcher bedient – mit Prüfung der dort
+genannten SHA-1-Summe.
+
+```bash
+pov-afk-linux mc.example.net --mc 26.2 --pov-web 8765
+```
+
+Das sind einmalig rund 30 MB; danach liegt die Datei unter
+`<konfigverzeichnis>/assets/<version>.jar`. Mit `--pov-resources aus` bleibt es aus, mit einem
+Pfad wird genau diese Datei benutzt. Gesucht und eingelesen wird **nebenher**: der Client
+verbindet sich sofort, und der Browser zeigt so lange an, was gerade passiert. Vorher lief das
+mitten im Start.
+
+Zwei sichtbare Fehler dabei behoben:
+
+* **Wasser und Lava waren lila.** Ihre Modelle haben in Vanilla gar keine Flächen –
+  `block/water.json` nennt nur die Partikeltextur, weil das Spiel Flüssigkeiten eigens zeichnet.
+  Die Suche nach einer Textur namens `block/water` ging ins Leere, und jeder See bekam die
+  Fehlertextur. Jetzt wird die Partikeltextur benutzt.
+* **Jede Fläche mit `tintindex` bekam denselben Grünton** – auch Redstone, Kürbisstiele und
+  Karten. Modelle sagen nur, *dass* eingefärbt wird; *womit*, hängt am Block. Gras, Laub, Wasser
+  und die Festwerte für Fichten-/Birkenlaub und Seerosen sind jetzt getrennt; alles andere bleibt
+  ungefärbt.
+
+## Schneller
+
+* **Der Raycaster schlägt Chunk-Abschnitte einmal nach statt bei jedem Block.** In reiner Luft –
+  bei einem Blick in den Himmel also fast überall – fällt die gesamte Suche weg. Die Schrittfolge
+  bleibt dabei Byte für Byte dieselbe; ein Test vergleicht über zehntausend Strahlen gegen die
+  Lehrbuchfassung.
+* **Große Bilder laufen über mehrere Kerne**, zeilenweise auf Zuruf verteilt (feste Bänder wären
+  hier falsch: ein Strahl in den Himmel kostet ein Vielfaches eines Strahls auf den Boden).
+  Terminalbilder bleiben einthreadig.
+* Zusammen auf einem stark gedrosselten Testrechner: **141 ms → 77 ms** je Browser-Bild. Auf einem
+  echten Vierkerner fällt der zweite Schritt deutlicher aus.
+* **Die Namensauflösung fragt zuerst den Resolver des Rechners**, dann erst die öffentlichen. In
+  Netzen mit gesperrtem UDP/53 nach draußen kostete jeder Verbindungsversuch vorher viereinhalb
+  Sekunden Zeitablauf, bevor überhaupt ein TCP-SYN hinausging. Auskünfte gelten eine Minute.
+* **Der Browser-Viewer weckt den Prozess nicht mehr hundertmal je Sekunde.** Er wartete
+  nicht-blockierend in einer 10-ms-Schleife auf Verbindungen – dauerhaft, ohne dass je etwas
+  passierte.
+
+## Nachgemessen und wieder verworfen
+
+`opt-level = 3` statt `"s"` lag in der Messstreuung (CFB8 18,6 → 19,0 MB/s, Browser-Bild 141 →
+137 ms) und machte die Ultra-Datei 660 KB größer. Die Änderung ist zurückgenommen; die Messwerte
+stehen als Kommentar in `rust/Cargo.toml`, damit es niemand erneut ins Blaue hinein versucht.
+
+## Tests
+
+Von 38 auf 46 Ablauftests und von 132 auf 166 Einzeltests. Neu abgesichert sind unter anderem: der
+Chunk-Stapel samt gemeldetem Durchsatz, `PlayerLoaded` auf allen vier Protokollen, die
+Positionsmeldung im Stillstand, ein Respawn **ohne** nachfolgende Position (daran wäre der Client
+sonst dauerhaft hängengeblieben), der Browser-Viewer samt Zugriffstoken, und dass geteiltes
+Rechnen Bildpunkt für Bildpunkt dasselbe Bild ergibt.
+
+Dazu für die drei neuen Funktionen: dass der Client nach einem Abbruch wirklich ein zweites Mal
+ankommt und mit `--no-reconnect` wirklich endet, dass die Wartezeit sich verdoppelt und auch nach
+sehr vielen Versuchen nicht überläuft, dass Licht aus einem echten Chunk-Paket ankommt und ein
+Chunk **ohne** Licht die Ansicht nicht kaputt macht, dass die Biom-Palette zellengenau
+zurückkommt, und dass die Farbkarte für vier bekannte Biome die bekannten Werte liefert. Die
+Paket-ID von `LightUpdate` ist über alle vier Protokolltabellen gegen ihre Nachbarn festgenagelt,
+statt geraten zu sein.
+
+Fünf zusätzliche Prüfungen laufen gegen eine wirklich geladene Original-JAR (`--ignored`). Vier
+davon suchen sie sich selbst; nur `originale_client_jar` und
+`browser_viewer_liefert_ein_texturiertes_bild` bekommen sie über `AFK_POV_RESOURCES` gereicht –
+und die brauchen unterschiedliche Versionen (26.2 bzw. 1.21.1), weil beide die Versionsprüfung
+mitprüfen. Der neue Farbkartentest holt sich die JAR deshalb selbst, statt eine dritte Bedeutung
+für dieselbe Variable einzuführen.
+
+## Was sich für bestehende Aufrufe ändert
+
+**Der Rust-Client beendet sich nach einem Abbruch nicht mehr von selbst.** Wer eine Aufsicht davor
+gesetzt hat, die den Prozess neu startet, hängt jetzt `--no-reconnect` an – dann ist alles wie
+vorher. Der Java-Client hatte diese Vorgabe schon immer.
+
+Sonst ändert sich an bestehenden Befehlszeilen nichts: keine Option ist weggefallen, keine hat
+eine andere Bedeutung bekommen, das zugesagte Bildformat der Live-POV ist unangetastet, und die
+Paket-IDs sind dieselben – es kam keine Minecraft-Version dazu.
+
+## Java-Client 2.1.0 (`afk-*.jar`)
+
+Die JARs sind mitgebaut und haben genau eine Änderung – die Gegenseite der oben beschriebenen
+Angleichung:
+
+* `--reconnect-tries <n>` gibt es jetzt auch hier. Der Zähler war schon da, die Grenze fehlte.
+* `--reconnect` wird angenommen, damit eine Befehlszeile, die die Vorgabe ausschreibt, nicht am
+  Start scheitert.
+* `--no-reconnect` gewinnt jetzt auch hier unabhängig von der Reihenfolge, und `--max-backoff`
+  fällt nicht mehr unter `--reconnect-delay` – eine Wartezeit, die mit jedem Versuch *kürzer*
+  wird, war nie gemeint.
+
+Damit versteht wieder jede Datei jede Reconnect-Option, und ein Panel darf allen dieselbe Zeile
+schicken. Genau das ist die Zusage, die im README steht.
+
+## Was bleibt, wie es ist
+
+- Tablist und Playerlist gibt es in keiner Rust-Variante; das ist eine Entscheidung, keine Lücke.
+- Die Biomfarben werden **nicht** über 3×3 Chunks gemittelt wie in Vanilla. An einer Biomgrenze
+  steht eine harte Kante statt eines weichen Übergangs.
+- Die Terminal-POV bleibt eine farbige Voxelansicht ohne Modelle und Texturen. Echte Blockformen
+  gibt es nur im Browser-Viewer, und nur mit einer Original-Client-JAR.
+- Der Client rechnet Licht nicht selbst nach: Was der Server schickt, wird gezeichnet. Ein Server,
+  der kein Licht schickt, bekommt die frühere Flächenschattierung.
+
+---
+
 # Rust-Client 2.5.0 – texturierte Live-POV und Projekt-Audit
 
 Stand: 30. August 2026

@@ -573,6 +573,14 @@ fn print_item(shared: &Arc<Shared>, index: usize, item: &Item) {
 
 /// `:click <feld> [rechts|shift]`
 pub fn click_command(shared: &Arc<Shared>, arg: &str) -> bool {
+    // Wie bei den übrigen Spielaktionen: die kurze Ladephase abwarten statt die Eingabe
+    // wegzuwerfen (siehe [`Shared::await_gameplay`]).
+    if !shared.await_gameplay(crate::client::GAMEPLAY_WAIT) {
+        shared
+            .console
+            .error("Menüaktionen sind erst nach dem Beitritt und der Startposition möglich.");
+        return false;
+    }
     let mut parts = arg.split_whitespace();
     let Some(slot) = parts.next().and_then(|text| text.parse::<i32>().ok()) else {
         shared
@@ -645,6 +653,14 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) -> bool {
 
 /// `:close` – Fenster schließen (der Server erwartet das, sonst bleibt es für ihn offen).
 pub fn close_command(shared: &Arc<Shared>) -> bool {
+    // Wie bei den übrigen Spielaktionen: die kurze Ladephase abwarten statt die Eingabe
+    // wegzuwerfen (siehe [`Shared::await_gameplay`]).
+    if !shared.await_gameplay(crate::client::GAMEPLAY_WAIT) {
+        shared
+            .console
+            .error("Menüaktionen sind erst nach dem Beitritt und der Startposition möglich.");
+        return false;
+    }
     // Fenster erst aus dem Zustand nehmen, Sperre loslassen, dann senden (siehe `click_command`).
     let Some(id) = shared
         .extras

@@ -129,6 +129,27 @@ pub struct AutoCommand {
     pub repeat_seconds: u64,
 }
 
+/// Was nach einem Kick oder Netzabbruch geschieht.
+///
+/// Der Server-Transfer ist davon unberührt: Er ist ein ausdrücklicher Protokollwechsel innerhalb
+/// derselben Sitzung und läuft ohne Wartezeit weiter, auch ohne diese Einstellung.
+///
+/// Die Vorgabewerte sind dieselben wie im Java-Client, damit ein Panel beiden Dateien dieselbe
+/// Befehlszeile schicken kann und dasselbe Verhalten bekommt.
+#[derive(Clone, Copy)]
+pub struct Reconnect {
+    /// Wartezeit vor dem ersten Versuch; sie verdoppelt sich mit jedem Fehlversuch in Folge.
+    pub delay_seconds: u64,
+    /// Obergrenze der verdoppelten Wartezeit.
+    pub max_backoff_seconds: u64,
+    /// Versuche in Folge, bevor der Client aufgibt. 0 = ohne Grenze.
+    pub attempts: u32,
+}
+
+/// Vorgabe des Java-Clients: erst nach fünf Sekunden, höchstens jede Minute.
+const DEFAULT_RECONNECT_DELAY: u64 = 5;
+const DEFAULT_MAX_BACKOFF: u64 = 60;
+
 /// Alles, was der Client zur Laufzeit braucht.
 #[derive(Clone)]
 pub struct Options {
@@ -179,9 +200,17 @@ pub struct Options {
     pub pov_fps: Option<usize>,
     /// Lokaler HTTP-Viewer fuer die texturierte Browser-POV.
     pub pov_web: Option<SocketAddr>,
-    /// Originale Minecraft-Client-JAR, aus der Modelle, Texturen und GUI gelesen werden. Die
-    /// Dateien werden nie kopiert oder ins Binary eingebettet.
-    pub pov_resources: Option<PathBuf>,
+    /// Woher die originalen Modelle, Texturen und GUI-Sprites kommen. Ohne Angabe sucht der
+    /// Client sie selbst (siehe [`crate::pov_resources`]); ins Binary eingebettet wird nichts.
+    #[cfg(feature = "pov")]
+    pub pov_resources: crate::pov_resources::Source,
+    /// Ohne Live-Ansicht ist die Angabe wirkungslos und wird nur gemeldet.
+    #[cfg(not(feature = "pov"))]
+    pub pov_resources: Option<String>,
+
+    /// Nach einem Kick oder Netzabbruch neu verbinden. Standardmäßig gesetzt; `None` steht für
+    /// `--no-reconnect`, dann endet der Prozess mit Status 1.
+    pub reconnect: Option<Reconnect>,
 
     /// Optionen, die dieser Client angenommen, aber nicht umgesetzt hat (weil es sie nur im
     /// Java-Client gibt). Wird beim Start einmal genannt.
@@ -216,7 +245,11 @@ impl Default for Options {
             pov_size: None,
             pov_fps: None,
             pov_web: None,
+            #[cfg(feature = "pov")]
+            pov_resources: crate::pov_resources::Source::Auto,
+            #[cfg(not(feature = "pov"))]
             pov_resources: None,
+            reconnect: None,
             ignored: Vec::new(),
         }
     }
@@ -239,6 +272,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
     // Wartezeit nach dem Beitritt, bevor der erste Befehl rausgeht. Der Server braucht einen
     // Moment, bis er Chat von uns überhaupt annimmt.
     let mut join_delay = 4u64;
+    // `None` = zum Reconnect wurde nichts gesagt, es bleibt beim Beenden nach einem Kick.
+    let mut reconnect_on: Option<bool> = None;
+    let mut reconnect_delay = DEFAULT_RECONNECT_DELAY;
+    let mut reconnect_backoff = DEFAULT_MAX_BACKOFF;
+    let mut reconnect_tries = 0u32;
     let mut args = args.into_iter().peekable();
 
     while let Some(arg) = args.next() {
@@ -312,7 +350,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 o.pov_web = Some(parsed);
             }
             "--pov-resources" | "--pov-assets" => {
-                o.pov_resources = Some(PathBuf::from(value("--pov-resources")?));
+                let wanted = value("--pov-resources")?;
+                #[cfg(feature = "pov")]
+                {
+                    o.pov_resources = crate::pov_resources::Source::parse(&wanted);
+                }
+                #[cfg(not(feature = "pov"))]
+                {
+                    o.pov_resources = Some(wanted);
+                }
             }
             "-m" | "--mc" | "--version" => {
                 let name = value("--mc")?;
@@ -333,12 +379,29 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             "--no-color" => o.color = false,
             "-q" | "--quiet" => o.quiet = true,
 
-            // Nur der Java-Client verbindet nach einem Abbruch neu. Ein Panel schickt allen
-            // Bauformen dieselbe Befehlszeile – daran darf der Start nicht scheitern.
-            "--no-reconnect" => o.ignored.push(arg.clone()),
-            "--reconnect-delay" | "--max-backoff" => {
-                value(&arg)?;
-                o.ignored.push(arg.clone());
+            // Neu verbinden ist die Vorgabe; hier steht nur, wer sie ausdrücklich umstellt.
+            // `--no-reconnect` gewinnt dabei unabhängig von der Reihenfolge – deshalb füllen die
+            // Feineinstellungen unten nur einen noch offenen Wunsch (`get_or_insert`) und
+            // überschreiben kein bereits ausgesprochenes „nein". `--reconnect` gibt es, damit ein
+            // Panel die Vorgabe auch ausschreiben kann, ohne dass der Start daran scheitert.
+            "--reconnect" => {
+                reconnect_on.get_or_insert(true);
+            }
+            "--no-reconnect" => reconnect_on = Some(false),
+            "--reconnect-delay" => {
+                reconnect_delay =
+                    seconds(&value("--reconnect-delay")?, "--reconnect-delay")?.max(1);
+                reconnect_on.get_or_insert(true);
+            }
+            "--max-backoff" => {
+                reconnect_backoff = seconds(&value("--max-backoff")?, "--max-backoff")?.max(1);
+                reconnect_on.get_or_insert(true);
+            }
+            "--reconnect-tries" => {
+                reconnect_tries =
+                    number(&value("--reconnect-tries")?, "--reconnect-tries")?.min(u32::MAX as u64)
+                        as u32;
+                reconnect_on.get_or_insert(true);
             }
 
             other if !other.starts_with('-') && o.server.is_empty() => o.server = other.to_string(),
@@ -354,6 +417,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             "--account und --offline schließen sich aus: entweder Microsoft-Konto oder Offline-Name."
                 .to_string(),
         );
+    }
+    // An, solange nicht ausdrücklich abgeschaltet – wie im Java-Client. Zwei Clients, die
+    // denselben Schalter kennen und sich ohne ihn verschieden verhalten, sind die Sorte
+    // Unterschied, die ein Panel erst bemerkt, wenn ein Bot nachts stillschweigend weg ist.
+    if reconnect_on != Some(false) {
+        o.reconnect = Some(Reconnect {
+            delay_seconds: reconnect_delay,
+            // Eine Obergrenze unter der Anfangswartezeit ergäbe eine Wartezeit, die mit jedem
+            // Versuch *kürzer* wird. Gemeint ist dann offensichtlich: nicht länger als das.
+            max_backoff_seconds: reconnect_backoff.max(reconnect_delay),
+            attempts: reconnect_tries,
+        });
     }
     o.server = o.server.trim().to_string();
     check_server(&o.server)?;
@@ -783,21 +858,78 @@ mod tests {
     /// Java-Client gibt, dürfen den Start deshalb nicht abbrechen.
     #[test]
     fn java_optionen_werden_angenommen_und_gemeldet() {
-        let o = options(&[
-            "x",
-            "--no-reconnect",
-            "--reconnect-delay",
-            "5",
-            "--max-backoff",
-            "60",
-        ]);
-        assert_eq!(
-            o.ignored,
-            vec!["--no-reconnect", "--reconnect-delay", "--max-backoff"]
-        );
+        let o = options(&["x", "--pov", "an"]);
+        assert!(o.ignored.is_empty());
         assert_eq!(o.server, "x");
         // Ein echter Tippfehler bleibt ein Fehler.
         assert!(parse_args(&["x", "--kein-schalter"]).is_err());
+    }
+
+    /// Ohne Angabe wird neu verbunden; nur `--no-reconnect` beendet den Prozess. Dieselbe Vorgabe
+    /// hat der Java-Client – ein Panel darf beiden dieselbe Zeile geben und dasselbe erwarten.
+    #[test]
+    fn ohne_angabe_wird_neu_verbunden() {
+        assert!(options(&["x"]).reconnect.is_some());
+        assert!(options(&["x", "--no-reconnect"]).reconnect.is_none());
+    }
+
+    /// Die Vorgabewerte sind die des Java-Clients – mit und ohne den Schalter dieselben.
+    #[test]
+    fn reconnect_hat_die_java_vorgaben() {
+        for args in [&["x"][..], &["x", "--reconnect"][..]] {
+            let r = options(args).reconnect.unwrap();
+            assert_eq!(r.delay_seconds, 5);
+            assert_eq!(r.max_backoff_seconds, 60);
+            assert_eq!(r.attempts, 0, "0 heisst: ohne Grenze");
+        }
+    }
+
+    /// Die Feineinstellungen kommen wirklich an – und ein `--reconnect` davor ändert daran nichts.
+    #[test]
+    fn feineinstellungen_kommen_an() {
+        let r = options(&["x", "--reconnect-delay", "9", "--reconnect-tries", "3"])
+            .reconnect
+            .unwrap();
+        assert_eq!(r.delay_seconds, 9);
+        assert_eq!(r.attempts, 3);
+        assert_eq!(
+            options(&["x", "--reconnect", "--max-backoff", "30"])
+                .reconnect
+                .unwrap()
+                .max_backoff_seconds,
+            30
+        );
+    }
+
+    /// `--no-reconnect` gewinnt gegen eine Wartezeit, und zwar in **beiden** Reihenfolgen. Sonst
+    /// hinge das Verhalten daran, wie ein Panel seine Argumente zusammensetzt.
+    #[test]
+    fn kein_reconnect_gewinnt_in_jeder_reihenfolge() {
+        assert!(options(&["x", "--no-reconnect", "--reconnect-delay", "9"])
+            .reconnect
+            .is_none());
+        assert!(options(&["x", "--reconnect-delay", "9", "--no-reconnect"])
+            .reconnect
+            .is_none());
+    }
+
+    /// Eine Obergrenze unterhalb der Grundzeit ergäbe eine Wartezeit, die mit jedem Versuch
+    /// kürzer wird. Gemeint ist offensichtlich „nicht länger als das".
+    #[test]
+    fn obergrenze_faellt_nie_unter_die_grundzeit() {
+        let r = options(&["x", "--reconnect-delay", "30", "--max-backoff", "5"])
+            .reconnect
+            .unwrap();
+        assert_eq!(r.delay_seconds, 30);
+        assert_eq!(r.max_backoff_seconds, 30);
+    }
+
+    /// Null Sekunden Wartezeit wären ein Sekundentakt gegen einen Server, der ohnehin gerade
+    /// nicht kann – und genau das, was als Angriff aussieht.
+    #[test]
+    fn wartezeit_null_wird_zu_einer_sekunde() {
+        let r = options(&["x", "--reconnect-delay", "0"]).reconnect.unwrap();
+        assert_eq!(r.delay_seconds, 1);
     }
 
     /// Aus den Sekundenangaben werden `Duration`-Werte, die der Befehls-Planer addiert. Ohne
@@ -873,7 +1005,22 @@ mod tests {
             "/tmp/client.jar",
         ]);
         assert_eq!(web.pov_web.unwrap().to_string(), "127.0.0.1:8765");
-        assert_eq!(web.pov_resources, Some(PathBuf::from("/tmp/client.jar")));
+        #[cfg(feature = "pov")]
+        {
+            use crate::pov_resources::Source;
+            assert_eq!(
+                web.pov_resources,
+                Source::File(PathBuf::from("/tmp/client.jar"))
+            );
+            // Ohne Angabe sucht der Client selbst – das ist der ganze Sinn der Sache.
+            assert_eq!(options(&["x"]).pov_resources, Source::Auto);
+            assert_eq!(
+                options(&["x", "--pov-resources", "aus"]).pov_resources,
+                Source::Off
+            );
+        }
+        #[cfg(not(feature = "pov"))]
+        assert_eq!(web.pov_resources.as_deref(), Some("/tmp/client.jar"));
         assert!(parse_args(&["x", "--pov-web", "localhost:8765"]).is_err());
         assert!(parse_args(&["x", "--pov-web", "0"]).is_err());
     }
