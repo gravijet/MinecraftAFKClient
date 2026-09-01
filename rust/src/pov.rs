@@ -659,7 +659,10 @@ fn read_light_arrays(
     let mut next = 0usize;
     for index in 0..count {
         out.push(if present.has(index) {
-            let section = arrays.get(next).cloned().unwrap_or(LightSection::Uniform(0));
+            let section = arrays
+                .get(next)
+                .cloned()
+                .unwrap_or(LightSection::Uniform(0));
             next += 1;
             section
         } else {
@@ -2260,11 +2263,13 @@ pub(crate) fn web_frame(
     let position = shared
         .position()
         .ok_or_else(|| "Position noch unbekannt".to_string())?;
-    let assets = shared
-        .extras
-        .pov
-        .assets()
-        .ok_or_else(|| shared.extras.pov.asset_note().unwrap_or_else(|| "keine Ressourcen".to_string()))?;
+    let assets = shared.extras.pov.assets().ok_or_else(|| {
+        shared
+            .extras
+            .pov
+            .asset_note()
+            .unwrap_or_else(|| "keine Ressourcen".to_string())
+    })?;
     let width = width.clamp(160, 640);
     let height = height.clamp(90, 360);
     if width.saturating_mul(height) > 640 * 360 {
@@ -2540,12 +2545,7 @@ fn cast_textured(
             if let Some(section) = section {
                 let index = local_index(ray.cell.0, ray.cell.1, ray.cell.2);
                 if !section.is_air(index) {
-                    let leave = ray
-                        .next
-                        .0
-                        .min(ray.next.1)
-                        .min(ray.next.2)
-                        .min(MAX_DISTANCE);
+                    let leave = ray.next.0.min(ray.next.1).min(ray.next.2).min(MAX_DISTANCE);
                     let biome = cursor.biome_tint(ray.cell.0, ray.cell.1, ray.cell.2);
                     if let Some(hit) = assets.hit(
                         section.state(index),
@@ -3611,7 +3611,11 @@ mod tests {
                 let sky = sky_color(py, height);
                 let direction =
                     pixel_direction(basis, (half_width, half_height), (width, height), px, py);
-                match cast(cursor, (position.0, position.1 + 1.62, position.2), direction) {
+                match cast(
+                    cursor,
+                    (position.0, position.1 + 1.62, position.2),
+                    direction,
+                ) {
                     Some((state, distance, face)) => Pixel {
                         rgb: fog(block_color(state, face, distance), sky, distance),
                         depth: distance,
@@ -3665,12 +3669,9 @@ mod tests {
     fn echte_texturen_landen_im_bild() {
         let console = crate::console::Console::new(false, false, false);
         let version = "1.21.1";
-        let path = crate::pov_resources::locate(
-            &console,
-            version,
-            &crate::pov_resources::Source::Auto,
-        )
-        .expect("Ressourcen beschaffen");
+        let path =
+            crate::pov_resources::locate(&console, version, &crate::pov_resources::Source::Auto)
+                .expect("Ressourcen beschaffen");
         let assets = Assets::load(&path, version).expect("Assets lesen");
 
         // Stein grau, Gras grün, Wasser blau, Sand sandfarben, ein Baum – alles echte

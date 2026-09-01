@@ -398,9 +398,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 reconnect_on.get_or_insert(true);
             }
             "--reconnect-tries" => {
-                reconnect_tries =
-                    number(&value("--reconnect-tries")?, "--reconnect-tries")?.min(u32::MAX as u64)
-                        as u32;
+                reconnect_tries = number(&value("--reconnect-tries")?, "--reconnect-tries")?
+                    .min(u32::MAX as u64) as u32;
                 reconnect_on.get_or_insert(true);
             }
 

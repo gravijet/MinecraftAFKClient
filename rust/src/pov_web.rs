@@ -42,9 +42,7 @@ pub(crate) fn start(shared: &Arc<Shared>, address: SocketAddr) -> Result<(), Str
         );
     }
     if let Some(note) = shared.extras.pov.asset_note() {
-        shared
-            .console
-            .info(&format!("Browser-POV: {}", note));
+        shared.console.info(&format!("Browser-POV: {}", note));
     }
 
     let owned = Arc::clone(shared);

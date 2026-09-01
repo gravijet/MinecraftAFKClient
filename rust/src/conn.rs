@@ -6,9 +6,7 @@
 use crate::buf::{err, push_var_int, Reader, Writer};
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Block};
-use flate2::{
-    Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status,
-};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc;
@@ -251,7 +249,9 @@ impl PacketReader {
         }
         let expected = uncompressed_len as usize;
         if expected < self.threshold as usize {
-            return Err(err("Komprimiertes Paket unterschreitet Kompressionsschwelle"));
+            return Err(err(
+                "Komprimiertes Paket unterschreitet Kompressionsschwelle",
+            ));
         }
         out.reserve(expected);
         self.inflate.reset(true);
@@ -504,7 +504,12 @@ pub(crate) fn dial_timeout(host: &str, port: u16, timeout: Duration) -> io::Resu
         }
     }
 
-    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Verbindungsaufbau dauerte zu lange")))
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Verbindungsaufbau dauerte zu lange",
+        )
+    }))
 }
 
 /// Resolver-Reihenfolge innerhalb jeder Adressfamilie erhalten, die Familien aber abwechseln.

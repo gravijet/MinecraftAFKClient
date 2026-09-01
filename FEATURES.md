@@ -442,6 +442,13 @@ Schritt entsprechend deutlicher aus:
 | 160×80 (Terminal) | 18 ms | 15 ms | 15 ms (bewusst einthreadig) |
 | 426×240 (Browser) | 141 ms | 110 ms | 77 ms |
 
+Licht und Biomfarben kamen danach dazu und kosten je Treffer einen Nachschlag mehr. Derselbe
+Messlauf auf einem *nicht* gedrosselten Rechner ergibt damit 2,2 ms, 12,7 ms und 35,4 ms – die
+Zahlen der Tabelle sind also nicht direkt vergleichbar, aber die Reihenfolge stimmt weiter. Der
+Grund, dass es nicht teurer wurde: Die Biomfarben liegen als fertige Tabelle bereit (eine
+Nachschlagestelle je Bildpunkt, nicht eine Rechnung), und ein gleichförmiger Lichtabschnitt
+antwortet ohne Speicherzugriff auf das Nibble-Feld.
+
 ```bash
 cd rust && cargo test --release --features ultra -- --ignored --nocapture messlauf_bildrate
 ```

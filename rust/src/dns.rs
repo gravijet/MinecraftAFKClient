@@ -483,9 +483,15 @@ options edns0
         assert!(parse_resolv_conf("nameserverX 192.0.2.1").is_empty());
         assert!(parse_resolv_conf("# nameserver 192.0.2.1").is_empty());
         // Doppelte Einträge nur einmal, und höchstens drei (MAXNS).
-        assert_eq!(parse_resolv_conf("nameserver 192.0.2.1\nnameserver 192.0.2.1").len(), 1);
         assert_eq!(
-            parse_resolv_conf("nameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1").len(),
+            parse_resolv_conf("nameserver 192.0.2.1\nnameserver 192.0.2.1").len(),
+            1
+        );
+        assert_eq!(
+            parse_resolv_conf(
+                "nameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1"
+            )
+            .len(),
             3
         );
     }

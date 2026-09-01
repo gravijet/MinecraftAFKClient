@@ -111,11 +111,7 @@ fn serverbefehl_wartet_auf_startposition() {
         &["--no-color", "-c", "/erst-nach-position"],
     );
 
-    let joined = common::wait_note(
-        &server.notes,
-        TIMEOUT,
-        |note| matches!(note, Note::Joined),
-    );
+    let joined = common::wait_note(&server.notes, TIMEOUT, |note| matches!(note, Note::Joined));
     assert!(joined, "Spiel-Login kam nicht an");
 
     let premature = common::wait_note(
@@ -1378,7 +1374,10 @@ fn browser_viewer_antwortet_nur_mit_token() {
     assert!(head.contains("text/html"), "{}", head);
     let page = String::from_utf8_lossy(&body);
     assert!(page.contains("Live-POV"), "unerwartete Seite");
-    assert!(!page.contains("https://"), "die Seite laedt von aussen nach");
+    assert!(
+        !page.contains("https://"),
+        "die Seite laedt von aussen nach"
+    );
 
     // Und der Zustand ist gültiges JSON mit den Feldern, an denen die Seite hängt.
     let (status, head, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
@@ -1387,7 +1386,10 @@ fn browser_viewer_antwortet_nur_mit_token() {
     let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
     assert_eq!(state["textures"], serde_json::Value::Bool(false));
     assert!(
-        state["texture_error"].as_str().unwrap_or("").contains("aus"),
+        state["texture_error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("aus"),
         "der abgeschaltete Zustand steht nicht im JSON: {}",
         state["texture_error"]
     );
@@ -1444,10 +1446,8 @@ fn browser_viewer_liefert_ein_texturiertes_bild() {
     assert_eq!(state["texture_error"], serde_json::Value::Null);
 
     // Und das Bild kommt als PNG heraus – mit Inhalt, nicht als leere Fläche.
-    let (status, head, png) = common::http_get(
-        port,
-        &format!("/api/frame.png?token={}&w=320&h=180", token),
-    );
+    let (status, head, png) =
+        common::http_get(port, &format!("/api/frame.png?token={}&w=320&h=180", token));
     assert_eq!(status, 200, "kein Bild: {}", head);
     assert!(head.contains("image/png"), "{}", head);
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "das ist kein PNG");

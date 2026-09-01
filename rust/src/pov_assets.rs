@@ -63,8 +63,16 @@ enum TintKind {
 fn tint_for(block: &str) -> Option<TintKind> {
     let (_, name) = resource_id(block);
     Some(match name {
-        "grass_block" | "grass" | "short_grass" | "tall_grass" | "fern" | "large_fern"
-        | "potted_fern" | "sugar_cane" | "pink_petals" | "attached_melon_stem"
+        "grass_block"
+        | "grass"
+        | "short_grass"
+        | "tall_grass"
+        | "fern"
+        | "large_fern"
+        | "potted_fern"
+        | "sugar_cane"
+        | "pink_petals"
+        | "attached_melon_stem"
         | "attached_pumpkin_stem" => TintKind::Grass,
         // Diese drei färbt Vanilla fest ein, unabhängig vom Biom.
         "spruce_leaves" => TintKind::Fixed([0x61, 0x99, 0x61]),
@@ -289,8 +297,7 @@ impl Assets {
             GrassModifier::Swamp => rgb(6_975_545),
             // `(farbe & 0xFEFEFE) + 0x28340A >> 1` – Vanillas Mischung zum Dunkelwald-Ton hin.
             GrassModifier::DarkForest => {
-                let packed =
-                    (grass[0] as u32) << 16 | (grass[1] as u32) << 8 | grass[2] as u32;
+                let packed = (grass[0] as u32) << 16 | (grass[1] as u32) << 8 | grass[2] as u32;
                 rgb(((packed & 0xFE_FEFE) + 0x28_340A) >> 1)
             }
         };
@@ -1469,10 +1476,22 @@ mod tests {
             ..BiomeParams::PLAINS
         };
         // Ebene, Wüste, Taiga, Dschungel – vier deutlich verschiedene Klimapunkte.
-        assert_eq!(assets.biome_tint(&biome(0.8, 0.4)).grass, [0x91, 0xBD, 0x59]);
-        assert_eq!(assets.biome_tint(&biome(2.0, 0.0)).grass, [0xBF, 0xB7, 0x55]);
-        assert_eq!(assets.biome_tint(&biome(0.25, 0.8)).grass, [0x86, 0xB7, 0x83]);
-        assert_eq!(assets.biome_tint(&biome(0.95, 0.9)).grass, [0x59, 0xC9, 0x3C]);
+        assert_eq!(
+            assets.biome_tint(&biome(0.8, 0.4)).grass,
+            [0x91, 0xBD, 0x59]
+        );
+        assert_eq!(
+            assets.biome_tint(&biome(2.0, 0.0)).grass,
+            [0xBF, 0xB7, 0x55]
+        );
+        assert_eq!(
+            assets.biome_tint(&biome(0.25, 0.8)).grass,
+            [0x86, 0xB7, 0x83]
+        );
+        assert_eq!(
+            assets.biome_tint(&biome(0.95, 0.9)).grass,
+            [0x59, 0xC9, 0x3C]
+        );
 
         // Eine ausdrücklich gesetzte Farbe schlägt die Farbkarte.
         let fixed = BiomeParams {

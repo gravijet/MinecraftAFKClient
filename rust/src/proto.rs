@@ -681,7 +681,7 @@ const EXTRA_26: Extra = Extra {
     sb_use_item: 67,
 
     cb_level_chunk: 45,
-        cb_light_update: 48,
+    cb_light_update: 48,
     cb_forget_level_chunk: 37,
     cb_block_update: 8,
     cb_section_blocks_update: 84,

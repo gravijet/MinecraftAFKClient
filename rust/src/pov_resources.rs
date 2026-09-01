@@ -340,8 +340,10 @@ mod tests {
             assert!(text.ends_with(".jar"), "{}", text);
         }
         // Der offizielle Launcher-Pfad muss dabei sein.
-        assert!(paths.iter().any(|path| path.ends_with("versions/26.1/26.1.jar")
-            || path.ends_with("versions\\26.1\\26.1.jar")));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("versions/26.1/26.1.jar")
+                || path.ends_with("versions\\26.1\\26.1.jar")));
     }
 
     /// Die Ablage gehört neben die Konten, nicht in ein temporäres Verzeichnis: Sie soll den
@@ -379,6 +381,11 @@ mod tests {
         // Eine ausdrücklich abgeschaltete Quelle lädt nichts, und eine falsche Datei erfindet
         // nichts, sondern sagt es.
         assert!(locate(&console, version, &Source::Off).is_err());
-        assert!(locate(&console, version, &Source::File("/gibt/es/nicht.jar".into())).is_err());
+        assert!(locate(
+            &console,
+            version,
+            &Source::File("/gibt/es/nicht.jar".into())
+        )
+        .is_err());
     }
 }
