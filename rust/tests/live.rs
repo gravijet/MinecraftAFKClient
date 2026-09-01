@@ -575,8 +575,14 @@ fn letzte_chatzeilen_gehen_vor_dem_beenden_noch_raus() {
 /// also, den Rest des Pakets **exakt** zu überspringen – ein Byte daneben, und es kommt Unsinn
 /// heraus statt gar nichts.
 ///
-/// Geprüft wird auf allen vier Protokollen, weil Höhenkarten und Palettenformat davor
-/// unterschiedlich lang sind: Genau daran fällt ein falscher Lesezeiger auf.
+/// Geprüft wird auf beiden Chunk-Formaten, die dieser Testserver nachbauen kann: dem alten
+/// (1.21.1, ohne Fluidzähler) und dem modernen (26.1 und 26.2). Genau daran fällt ein falscher
+/// Lesezeiger auf, denn Höhenkarten und Palettenformat davor sind unterschiedlich lang.
+///
+/// **Nicht** abgedeckt ist 1.21.11: Der Testserver hat für dieses Protokoll keine ID-Tabelle, und
+/// eine mit geratenen Nummern wäre schlimmer als keine – sie sähe aus wie Abdeckung. Dass die
+/// Paket-ID dort stimmt, sichert stattdessen der Einzeltest `licht_id_liegt_vor_dem_login`, der
+/// die Beziehung zu den Nachbarpaketen in **allen vier** Tabellen festhält.
 #[cfg(feature = "pov")]
 #[test]
 fn licht_wird_aus_dem_chunk_paket_gelesen() {
