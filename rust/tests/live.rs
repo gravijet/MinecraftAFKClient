@@ -1407,6 +1407,116 @@ fn browser_viewer_antwortet_nur_mit_token() {
     let _ = child.kill();
 }
 
+/// Die Steuerung im Browser sendet wirklich etwas an den Server – nicht nur an die eigene
+/// Ansicht.
+///
+/// `/api/hotbar`, `/api/click` und `/api/close` rufen dieselben Funktionen wie `:hand`, `:click`
+/// und `:close` auf; für den Terminalweg gibt es dafür bereits Abdeckung
+/// (`alle_oertlichen_befehle_ueberstehen_auch_unsinn`). Ohne diesen Test bliebe der HTTP-Pfad in
+/// `pov_web.rs` – Query-Parsing, Klickart-Übersetzung, Feature-Weiche – unbeobachtet, obwohl er
+/// der einzige Weg ist, den ein Browser tatsächlich benutzt.
+#[cfg(all(feature = "pov", feature = "menu", feature = "state"))]
+#[test]
+fn browser_steuerung_wirkt_auf_den_server() {
+    let mut plan = plan_with_ground();
+    plan.menu = true;
+    let server = common::start(&common::MC_26_1, plan);
+
+    let mut attempt = 0;
+    let (port, mut child, token, err) = loop {
+        attempt += 1;
+        let port = common::free_port();
+        let mut child = common::spawn_client(
+            server.port,
+            "26.1",
+            &[
+                "--no-color",
+                "--pov-web",
+                &port.to_string(),
+                "--pov-resources",
+                "aus",
+            ],
+        );
+        let err = common::collect(child.stderr.take().unwrap());
+        let (found, log) = common::wait_for(&err, Duration::from_secs(10), "Browser-POV: http://");
+        if found {
+            let token = log
+                .split("?token=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .expect("Token in der Adresse")
+                .to_string();
+            break (port, child, token, err);
+        }
+        let _ = child.kill();
+        assert!(
+            attempt < 4,
+            "Viewer kam auch nach {} Versuchen nicht hoch. Letzte Ausgabe:\n{}",
+            attempt,
+            log
+        );
+    };
+
+    // Der Testserver öffnet mit `plan.menu = true` gleich beim Beitritt ein Menü – erst darauf
+    // warten, sonst prüft der Rest des Tests einen Zustand von vor dem Beitritt.
+    let (opened, log) = common::wait_for(&err, TIMEOUT, "Menü geöffnet");
+    assert!(opened, "kein Menü gemeldet. Ausgabe:\n{}", log);
+
+    let (status, _, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(
+        state["menu"]["open"],
+        serde_json::Value::Bool(true),
+        "kein Menü offen, der Rest des Tests liefe ins Leere: {}",
+        state
+    );
+
+    // Schnellleiste: Feld 3 wählen kommt beim Server als eigenes Paket an ...
+    let (status, _, _) = common::http_post(port, &format!("/api/hotbar?slot=3&token={}", token));
+    assert_eq!(status, 204, "Schnellleistenwahl wurde abgelehnt");
+    let ok = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_set_carried_item),
+    );
+    assert!(ok, "kein sb_set_carried_item-Paket beim Server angekommen");
+    // ... und die eigene Ansicht meldet danach dasselbe Feld zurück.
+    let (status, _, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(state["selected_hotbar"], 3);
+
+    // Menü-Klick: Feld 4 rechtsklicken kommt als Container-Klick an.
+    let (status, _, _) = common::http_post(
+        port,
+        &format!("/api/click?slot=4&action=right&token={}", token),
+    );
+    assert_eq!(status, 204, "der Klick wurde abgelehnt");
+    let ok = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_container_click),
+    );
+    assert!(ok, "kein sb_container_click-Paket beim Server angekommen");
+
+    // Schließen kommt ebenfalls an, und der Zustand meldet das Menü danach als zu.
+    let (status, _, _) = common::http_post(port, &format!("/api/close?token={}", token));
+    assert_eq!(status, 204, "das Schließen wurde abgelehnt");
+    let ok = common::wait_note(
+        &server.notes,
+        TIMEOUT,
+        |note| matches!(note, Note::Packet(id, _) if *id == common::MC_26_1.sb_container_close),
+    );
+    assert!(ok, "kein sb_container_close-Paket beim Server angekommen");
+    let (status, _, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(state["menu"]["open"], serde_json::Value::Bool(false));
+
+    let _ = child.kill();
+}
+
 /// Der ganze Weg am Stück, durch das echte Binary: verbinden, Chunks lesen, Original-Texturen
 /// laden, ein Bild rendern und es über HTTP ausliefern.
 ///

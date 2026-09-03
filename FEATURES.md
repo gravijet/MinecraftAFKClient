@@ -293,17 +293,15 @@ hier als Fläche benutzt.
 
 #### Licht
 
-Vorher waren alle Höhlen genauso hell wie die Oberfläche, und ein Fackelschein war nirgends zu
-sehen: Die Helligkeit einer Fläche hing allein an ihrer Ausrichtung. Jetzt kommt sie aus dem
-Licht, das der Server ohnehin mitschickt – im Chunk-Paket direkt hinter den Blockdaten und danach
-in `LightUpdate`, wenn sich etwas ändert.
+Die Browser-Ansicht rechnet **fullbright**: Jede Fläche zeigt ihre Texturfarbe nur noch mit der
+Flächenausrichtung verrechnet (Oberseiten hell, Unterseiten dunkel), unabhängig vom Licht, das der
+Server meldet. Eine dunkle Höhle oder eine Server-Nacht macht die echten Texturen also nicht mehr
+unlesbar dunkel bis schwarz.
 
-Gelesen werden Himmels- und Blocklicht getrennt, als je ein Nibble pro Block. Für einen Treffer
-wird das Licht **des Nachbarblocks vor der getroffenen Fläche** genommen – so, wie das Spiel es
-auch tut; das Licht im Block selbst ist bei einem festen Block null. Aus dem größeren der beiden
-Werte wird die Vanilla-Kurve `f / (4 - 3f)` gebildet und mit der Flächenausrichtung multipliziert.
-Ein Restwert von 0,06 bleibt stehen, damit ein unbeleuchteter Block noch als Umriss erkennbar ist
-statt als schwarze Fläche.
+Gelesen werden Himmels- und Blocklicht trotzdem weiterhin – getrennt, als je ein Nibble pro Block,
+im Chunk-Paket direkt hinter den Blockdaten und danach in `LightUpdate`, wenn sich etwas ändert.
+`:pov info` nennt weiterhin, wie viele Chunks Licht mitbringen; nur die Bildhelligkeit selbst
+hängt nicht mehr daran.
 
 Der Speicher dafür wird nicht einfach hingenommen: Roh sind das 2 × 2048 Byte je Abschnitt, bei
 24 Abschnitten also 96 KB je Chunk. Fast alle davon sind aber gleichförmig – tief unter Tage
@@ -319,10 +317,8 @@ dieser eine Wert abgelegt. Nachgemessen am selben Arbeitspunkt wie oben:
 Die Verdichtung ist also nicht Kosmetik, sondern der Grund, warum das Feature überhaupt
 vertretbar ist: 272 KB statt 7,2 MB.
 
-Licht ist strikt additiv. Ein Server, der keins schickt, ein Paket in unerwarteter Form oder ein
-Abschnitt ohne Lichtdaten kosten weder den Chunk noch die Verbindung – die Ansicht fällt dann
-genau auf die frühere Flächenschattierung zurück. `:pov info` nennt deshalb neben der Chunk-Zahl,
-wie viele davon Licht mitbringen.
+Ein Server, der keins schickt, ein Paket in unerwarteter Form oder ein Abschnitt ohne Lichtdaten
+kosten weder den Chunk noch die Verbindung – da die Bildhelligkeit ohnehin nicht davon abhängt.
 
 ### Terminal-Fallback
 

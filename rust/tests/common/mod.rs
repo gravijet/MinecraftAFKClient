@@ -416,6 +416,12 @@ pub struct Ids {
     pub cb_transfer: i32,
     pub cb_store_cookie: i32,
     pub sb_client_command: i32,
+    /// `:hand`/`/api/hotbar` – welches Schnellleistenfeld aktiv ist.
+    pub sb_set_carried_item: i32,
+    /// `:click`/`/api/click` – ein Feld im offenen Menü anklicken.
+    pub sb_container_click: i32,
+    /// `:close`/`/api/close` – das offene Menü schließen.
+    pub sb_container_close: i32,
 }
 
 pub static MC_26_1: Ids = Ids {
@@ -458,6 +464,9 @@ pub static MC_26_1: Ids = Ids {
     cb_transfer: 129,
     cb_store_cookie: 120,
     sb_client_command: 12,
+    sb_set_carried_item: 53,
+    sb_container_click: 18,
+    sb_container_close: 19,
 };
 
 pub static MC_1_21_1: Ids = Ids {
@@ -500,6 +509,9 @@ pub static MC_1_21_1: Ids = Ids {
     cb_transfer: 115,
     cb_store_cookie: 107,
     sb_client_command: 9,
+    sb_set_carried_item: 47,
+    sb_container_click: 14,
+    sb_container_close: 15,
 };
 
 /// 26.2 verschiebt keine der hier benutzten IDs gegenüber 26.1 – nur das Team-Paket ist
@@ -1495,13 +1507,23 @@ pub fn free_port() -> u16 {
 /// Bewusst zu Fuß statt mit einer Bibliothek – geprüft werden soll, was der Viewer wirklich auf
 /// die Leitung schreibt, nicht das, was ein Client daraus zurechtbiegt.
 pub fn http_get(port: u16, target: &str) -> (u16, String, Vec<u8>) {
+    http_request(port, "GET", target)
+}
+
+/// Wie [`http_get`], aber mit `POST` – für die Klick-/Schnellleisten-Endpunkte des Viewers, die
+/// keinen Rumpf erwarten, sondern alles über die Query-Zeichenkette bekommen.
+pub fn http_post(port: u16, target: &str) -> (u16, String, Vec<u8>) {
+    http_request(port, "POST", target)
+}
+
+fn http_request(port: u16, method: &str, target: &str) -> (u16, String, Vec<u8>) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("Viewer erreichbar");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("Zeitlimit");
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        target
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        method, target
     );
     stream.write_all(request.as_bytes()).expect("Anfrage");
     let mut raw = Vec::new();

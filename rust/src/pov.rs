@@ -2661,36 +2661,22 @@ fn first_boundary(origin: f64, direction: f64, cell: i32) -> f64 {
     }
 }
 
-/// Vanillas Helligkeitskurve zu einer Lichtstufe: `f / (4 - 3f)` mit `f = stufe / 15`.
-///
-/// Sie ist deutlich nicht-linear – Stufe 7 ergibt nicht die halbe, sondern rund ein Fünftel der
-/// Helligkeit. Genau das macht den Unterschied zwischen „Höhle" und „Abend" sichtbar.
-///
-/// Der Boden von 0,06 ist bewusst keine Physik: Vanilla käme bei Stufe 0 auf glatt Null. Ein
-/// vollständig schwarzes Bild ist aber keine Auskunft mehr, und die Ansicht soll auch in einer
-/// unbeleuchteten Höhle noch zeigen, wo Wände stehen.
-#[inline]
-fn brightness(level: u8) -> f64 {
-    let f = level.min(15) as f64 / 15.0;
-    (f / (4.0 - 3.0 * f)).max(0.06)
-}
-
 /// Seitenabhängige Helligkeit wie im Spiel: Oberseiten hell, Unterseiten dunkel, die vier
 /// Seitenflächen dazwischen. Dieselben Faktoren benutzt auch das Gegenstands-Icon in
 /// [`crate::pov_assets`].
 ///
-/// `light` ist die echte Lichtstufe aus dem Chunk-Paket, sofern der Server sie geschickt hat.
-/// Ohne sie bleibt es bei der reinen Flächenhelligkeit – dann sieht die Ansicht aus wie vorher,
-/// statt eine Beleuchtung zu erfinden, die niemand gemeldet hat.
+/// Fullbright: Die Ansicht ignoriert bewusst die vom Server gemeldete Lichtstufe (`_light`) und
+/// zeigt die Texturfarben so, wie sie in der JAR stehen – nur noch mit der Seitenabhängigkeit
+/// verrechnet. Damit bleibt eine Höhle oder Nacht als Umriss erkennbar statt fast schwarz.
 #[inline]
-fn shade_face(rgba: (u8, u8, u8, u8), face: usize, light: Option<u8>) -> (u8, u8, u8) {
+fn shade_face(rgba: (u8, u8, u8, u8), face: usize, _light: Option<u8>) -> (u8, u8, u8) {
     let side = match face {
         3 => 1.0,
         2 => 0.55,
         4 | 5 => 0.82,
         _ => 0.70,
     };
-    let factor = side * light.map_or(1.0, brightness);
+    let factor = side;
     (
         (rgba.0 as f64 * factor).min(255.0) as u8,
         (rgba.1 as f64 * factor).min(255.0) as u8,
@@ -2937,16 +2923,6 @@ mod tests {
             0,
             "ausdruecklich geleerter Abschnitt wird dunkel"
         );
-    }
-
-    /// Vanillas Kurve ist deutlich nicht-linear: Halbes Licht ist längst nicht halbe Helligkeit.
-    #[test]
-    fn helligkeitskurve_folgt_vanilla() {
-        assert!((brightness(15) - 1.0).abs() < 1e-9);
-        // 7/15 ergibt 0,4667 / (4 - 1,4) = 0,1795.
-        assert!((brightness(7) - 0.1795).abs() < 0.001);
-        assert!(brightness(0) > 0.0, "ganz schwarz ist keine Auskunft mehr");
-        assert!(brightness(4) < brightness(8) && brightness(8) < brightness(12));
     }
 
     const LEGACY: Format = Format {
