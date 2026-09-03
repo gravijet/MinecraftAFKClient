@@ -434,9 +434,11 @@ impl Assets {
         read_zip(&mut archive, path, MAX_ARCHIVE_ASSET_BYTES)
     }
 
-    /// Vanilla-Icon fuer einen Registry-Namen. Direkte Item-Texturen haben Vorrang; fuer
-    /// Blockitems folgt der gleichnamige Block. Komplex gerenderte Item-Modelle fallen sichtbar
-    /// auf die lila-schwarze Fehlertextur zurueck statt ein falsches Icon zu erfinden.
+    /// Vanilla-Icon fuer einen Registry-Namen. Fuer Blockitems wird das echte Blockmodell
+    /// gerastert, fuer andere Gegenstaende das Itemmodell samt seinen Ebenen geladen. Seit 1.21.2
+    /// verweist `items/<name>.json` bei dynamischen Gegenstaenden wie Uhr und Kompass auf
+    /// nummerierte Modelltexturen; nur nach `textures/item/<name>.png` zu suchen liess diese
+    /// Hotbarfelder dauerhaft lila-schwarz.
     #[cfg(feature = "items")]
     pub(crate) fn item_png(&self, name: &str) -> Vec<u8> {
         if let Ok(cache) = self.item_icons.lock() {
@@ -447,16 +449,57 @@ impl Assets {
         let (namespace, path) = resource_id(name);
         let direct = format!("assets/{}/textures/item/{}.png", namespace, path);
         let bytes = self
-            .raw(&direct)
-            .or_else(|| {
-                let state = self.block_defaults.get(name).copied()?;
-                self.render_block_icon(state)
-            })
+            .block_defaults
+            .get(name)
+            .copied()
+            .and_then(|state| self.render_block_icon(state))
+            .or_else(|| self.render_item_model(name))
+            .or_else(|| self.raw(&direct))
             .unwrap_or_else(|| self.missing_png.clone());
         if let Ok(mut cache) = self.item_icons.lock() {
             cache.insert(name.to_string(), bytes.clone());
         }
         bytes
+    }
+
+    /// Das moderne Item-Definition-Format auf ein statisches GUI-Bild reduzieren.
+    ///
+    /// Der AFK-Client kennt absichtlich keinen Weltwinkel fuer Kompasse oder eine Uhrzeit fuer
+    /// Uhren. Er nimmt deshalb den ersten gueltigen Modellzweig, laedt aber *alle* Ebenen dieses
+    /// Modells. Damit ist das Icon vollstaendig und stammt weiterhin ausschliesslich aus der
+    /// ausgewaehlten Original-JAR.
+    #[cfg(feature = "items")]
+    fn render_item_model(&self, name: &str) -> Option<Vec<u8>> {
+        let (namespace, path) = resource_id(name);
+        let mut archive = self.archive.lock().ok()?;
+        let definition = read_zip(
+            &mut archive,
+            &format!("assets/{}/items/{}.json", namespace, path),
+            MAX_JSON_BYTES,
+        )?;
+        let definition: Value = serde_json::from_slice(&definition).ok()?;
+        let model = first_item_model(definition.get("model")?, 0)?;
+        let mut cache = HashMap::new();
+        let textures = resolved_model_textures(&mut archive, model, 0, &mut cache)?;
+
+        let mut layers = Vec::new();
+        for index in 0..8 {
+            let Some(reference) = textures.get(&format!("layer{}", index)) else {
+                break;
+            };
+            let resolved = resolve_texture(reference, &textures);
+            if resolved.is_empty() {
+                continue;
+            }
+            let (texture_namespace, texture_path) = resource_id(&resolved);
+            let bytes = read_zip(
+                &mut archive,
+                &format!("assets/{}/textures/{}.png", texture_namespace, texture_path),
+                MAX_ARCHIVE_ASSET_BYTES,
+            )?;
+            layers.push(decode_png(&bytes).ok()?);
+        }
+        composite_item_layers(&layers)
     }
 
     pub(crate) fn missing_png(&self) -> &[u8] {
@@ -541,6 +584,113 @@ impl Assets {
     pub(crate) fn material_count(&self) -> usize {
         self.states.len()
     }
+}
+
+/// Aus einem modernen `items/*.json` einen verwendbaren statischen Modellzweig waehlen.
+/// Bedingungen koennen ohne Item-Komponenten nicht ausgewertet werden; fuer die Hotbar ist der
+/// erste vom Pack angebotene Modellzweig die ehrliche, reproduzierbare Vorschau.
+#[cfg(feature = "items")]
+fn first_item_model(value: &Value, depth: usize) -> Option<&str> {
+    if depth > 32 {
+        return None;
+    }
+    if value.get("type").and_then(Value::as_str) == Some("minecraft:model") {
+        return value.get("model").and_then(Value::as_str);
+    }
+    if value.get("type").and_then(Value::as_str) == Some("minecraft:special") {
+        return value.get("base").and_then(Value::as_str);
+    }
+    for key in ["on_false", "fallback", "on_true"] {
+        if let Some(model) = value
+            .get(key)
+            .and_then(|child| first_item_model(child, depth + 1))
+        {
+            return Some(model);
+        }
+    }
+    for key in ["cases", "entries", "models"] {
+        if let Some(values) = value.get(key).and_then(Value::as_array) {
+            for child in values {
+                let child = child.get("model").unwrap_or(child);
+                if let Some(model) = first_item_model(child, depth + 1) {
+                    return Some(model);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "items")]
+fn resolved_model_textures(
+    archive: &mut ZipArchive<File>,
+    name: &str,
+    depth: usize,
+    cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    if depth > 24 {
+        return None;
+    }
+    if let Some(textures) = cache.get(name) {
+        return Some(textures.clone());
+    }
+    let (namespace, path) = resource_id(name);
+    let bytes = read_zip(
+        archive,
+        &format!("assets/{}/models/{}.json", namespace, path),
+        MAX_JSON_BYTES,
+    )?;
+    let json: Value = serde_json::from_slice(&bytes).ok()?;
+    let mut textures = json
+        .get("parent")
+        .and_then(Value::as_str)
+        .and_then(|parent| resolved_model_textures(archive, parent, depth + 1, cache))
+        .unwrap_or_default();
+    if let Some(own) = json.get("textures").and_then(Value::as_object) {
+        for (key, value) in own {
+            if let Some(value) = value.as_str() {
+                textures.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    cache.insert(name.to_string(), textures.clone());
+    Some(textures)
+}
+
+/// PNG-Ebenen wie `layer0`/`layer1` von hinten nach vorne alpha-komponieren. Animierte Texturen
+/// liefern wie beim Welt-Renderer ihr erstes quadratisches Bild.
+#[cfg(feature = "items")]
+fn composite_item_layers(layers: &[Texture]) -> Option<Vec<u8>> {
+    let first = layers.first()?;
+    let (width, height) = (first.width, first.frame_height);
+    let mut rgba = vec![0u8; width.checked_mul(height)?.checked_mul(4)?];
+    for layer in layers {
+        if layer.width != width || layer.frame_height != height {
+            continue;
+        }
+        for (under, over) in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(layer.rgba.as_chunks::<4>().0.iter())
+            .take(width * height)
+        {
+            let source_alpha = over[3] as u32;
+            let target_alpha = under[3] as u32;
+            let inverse = 255 - source_alpha;
+            let alpha = source_alpha + target_alpha * inverse / 255;
+            if alpha == 0 {
+                continue;
+            }
+            for channel in 0..3 {
+                under[channel] = ((over[channel] as u32 * source_alpha
+                    + under[channel] as u32 * target_alpha * inverse / 255)
+                    / alpha) as u8;
+            }
+            under[3] = alpha as u8;
+        }
+    }
+    encode_rgba_png(width, height, &rgba).ok()
 }
 
 /// Offizielle Client-JARs tragen ihre Version selbst ein. Ein Resourcepack hat diese Datei nicht
@@ -1427,6 +1577,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "items")]
+    fn modernes_dynamisches_item_waehlt_einen_modellzweig() {
+        let definition = serde_json::json!({
+            "type": "minecraft:condition",
+            "on_false": {
+                "type": "minecraft:range_dispatch",
+                "entries": [{
+                    "threshold": 0,
+                    "model": {"type": "minecraft:model", "model": "minecraft:item/clock_00"}
+                }]
+            }
+        });
+        assert_eq!(
+            first_item_model(&definition, 0),
+            Some("minecraft:item/clock_00")
+        );
+    }
+
+    #[test]
     fn slab_trifft_ihre_echte_halbe_hoehe() {
         let hit = ray_box(
             [8.0, 20.0, 8.0],
@@ -1544,5 +1713,10 @@ mod tests {
         assert_eq!(&stone_icon[..8], b"\x89PNG\r\n\x1a\n");
         // Beim zweiten Aufruf kommt dasselbe bereits gerenderte Icon aus dem Cache.
         assert_eq!(assets.item_png("minecraft:stone"), stone_icon);
+        for name in ["minecraft:clock", "minecraft:compass", "minecraft:potion"] {
+            let icon = assets.item_png(name);
+            assert_ne!(icon, assets.missing_png, "{} blieb die Fehlertextur", name);
+            assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n", "{}", name);
+        }
     }
 }

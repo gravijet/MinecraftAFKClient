@@ -641,6 +641,8 @@ fn read_light_arrays(
     r: &mut Reader,
     count: usize,
     present: &SectionMask,
+    empty: &SectionMask,
+    previous: Option<&[LightSection]>,
 ) -> io::Result<Box<[LightSection]>> {
     let sent = r.var_int()?;
     if !(0..=count as i32).contains(&sent) {
@@ -658,6 +660,11 @@ fn read_light_arrays(
     let mut out = Vec::with_capacity(count);
     let mut next = 0usize;
     for index in 0..count {
+        if present.has(index) && empty.has(index) {
+            return Err(crate::buf::err(
+                "POV: Lichtabschnitt zugleich vorhanden und leer",
+            ));
+        }
         out.push(if present.has(index) {
             let section = arrays
                 .get(next)
@@ -665,9 +672,21 @@ fn read_light_arrays(
                 .unwrap_or(LightSection::Uniform(0));
             next += 1;
             section
-        } else {
+        } else if empty.has(index) {
             LightSection::Uniform(0)
+        } else {
+            // Im Chunk-Paket gibt es noch keinen alten Stand; dort bedeutet ein nicht genanntes
+            // Feld dunkel. Ein LightUpdate ist dagegen ein *Patch*: Nicht genannte Abschnitte
+            // bleiben unveraendert. Die alte Fassung ersetzte sie alle durch Null und machte so
+            // nach dem ersten kleinen Lichtupdate fast die ganze Live-POV schwarz.
+            previous
+                .and_then(|sections| sections.get(index))
+                .cloned()
+                .unwrap_or(LightSection::Uniform(0))
         });
+    }
+    if next != arrays.len() {
+        return Err(crate::buf::err("POV: Lichtmaske und Felder passen nicht"));
     }
     Ok(out.into_boxed_slice())
 }
@@ -676,17 +695,36 @@ fn read_light_arrays(
 ///
 /// Aufbau: vier Bitfelder (welche Abschnitte ein Feld mitbringen und welche bekanntermaßen ganz
 /// dunkel sind), danach die Felder selbst.
-fn read_light(r: &mut Reader, min_section: i32, sections: usize) -> io::Result<Light> {
+fn read_light(
+    r: &mut Reader,
+    min_section: i32,
+    sections: usize,
+    previous: Option<&Light>,
+) -> io::Result<Light> {
     let count = sections + 2;
     let sky_mask = read_mask(r)?;
     let block_mask = read_mask(r)?;
-    // Die beiden „ist ganz dunkel"-Masken werden gelesen, aber nicht ausgewertet: Ein Abschnitt
-    // ohne Feld ist für die Ansicht ohnehin dunkel. Überspringen ginge nicht – sie sind
-    // längenvariabel und stehen mitten im Paket.
-    let _empty_sky = read_mask(r)?;
-    let _empty_block = read_mask(r)?;
-    let sky = read_light_arrays(r, count, &sky_mask)?;
-    let block = read_light_arrays(r, count, &block_mask)?;
+    let empty_sky = read_mask(r)?;
+    let empty_block = read_mask(r)?;
+    let previous = previous.filter(|light| {
+        light.min_section == min_section - 1
+            && light.sky.len() == count
+            && light.block.len() == count
+    });
+    let sky = read_light_arrays(
+        r,
+        count,
+        &sky_mask,
+        &empty_sky,
+        previous.map(|light| light.sky.as_ref()),
+    )?;
+    let block = read_light_arrays(
+        r,
+        count,
+        &block_mask,
+        &empty_block,
+        previous.map(|light| light.block.as_ref()),
+    )?;
     Ok(Light {
         min_section: min_section - 1,
         sky,
@@ -1242,7 +1280,7 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     // geschätzter Flächenhelligkeit weiter. Ein Lesefehler darf hier weder den Chunk noch – über
     // die Fehlerkette – die Verbindung kosten.
     chunk.light = skip_block_entities(r)
-        .and_then(|()| read_light(r, chunk.min_section, chunk.sections.len()))
+        .and_then(|()| read_light(r, chunk.min_section, chunk.sections.len(), None))
         .ok()
         .map(Arc::new);
     if pov.format.swap(format.code(), Ordering::Relaxed) != format.code() {
@@ -1292,8 +1330,12 @@ fn read_light_update(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let Some(chunk) = world.chunks.get(&(x, z)) else {
         return Ok(());
     };
-    let (min_section, sections) = (chunk.min_section, chunk.sections.len());
-    let light = Arc::new(read_light(r, min_section, sections)?);
+    let (min_section, sections, previous) = (
+        chunk.min_section,
+        chunk.sections.len(),
+        chunk.light.as_ref().map(Arc::clone),
+    );
+    let light = Arc::new(read_light(r, min_section, sections, previous.as_deref())?);
     // `make_mut` kopiert den Chunk nur, solange ihn ein Bild gerade liest; die Abschnitte selbst
     // hängen an eigenen `Arc`s und werden dabei nicht mitkopiert.
     Arc::make_mut(world.chunks.get_mut(&(x, z)).unwrap()).light = Some(light);
@@ -2795,13 +2837,25 @@ mod tests {
         w.data
     }
 
+    fn empty_sky_light_bytes(index: usize) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.var_int(0); // Himmelsmaske: kein neues Feld
+        w.var_int(0); // Blockmaske
+        w.var_int(1); // ein Long in der Leer-Himmelsmaske
+        w.i64((1u64 << index) as i64);
+        w.var_int(0); // Leer-Blockmaske
+        w.var_int(0); // keine Himmelsfelder
+        w.var_int(0); // keine Blockfelder
+        w.data
+    }
+
     /// Der Normalfall eines Chunks: Über Tage überall 15, darunter 0. Genau dafür gibt es die
     /// Zusammenfassung – ohne sie kostete jeder dieser Abschnitte 2 KiB.
     #[test]
     fn gleichmaessiges_licht_wird_zusammengefasst() {
         let bytes = light_bytes(24, &[10, 11], 15);
         let mut r = Reader::new(&bytes);
-        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        let light = read_light(&mut r, -4, 24, None).expect("Lichtpaket");
         assert!(
             matches!(light.sky[10], LightSection::Uniform(15)),
             "ein durchgehend helles Feld muss zusammengefasst werden"
@@ -2820,7 +2874,7 @@ mod tests {
         // min_section = -4 heißt: die Welt beginnt bei y = -64.
         let bytes = light_bytes(24, &[5], 12);
         let mut r = Reader::new(&bytes);
-        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        let light = read_light(&mut r, -4, 24, None).expect("Lichtpaket");
         // Lichtabschnitt 5 = Weltabschnitt 4 = y 0..15.
         assert_eq!(light.get(0, 0, 0).0, 12);
         assert_eq!(light.get(0, 15, 0).0, 12);
@@ -2850,9 +2904,39 @@ mod tests {
     fn ueber_der_welt_ist_voller_himmel() {
         let bytes = light_bytes(24, &[], 0);
         let mut r = Reader::new(&bytes);
-        let light = read_light(&mut r, -4, 24).expect("Lichtpaket");
+        let light = read_light(&mut r, -4, 24, None).expect("Lichtpaket");
         assert_eq!(light.get(0, 5000, 0), (15, 0));
         assert_eq!(light.get(0, -5000, 0), (0, 0));
+    }
+
+    /// Ein LightUpdate enthaelt nur die geaenderten Abschnitte. Nicht gesetzte Bits bedeuten
+    /// dort „alten Wert behalten", nicht „auf null setzen". Letzteres machte nach einer
+    /// einzelnen Fackel- oder Tageslichtaenderung fast die gesamte Browser-POV schwarz.
+    #[test]
+    fn teilweises_lichtupdate_behaelt_unveraenderte_abschnitte() {
+        let initial = light_bytes(24, &[5, 10], 15);
+        let mut r = Reader::new(&initial);
+        let old = read_light(&mut r, -4, 24, None).expect("Ausgangslicht");
+
+        let update = light_bytes(24, &[5], 7);
+        let mut r = Reader::new(&update);
+        let patched = read_light(&mut r, -4, 24, Some(&old)).expect("Lichtpatch");
+
+        assert_eq!(patched.sky[5].get(0), 7, "genannter Abschnitt wird ersetzt");
+        assert_eq!(
+            patched.sky[10].get(0),
+            15,
+            "nicht genannter Abschnitt muss erhalten bleiben"
+        );
+
+        let emptied = empty_sky_light_bytes(10);
+        let mut r = Reader::new(&emptied);
+        let patched = read_light(&mut r, -4, 24, Some(&patched)).expect("Leer-Patch");
+        assert_eq!(
+            patched.sky[10].get(0),
+            0,
+            "ausdruecklich geleerter Abschnitt wird dunkel"
+        );
     }
 
     /// Vanillas Kurve ist deutlich nicht-linear: Halbes Licht ist längst nicht halbe Helligkeit.

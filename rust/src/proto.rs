@@ -937,7 +937,8 @@ pub const CLIENT_COMMAND_RESPAWN: i32 = 0;
 
 /// ResourcePackStatus-Ordinalwerte (siehe ResourcePackStatus in MCProtocolLib).
 pub mod pack_status {
-    pub const DECLINED: i32 = 1;
+    pub const SUCCESSFULLY_LOADED: i32 = 0;
+    pub const ACCEPTED: i32 = 3;
 }
 
 /// Zahlenwerte in den Zusatzpaketen der Ausbaustufen. Alle aus denselben Klassen abgelesen wie

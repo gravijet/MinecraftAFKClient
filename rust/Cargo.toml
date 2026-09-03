@@ -1,6 +1,6 @@
 [package]
 name = "afk"
-version = "2.6.0"
+version = "2.6.1"
 edition = "2021"
 description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.21.11, 26.1 und 26.2"
 

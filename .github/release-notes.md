@@ -19,6 +19,29 @@ Ultra-Varianten gibt es bewusst nur für Rust.
 
 ---
 
+# Rust-Client 2.6.1 – Live-POV und Hotbar repariert
+
+Stand: 3. September 2026
+
+* **Die Live-POV wird nach einem Lichtupdate nicht mehr schwarz.** Ein `LightUpdate` enthält nur
+  veränderte Abschnitte. Der Client behandelte es bislang als vollständigen neuen Lichtstand und
+  setzte jeden nicht erwähnten Abschnitt auf Lichtstufe null. Jetzt wird das Paket korrekt in den
+  vorhandenen Stand eingearbeitet; ausdrücklich geleerte Abschnitte werden weiterhin dunkel.
+* **Alle HUD-Texturen warten auf die Client-Ressourcen.** Der Browser konnte Hotbar, Auswahlrahmen,
+  Fadenkreuz und Itemicons anfordern, während die Client-JAR noch geladen wurde. Nach der einmaligen
+  `503`-Antwort blieben diese Bilder kaputt. Der Viewer setzt sie nun erst, wenn die Ressourcen
+  bereitstehen, und zeigt bis zum ersten Frame einen verständlichen Ladebildschirm.
+* **Moderne Itemmodelle erscheinen in Hotbar und Menüs.** Seit Minecraft 1.21.2 liegen dynamische
+  Gegenstände wie Uhr und Kompass nicht mehr zwingend unter `textures/item/<name>.png`. Der Client
+  folgt jetzt `items/<name>.json`, wählt einen statischen Vorschaustand und kombiniert alle
+  Texturebenen des referenzierten Modells.
+* **Server-Resource-Packs werden immer akzeptiert.** Der Rust-Client bestätigt sie jetzt wie die
+  Java-Variante mit `ACCEPTED` und `SUCCESSFULLY_LOADED`, auch wenn ein kopfloser AFK-Client ihre
+  Bilder nicht rendert. Verpflichtende Packs führen dadurch nicht mehr zu
+  `multiplayer.requiredTexturePrompt.disconnect`.
+
+---
+
 # Rust-Client 2.6.0 – Spielphase repariert, Neuverbinden, echtes Licht und Biomfarben
 
 Stand: 1. September 2026

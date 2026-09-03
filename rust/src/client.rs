@@ -1905,14 +1905,30 @@ fn client_brand(packet_id: i32, mc_version: &str) -> Writer {
     w
 }
 
-/// Dieser schlanke Client kann keine Resource-Packs laden und meldet deshalb ehrlich
-/// `DECLINED`. `SUCCESSFULLY_LOADED` zu behaupten, ohne auch nur die Datei geladen zu haben,
-/// widerspricht dem Vanilla-Zustandsablauf und kann serverseitige Pack-Logik desynchronisieren.
+/// Ein Server-Resource-Pack für die Spielsitzung bestätigen.
+///
+/// Der AFK-Client zeichnet keine Servertexturen und muss die Datei daher nicht herunterladen.
+/// Trotzdem erwarten Server mit verpflichtendem Pack denselben Abschluss wie vom Java-Client:
+/// erst `ACCEPTED`, dann `SUCCESSFULLY_LOADED`. Ein ehrliches `DECLINED` klingt naheliegend, führt
+/// dort aber unmittelbar zu `multiplayer.requiredTexturePrompt.disconnect` – der Bot darf dann
+/// überhaupt nicht beitreten, obwohl keine seiner Funktionen das Pack benötigt.
 fn acknowledge_resource_pack(shared: &Arc<Shared>, packet_id: i32, pack: &[u8; 16]) {
-    let mut w = Writer::packet(packet_id);
-    w.uuid(pack);
-    w.var_int(pack_status::DECLINED);
-    shared.send(w);
+    for answer in resource_pack_answers(packet_id, pack) {
+        shared.send(answer);
+    }
+}
+
+fn resource_pack_answers(packet_id: i32, pack: &[u8; 16]) -> [Writer; 2] {
+    let answer = |status| {
+        let mut w = Writer::packet(packet_id);
+        w.uuid(pack);
+        w.var_int(status);
+        w
+    };
+    [
+        answer(pack_status::ACCEPTED),
+        answer(pack_status::SUCCESSFULLY_LOADED),
+    ]
 }
 
 /// So viele Cookies hebt der Client je Verbindung auf, und so groß darf eines höchstens sein.
@@ -2022,6 +2038,19 @@ mod tests {
             max_backoff_seconds: max,
             attempts: 0,
         }
+    }
+
+    /// HugoSMP und andere Server lassen den Spieler ohne ihr verpflichtendes Resource-Pack gar
+    /// nicht erst hinein. Der AFK-Client braucht die Bilder nicht, muss den zweistufigen
+    /// Vanilla-Ablauf aber vollständig quittieren – genau wie die Java-Bauform.
+    #[test]
+    fn verpflichtendes_resource_pack_wird_bestaetigt() {
+        let pack = [0xAB; 16];
+        let answers = resource_pack_answers(49, &pack);
+        assert_eq!(&answers[0].data[..17], &[vec![49], pack.to_vec()].concat());
+        assert_eq!(answers[0].data[17], pack_status::ACCEPTED as u8);
+        assert_eq!(&answers[1].data[..17], &[vec![49], pack.to_vec()].concat());
+        assert_eq!(answers[1].data[17], pack_status::SUCCESSFULLY_LOADED as u8);
     }
 
     /// Die Wartezeit verdoppelt sich je Fehlversuch und bleibt dann an der Obergrenze stehen.
