@@ -1,8 +1,8 @@
 [package]
 name = "afk"
-version = "2.6.2"
+version = "2.7.0"
 edition = "2021"
-description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.21.1, 1.21.11, 26.1 und 26.2"
+description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.8.9, 1.21.1, 1.21.11, 26.1 und 26.2"
 
 [[bin]]
 name = "afk"
@@ -66,7 +66,7 @@ rsa = "0.9"
 sha1 = "0.10"
 rand = "0.8"
 base64 = "0.22"
-# Nur um beim Anlegen eines NEUEN Kontos ein deviceKeyPair zu erzeugen, das der Java-Client lesen kann.
+# Beim Anlegen eines neuen Kontos wird ein dauerhaftes Device-Schluesselpaar erzeugt.
 p256 = { version = "0.13", features = ["pkcs8"] }
 # Die Browser-POV decodiert die PNGs aus der Original-Client-JAR und schreibt ihre Frames als
 # PNG. Beides bleibt auf POV/Ultra beschraenkt; die schlanke Binary zieht die Abhaengigkeiten

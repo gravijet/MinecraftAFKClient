@@ -211,10 +211,6 @@ pub struct Options {
     /// Nach einem Kick oder Netzabbruch neu verbinden. Standardmäßig gesetzt; `None` steht für
     /// `--no-reconnect`, dann endet der Prozess mit Status 1.
     pub reconnect: Option<Reconnect>,
-
-    /// Optionen, die dieser Client angenommen, aber nicht umgesetzt hat (weil es sie nur im
-    /// Java-Client gibt). Wird beim Start einmal genannt.
-    pub ignored: Vec<String>,
 }
 
 /// Sichtweite, die der jeweilige Build sinnvollerweise anfordert. Ohne Live-Ansicht liest der
@@ -250,7 +246,6 @@ impl Default for Options {
             #[cfg(not(feature = "pov"))]
             pov_resources: None,
             reconnect: None,
-            ignored: Vec::new(),
         }
     }
 }
@@ -724,6 +719,7 @@ mod tests {
 
     #[test]
     fn versionen_werden_geprueft() {
+        assert_eq!(options(&["x", "--mc", "1.8.9"]).protocol.version, 47);
         assert_eq!(options(&["x", "--mc", "1.21.1"]).protocol.version, 767);
         assert_eq!(options(&["x", "--mc", "26.2"]).protocol.version, 776);
         assert_eq!(options(&["x"]).protocol.name, "26.1");
@@ -853,28 +849,26 @@ mod tests {
         assert_eq!(options(&["x", "--antiafk", "90"]).antiafk_seconds, 90);
     }
 
-    /// Ein Panel schickt allen Bauformen dieselbe Befehlszeile. Optionen, die es nur im
-    /// Java-Client gibt, dürfen den Start deshalb nicht abbrechen.
+    /// Ein Panel schickt allen Bauformen dieselbe Befehlszeile; eine bekannte POV-Option muss
+    /// deshalb auch im schlanken Build syntaktisch angenommen werden.
     #[test]
-    fn java_optionen_werden_angenommen_und_gemeldet() {
+    fn optionen_anderer_bauformen_werden_angenommen() {
         let o = options(&["x", "--pov", "an"]);
-        assert!(o.ignored.is_empty());
         assert_eq!(o.server, "x");
         // Ein echter Tippfehler bleibt ein Fehler.
         assert!(parse_args(&["x", "--kein-schalter"]).is_err());
     }
 
-    /// Ohne Angabe wird neu verbunden; nur `--no-reconnect` beendet den Prozess. Dieselbe Vorgabe
-    /// hat der Java-Client – ein Panel darf beiden dieselbe Zeile geben und dasselbe erwarten.
+    /// Ohne Angabe wird neu verbunden; nur `--no-reconnect` beendet den Prozess.
     #[test]
     fn ohne_angabe_wird_neu_verbunden() {
         assert!(options(&["x"]).reconnect.is_some());
         assert!(options(&["x", "--no-reconnect"]).reconnect.is_none());
     }
 
-    /// Die Vorgabewerte sind die des Java-Clients – mit und ohne den Schalter dieselben.
+    /// Mit und ohne den ausdrücklichen Schalter gelten dieselben Vorgabewerte.
     #[test]
-    fn reconnect_hat_die_java_vorgaben() {
+    fn reconnect_hat_feste_vorgaben() {
         for args in [&["x"][..], &["x", "--reconnect"][..]] {
             let r = options(args).reconnect.unwrap();
             assert_eq!(r.delay_seconds, 5);

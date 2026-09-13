@@ -34,6 +34,8 @@ pub struct Item {
     /// Registrierungsnummer des Gegenstands. Ohne Registerdaten des Servers lässt sich daraus
     /// kein Name ableiten – angezeigt wird sie deshalb als `#nummer`.
     pub id: i32,
+    /// Schadenswert/Metadatum des alten 1.8.9-Slots; moderne Komponenten-Slots setzen ihn auf 0.
+    pub legacy_damage: i16,
     pub count: i32,
     /// Anzeigename (`custom_name`, sonst `item_name`) als `§`-Text.
     pub name: Option<String>,
@@ -65,6 +67,9 @@ pub struct Slot {
 /// Ein Feld lesen: Anzahl, Nummer, Komponenten. Anzahl `<= 0` heißt „leer" – dann steht auch
 /// nichts weiter im Paket (in allen vier Versionen ein einzelnes Null-Byte).
 pub fn read_slot(proto: &'static Protocol, r: &mut Reader) -> io::Result<Slot> {
+    if proto.legacy {
+        return read_legacy_slot(r);
+    }
     let count = r.var_int()?;
     if count <= 0 {
         return Ok(Slot {
@@ -74,6 +79,7 @@ pub fn read_slot(proto: &'static Protocol, r: &mut Reader) -> io::Result<Slot> {
     }
     let mut item = Item {
         id: r.var_int()?,
+        legacy_damage: 0,
         count,
         name: None,
         lore: Vec::new(),
@@ -84,6 +90,46 @@ pub fn read_slot(proto: &'static Protocol, r: &mut Reader) -> io::Result<Slot> {
     Ok(Slot {
         item: Some(item),
         synced,
+    })
+}
+
+/// Slot aus Protokoll 47: Short-ID, Anzahl, Metadatum und optionales benanntes NBT.
+fn read_legacy_slot(r: &mut Reader) -> io::Result<Slot> {
+    let id = r.i16()?;
+    if id < 0 {
+        return Ok(Slot {
+            item: None,
+            synced: true,
+        });
+    }
+    let count = r.i8()? as i32;
+    let damage = r.i16()?;
+    let tag = nbt::read_named(r)?;
+    let display = tag.get("display");
+    let name = display
+        .and_then(|value| value.get_str("Name"))
+        .map(str::to_string);
+    let lore = display
+        .and_then(|value| value.get("Lore"))
+        .and_then(nbt::Nbt::as_list)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(nbt::Nbt::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Slot {
+        item: Some(Item {
+            id: id as i32,
+            legacy_damage: damage,
+            count,
+            name,
+            lore,
+            complete: true,
+        }),
+        synced: true,
     })
 }
 
@@ -333,11 +379,16 @@ mod tests {
         assert_eq!(r.remaining(), 0, "das Feld muss restlos gelesen sein");
     }
 
-    /// Ein leeres Feld ist in allen vier Versionen ein einzelnes Null-Byte.
+    /// Ein modernes leeres Feld ist ein Null-Byte; 1.8.9 benutzt die Short-ID -1.
     #[test]
     fn leeres_feld_ist_ein_byte() {
         for p in PROTOCOLS {
-            let mut r = Reader::new(&[0u8]);
+            let bytes = if p.legacy {
+                &[0xff, 0xff][..]
+            } else {
+                &[0u8][..]
+            };
+            let mut r = Reader::new(bytes);
             let slot = read_slot(p, &mut r).expect("lesbar");
             assert!(slot.item.is_none() && slot.synced, "{}", p.name);
             assert_eq!(r.remaining(), 0);
@@ -441,6 +492,9 @@ mod tests {
     #[test]
     fn tabelle_passt_zu_den_gelesenen_nummern() {
         for p in PROTOCOLS {
+            if p.legacy {
+                continue;
+            }
             let c = &p.extra.components;
             let shapes = c.shapes.as_bytes();
             assert!(

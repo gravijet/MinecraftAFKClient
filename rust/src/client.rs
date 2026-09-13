@@ -720,7 +720,7 @@ fn sender_loop(shared: Arc<Shared>) {
 
         // Erst säubern, dann senden: sonst könnte eine Nachricht wegfallen, deren
         // Quittungs-Offset schon verbraucht wäre.
-        let Some(outgoing) = prepare(&input) else {
+        let Some(outgoing) = prepare(&input, shared.proto.legacy) else {
             continue;
         };
         if !sleep_until(&shared, next_allowed)
@@ -734,7 +734,11 @@ fn sender_loop(shared: Arc<Shared>) {
             // der Offset darf hier also nicht verbraucht werden.
             Outgoing::Command(command) => {
                 let mut w = Writer::packet(shared.proto.game.sb_chat_command);
-                w.string(&command);
+                if shared.proto.legacy {
+                    w.string(&format!("/{}", command));
+                } else {
+                    w.string(&command);
+                }
                 shared.send(w);
             }
             Outgoing::Message(message) => {
@@ -766,12 +770,14 @@ enum Outgoing {
 }
 
 /// Eingabe in ein sendbares Paket übersetzen. `None`, wenn nach dem Säubern nichts übrig ist.
-fn prepare(input: &str) -> Option<Outgoing> {
+fn prepare(input: &str, legacy: bool) -> Option<Outgoing> {
     if let Some(command) = input.strip_prefix('/') {
-        let command = sanitize(command, MAX_COMMAND_CHARS);
+        // In 1.8.9 laufen Befehle als gewöhnliche Chatnachricht; deren 100-Zeichen-Grenze zählt
+        // den führenden Schrägstrich mit.
+        let command = sanitize(command, if legacy { 99 } else { MAX_COMMAND_CHARS });
         return (!command.is_empty()).then_some(Outgoing::Command(command));
     }
-    let message = sanitize(input, MAX_MESSAGE_CHARS);
+    let message = sanitize(input, if legacy { 100 } else { MAX_MESSAGE_CHARS });
     (!message.is_empty()).then_some(Outgoing::Message(message))
 }
 
@@ -818,6 +824,9 @@ fn sanitize(input: &str, limit: usize) -> String {
 fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
     let mut w = Writer::packet(shared.proto.game.sb_chat);
     w.string(message);
+    if shared.proto.legacy {
+        return w;
+    }
     w.i64(shared.next_chat_time());
     w.i64(0); // salt
     w.bool(false); // keine Signatur (unsignierter Chat)
@@ -1035,7 +1044,9 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
 
     let mut hello = Writer::packet(login::SB_HELLO);
     hello.string(&username);
-    hello.uuid(&profile_id);
+    if !shared.proto.legacy {
+        hello.uuid(&profile_id);
+    }
     shared.send(hello);
 
     let mut session = Session {
@@ -1219,9 +1230,14 @@ fn handle_login(
             }
         }
         login::CB_FINISHED => {
-            shared.send(Writer::packet(login::SB_ACKNOWLEDGED));
-            session.state = State::Configuration;
-            shared.send(client_information(shared, cfg::SB_CLIENT_INFORMATION));
+            if shared.proto.legacy {
+                // Protokoll 47 geht nach LoginSuccess unmittelbar in die Spielphase.
+                session.state = State::Game;
+            } else {
+                shared.send(Writer::packet(login::SB_ACKNOWLEDGED));
+                session.state = State::Configuration;
+                shared.send(client_information(shared, cfg::SB_CLIENT_INFORMATION));
+            }
         }
         login::CB_DISCONNECT => {
             // In der Login-Phase kommt der Grund noch als JSON-Text, nicht als NBT.
@@ -1317,9 +1333,17 @@ fn handle_game(
         // KeepAlive zuerst und sofort beantworten – das ist der eigentliche Schutz gegen
         // disconnect.timeout. Alles andere (Anzeige o. Ä.) kommt danach.
         In::KeepAlive => {
-            let ping = r.i64().map_err(|e| e.to_string())?;
+            let ping = if shared.proto.legacy {
+                r.var_int().map_err(|e| e.to_string())? as i64
+            } else {
+                r.i64().map_err(|e| e.to_string())?
+            };
             let mut w = Writer::packet(game.sb_keep_alive);
-            w.i64(ping);
+            if shared.proto.legacy {
+                w.var_int(ping as i32);
+            } else {
+                w.i64(ping);
+            }
             shared.send(w);
         }
         In::Ping => {
@@ -1375,8 +1399,16 @@ fn handle_game(
             // Eine unlesbare Chat-Komponente ist kein Grund, die Verbindung zu beenden: Pakete
             // sind einzeln gerahmt, das nächste beginnt ohnehin an einer bekannten Stelle.
             // Vorher hat eine einzige seltsame Zeile eines Plugins den ganzen Client abgemeldet.
-            if let Ok(component) = nbt::read_network(r) {
-                let line = nbt::render(&component, shared.console.fmt());
+            let line = if shared.proto.legacy {
+                r.string()
+                    .ok()
+                    .map(|json| nbt::render_json(&json, shared.console.fmt()))
+            } else {
+                nbt::read_network(r)
+                    .ok()
+                    .map(|component| nbt::render(&component, shared.console.fmt()))
+            };
+            if let Some(line) = line {
                 if !line.trim().is_empty() {
                     shared.display(&line);
                 }
@@ -1413,8 +1445,14 @@ fn handle_game(
             }
         }
         In::ResourcePackPush => {
-            let pack = r.uuid().map_err(|e| e.to_string())?;
-            acknowledge_resource_pack(shared, game.sb_resource_pack, &pack);
+            if shared.proto.legacy {
+                let _url = r.string().map_err(|e| e.to_string())?;
+                let hash = r.string().map_err(|e| e.to_string())?;
+                acknowledge_legacy_resource_pack(shared, game.sb_resource_pack, &hash);
+            } else {
+                let pack = r.uuid().map_err(|e| e.to_string())?;
+                acknowledge_resource_pack(shared, game.sb_resource_pack, &pack);
+            }
         }
         In::StartConfiguration => {
             // Der Server holt uns zurück in die Konfigurationsphase (z. B. Ressourcen-Neuladen).
@@ -1464,10 +1502,7 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
         shared,
         shared.proto.game.sb_client_information,
     ));
-    shared.send(client_brand(
-        shared.proto.game.sb_custom_payload,
-        shared.proto.name,
-    ));
+    shared.send(client_brand(shared.proto));
 
     if first_join {
         let name = shared.account.lock().unwrap().name.clone();
@@ -1589,6 +1624,15 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         let yaw = r.f32().map_err(err)?;
         let pitch = r.f32().map_err(err)?;
         (id, x, y, z, yaw, pitch, r.i32().map_err(err)?)
+    } else if shared.proto.legacy {
+        let (x, y, z) = (
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+        );
+        let yaw = r.f32().map_err(err)?;
+        let pitch = r.f32().map_err(err)?;
+        (-1, x, y, z, yaw, pitch, r.u8().map_err(err)? as i32)
     } else {
         let (x, y, z) = (
             r.f64().map_err(err)?,
@@ -1633,9 +1677,11 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
 
     // Teleport bestätigen (Pflicht, sonst Rubberband/Kick) und die vorgegebene Position EINMAL
     // zurückspiegeln – das ist die Antwort auf den Teleport, keine Eigenbewegung.
-    let mut accept = Writer::packet(shared.proto.game.sb_accept_teleportation);
-    accept.var_int(id);
-    shared.send(accept);
+    if id >= 0 {
+        let mut accept = Writer::packet(shared.proto.game.sb_accept_teleportation);
+        accept.var_int(id);
+        shared.send(accept);
+    }
 
     // Das Bewegungspaket ist in allen unterstützten Versionen bytegleich: ab 1.21.4 steht dort
     // ein Flag-Byte statt des alten `onGround`-Bool – 0x01 bedeutet in beiden „am Boden".
@@ -1883,6 +1929,9 @@ fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     w.var_int(0); // ChatVisibility: FULL
     w.bool(true); // Chatfarben
     w.u8(0x7F); // alle Skin-Teile sichtbar
+    if shared.proto.legacy {
+        return w;
+    }
     w.var_int(1); // Haupthand: rechts
     w.bool(false); // Textfilterung
     w.bool(true); // in der Serverliste sichtbar
@@ -1898,10 +1947,14 @@ fn client_information(shared: &Shared, packet_id: i32) -> Writer {
 /// dessen String-Nutzlast. Es wird pro Spielbeitritt genau einmal direkt nach
 /// `ClientInformation` gesendet – auch bei einem Unterserver-Wechsel, bei dem der Server ein
 /// neues Login-Paket ausliefert.
-fn client_brand(packet_id: i32, mc_version: &str) -> Writer {
-    let mut w = Writer::packet(packet_id);
-    w.string(BRAND_CHANNEL);
-    w.string(&format!("{} {}", BRAND_PREFIX, mc_version));
+fn client_brand(protocol: &Protocol) -> Writer {
+    let mut w = Writer::packet(protocol.game.sb_custom_payload);
+    w.string(if protocol.legacy {
+        "MC|Brand"
+    } else {
+        BRAND_CHANNEL
+    });
+    w.string(&format!("{} {}", BRAND_PREFIX, protocol.name));
     w
 }
 
@@ -1929,6 +1982,15 @@ fn resource_pack_answers(packet_id: i32, pack: &[u8; 16]) -> [Writer; 2] {
         answer(pack_status::ACCEPTED),
         answer(pack_status::SUCCESSFULLY_LOADED),
     ]
+}
+
+fn acknowledge_legacy_resource_pack(shared: &Arc<Shared>, packet_id: i32, hash: &str) {
+    for status in [pack_status::ACCEPTED, pack_status::SUCCESSFULLY_LOADED] {
+        let mut answer = Writer::packet(packet_id);
+        answer.string(hash);
+        answer.var_int(status);
+        shared.send(answer);
+    }
 }
 
 /// So viele Cookies hebt der Client je Verbindung auf, und so groß darf eines höchstens sein.
@@ -1991,6 +2053,12 @@ fn transfer(shared: &Arc<Shared>, r: &mut Reader) -> Result<bool, String> {
 }
 
 fn disconnect_reason(shared: &Arc<Shared>, r: &mut Reader) -> String {
+    if shared.proto.legacy {
+        return r
+            .string()
+            .map(|json| nbt::render_json(&json, shared.console.fmt()))
+            .unwrap_or_else(|_| "unbekannt".to_string());
+    }
     match nbt::read_network(r) {
         Ok(component) => nbt::render(&component, shared.console.fmt()),
         Err(_) => "unbekannt".to_string(),
@@ -2138,11 +2206,14 @@ mod tests {
 
     #[test]
     fn befehle_und_nachrichten_werden_unterschieden() {
-        assert!(matches!(prepare("/afk"), Some(Outgoing::Command(c)) if c == "afk"));
-        assert!(matches!(prepare("hallo"), Some(Outgoing::Message(m)) if m == "hallo"));
+        assert!(matches!(prepare("/afk", false), Some(Outgoing::Command(c)) if c == "afk"));
+        assert!(matches!(prepare("hallo", false), Some(Outgoing::Message(m)) if m == "hallo"));
         // Nichts Sendbares übrig: darf keinen Quittungs-Offset verbrauchen.
-        assert!(prepare("/").is_none());
-        assert!(prepare("   ").is_none());
+        assert!(prepare("/", false).is_none());
+        assert!(prepare("   ", false).is_none());
+        assert!(
+            matches!(prepare(&format!("/{}", "a".repeat(200)), true), Some(Outgoing::Command(c)) if c.len() == 99)
+        );
     }
 
     #[test]
@@ -2354,6 +2425,7 @@ mod tests {
                 #[cfg(feature = "pov")]
                 ids.extend_from_slice(&[
                     e.cb_level_chunk,
+                    e.cb_level_chunk_bulk,
                     e.cb_forget_level_chunk,
                     e.cb_block_update,
                     e.cb_section_blocks_update,
@@ -2364,6 +2436,7 @@ mod tests {
                     e.cb_teleport_entity,
                 ]);
             }
+            ids.retain(|id| *id >= 0);
             for (i, a) in ids.iter().enumerate() {
                 for b in &ids[i + 1..] {
                     assert_ne!(a, b, "doppelte Paket-ID in {}", p.name);
@@ -2385,10 +2458,17 @@ mod tests {
             }
             #[cfg(feature = "movement")]
             {
-                assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_pos + 1);
-                assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos_rot + 1);
+                if protocol.legacy {
+                    assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos + 1);
+                    assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_rot + 1);
+                } else {
+                    assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_pos + 1);
+                    assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos_rot + 1);
+                }
             }
-            assert_eq!(game.sb_custom_payload, game.sb_cookie_response + 1);
+            if !protocol.legacy {
+                assert_eq!(game.sb_custom_payload, game.sb_cookie_response + 1);
+            }
         }
     }
 
@@ -2400,6 +2480,9 @@ mod tests {
     #[test]
     fn licht_id_liegt_vor_dem_login() {
         for protocol in crate::proto::PROTOCOLS {
+            if protocol.legacy {
+                continue;
+            }
             assert_eq!(
                 protocol.extra.cb_light_update,
                 protocol.game.cb_login - 1,
@@ -2428,6 +2511,9 @@ mod tests {
     #[test]
     fn chunk_stapel_ids_liegen_nebeneinander() {
         for protocol in crate::proto::PROTOCOLS {
+            if protocol.legacy {
+                continue;
+            }
             assert_eq!(
                 protocol.game.cb_chunk_batch_start,
                 protocol.game.cb_chunk_batch_finished + 1,
@@ -2490,10 +2576,17 @@ mod tests {
     #[test]
     fn client_brand_hat_exakt_den_vanilla_payload_aufbau() {
         for protocol in crate::proto::PROTOCOLS {
-            let packet = client_brand(protocol.game.sb_custom_payload, protocol.name);
+            let packet = client_brand(protocol);
             let mut r = Reader::new(&packet.data);
             assert_eq!(r.var_int().unwrap(), protocol.game.sb_custom_payload);
-            assert_eq!(r.string().unwrap(), BRAND_CHANNEL);
+            assert_eq!(
+                r.string().unwrap(),
+                if protocol.legacy {
+                    "MC|Brand"
+                } else {
+                    BRAND_CHANNEL
+                }
+            );
             assert_eq!(
                 r.string().unwrap(),
                 format!("{} {}", BRAND_PREFIX, protocol.name)

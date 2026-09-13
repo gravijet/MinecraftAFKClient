@@ -47,37 +47,6 @@ jobs:
             --notes-file .github/release-notes.md
           gh release upload "$ENTWURF" RELEASE.md --clobber
 
-  java:
-    name: Jars (alle vier Minecraft-Versionen)
-    needs: vorbereiten
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: gradle
-
-      - name: Bauen
-        run: |
-          chmod +x gradlew
-          mkdir -p out-java
-          for v in 1.21.1 1.21.11 26.1 26.2; do
-            ./gradlew :java:clean :java:test :java:shadowJar -Pmc=$v --console=plain --warning-mode all
-            cp "java/build/libs/afk-$v.jar" out-java/
-          done
-
-      - name: Hochladen
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          test "$(find out-java -maxdepth 1 -type f | wc -l)" -eq 4
-          ls -lh out-java/afk-*.jar
-          gh release upload "$ENTWURF" out-java/afk-*.jar --clobber
-
   rust:
     name: Binary (${{ matrix.name }})
     needs: vorbereiten
@@ -148,7 +117,7 @@ jobs:
 
   veroeffentlichen:
     name: latest-Release ersetzen
-    needs: [java, rust]
+    needs: rust
     runs-on: ubuntu-latest
     steps:
       - name: Aus dem Entwurf wird "latest"
@@ -159,7 +128,6 @@ jobs:
           # Vor dem Entfernen des alten Releases die vollständige, exakte Dateiliste prüfen.
           expected=$(printf '%s\n' \
             RELEASE.md \
-            afk-1.21.1.jar afk-1.21.11.jar afk-26.1.jar afk-26.2.jar \
             afk-linux afk-linux-move items-afk-linux pov-afk-linux \
             premium-afk-linux premium-items-afk-linux ultra-afk-linux \
             afk-windows.exe afk-windows-move.exe items-afk-windows.exe pov-afk-windows.exe \

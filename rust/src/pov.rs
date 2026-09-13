@@ -90,6 +90,19 @@ pub(crate) struct Dimension {
 }
 
 impl Dimension {
+    fn legacy(id: i32) -> Dimension {
+        Dimension {
+            name: match id {
+                -1 => "minecraft:the_nether",
+                1 => "minecraft:the_end",
+                _ => "minecraft:overworld",
+            }
+            .to_string(),
+            min_y: 0,
+            height: 256,
+        }
+    }
+
     pub(crate) fn from_registry(name: String, data: Option<&Nbt>) -> Dimension {
         let fallback = Dimension::for_world(&name);
         let min_y = data
@@ -1125,6 +1138,16 @@ impl Pov {
 /// Login-Paket ab direkt hinter der eigenen Entity-ID. Der erste Wert im eingebetteten
 /// `PlayerSpawnInfo` ist die Dimension-Type-ID.
 pub fn login(shared: &Arc<Shared>, own_entity: i32, r: &mut Reader) {
+    if shared.proto.legacy {
+        let dimension = r.u8().and_then(|_| r.i8()).map(|value| value as i32);
+        let mut world = shared.extras.pov.world.lock().unwrap();
+        world.own_entity = own_entity;
+        if let Ok(dimension) = dimension {
+            world.dimension = Dimension::legacy(dimension);
+            world.clear_visible();
+        }
+        return;
+    }
     let dimension = (|| -> io::Result<(i32, String)> {
         r.bool()?;
         let worlds = r.var_int()?;
@@ -1158,6 +1181,17 @@ pub fn login(shared: &Arc<Shared>, own_entity: i32, r: &mut Reader) {
 
 /// Respawn beginnt direkt mit demselben `PlayerSpawnInfo`.
 pub fn respawn(shared: &Arc<Shared>, r: &mut Reader) {
+    if shared.proto.legacy {
+        match r.i32() {
+            Ok(dimension) => {
+                let mut world = shared.extras.pov.world.lock().unwrap();
+                world.dimension = Dimension::legacy(dimension);
+                world.clear_visible();
+            }
+            Err(_) => shared.extras.pov.clear(),
+        }
+        return;
+    }
     if let (Ok(dimension), Ok(world_name)) = (r.var_int(), r.string()) {
         shared
             .extras
@@ -1204,6 +1238,7 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<()> {
     match kind {
         In::LevelChunk => read_chunk(shared, r),
+        In::LevelChunkBulk => read_chunk_bulk(shared, r),
         In::ForgetChunk => {
             // ChunkPos ist ein Long: x in den unteren, z in den oberen 32 Bit. Zwei
             // nacheinander gelesene i32 wären durch die Netzwerk-Bytefolge genau vertauscht.
@@ -1215,7 +1250,12 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
             Ok(())
         }
         In::BlockUpdate => {
-            let (x, y, z) = unpack_block_pos(r.i64()?);
+            let packed = r.i64()?;
+            let (x, y, z) = if shared.proto.legacy {
+                unpack_legacy_block_pos(packed)
+            } else {
+                unpack_block_pos(packed)
+            };
             let state = r.var_int()? as u32;
             shared
                 .extras
@@ -1250,6 +1290,20 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
 fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let x = r.i32()?;
     let z = r.i32()?;
+    if shared.proto.legacy {
+        let ground_up = r.bool()?;
+        let mask = r.u16()?;
+        let data = r.byte_slice()?;
+        if ground_up && mask == 0 {
+            let mut world = shared.extras.pov.world.lock().unwrap();
+            if world.chunks.remove(&(x, z)).is_some() {
+                world.touch();
+            }
+            return Ok(());
+        }
+        let chunk = decode_legacy_chunk(mask, data, ground_up, None)?;
+        return store_chunk(shared, x, z, chunk);
+    }
     if shared.proto.modern {
         let maps = r.var_int()?;
         if !(0..=64).contains(&maps) {
@@ -1317,6 +1371,155 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     Ok(())
 }
 
+/// 1.8.9-Sammelpaket: Metadaten aller Spalten stehen vorn, ihre rohen Daten lückenlos dahinter.
+fn read_chunk_bulk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
+    if !shared.proto.legacy {
+        return Ok(());
+    }
+    let sky_light = r.bool()?;
+    let count = r.var_int()?;
+    if !(0..=MAX_CHUNKS as i32).contains(&count) {
+        return Err(crate::buf::err("POV: Chunk-Sammelpaket unplausibel"));
+    }
+    let mut columns = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        columns.push((r.i32()?, r.i32()?, r.u16()?));
+    }
+    for (x, z, mask) in columns {
+        let sections = mask.count_ones() as usize;
+        let size = sections
+            * (SECTION_BLOCKS * 2 + LIGHT_BYTES + if sky_light { LIGHT_BYTES } else { 0 })
+            + 256;
+        let data = r.bytes(size)?;
+        let chunk = decode_legacy_chunk(mask, data, true, Some(sky_light))?;
+        store_chunk(shared, x, z, chunk)?;
+    }
+    Ok(())
+}
+
+/// Einen alten Chunk in dieselbe kompakte interne Darstellung wie moderne Paletten überführen.
+fn decode_legacy_chunk(
+    mask: u16,
+    data: &[u8],
+    ground_up: bool,
+    sky_hint: Option<bool>,
+) -> io::Result<Chunk> {
+    let included = mask.count_ones() as usize;
+    let block_bytes = included * SECTION_BLOCKS * 2;
+    let light_bytes = included * LIGHT_BYTES;
+    let biome_bytes = if ground_up { 256 } else { 0 };
+    let without_sky = block_bytes + light_bytes + biome_bytes;
+    let with_sky = without_sky + light_bytes;
+    let has_sky = sky_hint.unwrap_or(data.len() == with_sky);
+    let expected = if has_sky { with_sky } else { without_sky };
+    if data.len() != expected {
+        return Err(crate::buf::err("POV: alte Chunkdaten haben falsche Länge"));
+    }
+
+    let mut sections: Vec<Option<Arc<Section>>> = vec![None; 16];
+    let mut raw_offset = 0usize;
+    let mut included_indices = Vec::with_capacity(included);
+    for (section_index, section) in sections.iter_mut().enumerate() {
+        if mask & (1 << section_index) == 0 {
+            continue;
+        }
+        included_indices.push(section_index);
+        let raw = &data[raw_offset..raw_offset + SECTION_BLOCKS * 2];
+        raw_offset += SECTION_BLOCKS * 2;
+        *section = legacy_section(raw).map(Arc::new);
+    }
+
+    let block_start = block_bytes;
+    let sky_start = block_start + light_bytes;
+    let biome_start = sky_start + if has_sky { light_bytes } else { 0 };
+    if ground_up {
+        let biomes = &data[biome_start..biome_start + 256];
+        for section in sections.iter_mut().flatten() {
+            let section = Arc::make_mut(section);
+            let mut cells = [0u16; SECTION_BIOMES];
+            for cell_y in 0..4usize {
+                for cell_z in 0..4usize {
+                    for cell_x in 0..4usize {
+                        let column = (cell_z * 4 * 16) + cell_x * 4;
+                        cells[(cell_y << 4) | (cell_z << 2) | cell_x] = biomes[column] as u16;
+                    }
+                }
+            }
+            section.biomes = Biomes::Cells(Box::new(cells));
+        }
+    }
+
+    let mut block_light = vec![LightSection::Uniform(0); 16];
+    let mut sky_light = vec![LightSection::Uniform(if has_sky { 15 } else { 0 }); 16];
+    for (slot, section_index) in included_indices.into_iter().enumerate() {
+        let at = block_start + slot * LIGHT_BYTES;
+        block_light[section_index] = compact_light(&data[at..at + LIGHT_BYTES]);
+        if has_sky {
+            let at = sky_start + slot * LIGHT_BYTES;
+            sky_light[section_index] = compact_light(&data[at..at + LIGHT_BYTES]);
+        }
+    }
+    Ok(Chunk {
+        min_section: 0,
+        sections,
+        light: Some(Arc::new(Light {
+            min_section: 0,
+            sky: sky_light.into_boxed_slice(),
+            block: block_light.into_boxed_slice(),
+        })),
+    })
+}
+
+fn legacy_section(raw: &[u8]) -> Option<Section> {
+    let mut palette = vec![0u32];
+    let mut by_state = HashMap::new();
+    by_state.insert(0u32, 0u16);
+    let mut indices = Vec::with_capacity(SECTION_BLOCKS);
+    for bytes in raw.chunks_exact(2) {
+        let state = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
+        let slot = match by_state.get(&state) {
+            Some(slot) => *slot,
+            None => {
+                let slot = palette.len() as u16;
+                palette.push(state);
+                by_state.insert(state, slot);
+                slot
+            }
+        };
+        indices.push(slot);
+    }
+    if palette.len() == 1 {
+        return None;
+    }
+    let remap: Vec<u16> = (0..palette.len() as u16).collect();
+    Some(Section {
+        indices: Indices::remapped(&indices, &remap, palette.len()),
+        palette,
+        biomes: Biomes::Single(0),
+    })
+}
+
+fn store_chunk(shared: &Arc<Shared>, x: i32, z: i32, chunk: Chunk) -> io::Result<()> {
+    let center = shared.position().map(|(x, _, z, _, _)| {
+        (
+            (x.floor() as i32).div_euclid(16),
+            (z.floor() as i32).div_euclid(16),
+        )
+    });
+    let mut world = shared.extras.pov.world.lock().unwrap();
+    if let Some(center) = center {
+        world.center = center;
+    }
+    if world.chunks.len() < MAX_CHUNKS || world.chunks.contains_key(&(x, z)) {
+        world.chunks.insert((x, z), Arc::new(chunk));
+        world.touch();
+    }
+    if center.is_some() {
+        world.prune();
+    }
+    Ok(())
+}
+
 /// Nachgereichtes Licht zu einem Chunk, den wir schon haben.
 ///
 /// Der Server schickt das, sobald sich die Beleuchtung ändert – eine gesetzte Fackel, ein
@@ -1344,6 +1547,24 @@ fn read_light_update(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 }
 
 fn read_section_blocks(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
+    if shared.proto.legacy {
+        let chunk_x = r.i32()?;
+        let chunk_z = r.i32()?;
+        let count = r.var_int()?;
+        if !(0..=SECTION_BLOCKS as i32).contains(&count) {
+            return Err(crate::buf::err("POV: alte Blockänderungen unplausibel"));
+        }
+        let mut world = shared.extras.pov.world.lock().unwrap();
+        for _ in 0..count {
+            let horizontal = r.u8()?;
+            let y = r.u8()? as i32;
+            let state = r.var_int()? as u32;
+            let x = chunk_x * 16 + (horizontal >> 4) as i32;
+            let z = chunk_z * 16 + (horizontal & 15) as i32;
+            world.set_block(x, y, z, state);
+        }
+        return Ok(());
+    }
     let (section_x, section_y, section_z) = unpack_section_pos(r.i64()?);
     let count = r.var_int()?;
     if !(0..=SECTION_BLOCKS as i32).contains(&count) {
@@ -1368,13 +1589,23 @@ fn read_section_blocks(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 
 fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
-    r.skip(16)?;
-    let kind = r.var_int()?;
-    let entity = Entity {
-        x: r.f64()?,
-        y: r.f64()?,
-        z: r.f64()?,
-        player: kind == shared.proto.extra.player_entity_type,
+    let entity = if shared.proto.legacy {
+        r.skip(16)?; // UUID
+        Entity {
+            x: r.i32()? as f64 / 32.0,
+            y: r.i32()? as f64 / 32.0,
+            z: r.i32()? as f64 / 32.0,
+            player: true,
+        }
+    } else {
+        r.skip(16)?;
+        let kind = r.var_int()?;
+        Entity {
+            x: r.f64()?,
+            y: r.f64()?,
+            z: r.f64()?,
+            player: kind == shared.proto.extra.player_entity_type,
+        }
     };
     let mut world = shared.extras.pov.world.lock().unwrap();
     if id != world.own_entity
@@ -1387,9 +1618,19 @@ fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 
 fn read_move_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
-    let dx = r.i16()? as f64 / 4096.0;
-    let dy = r.i16()? as f64 / 4096.0;
-    let dz = r.i16()? as f64 / 4096.0;
+    let (dx, dy, dz) = if shared.proto.legacy {
+        (
+            r.i8()? as f64 / 32.0,
+            r.i8()? as f64 / 32.0,
+            r.i8()? as f64 / 32.0,
+        )
+    } else {
+        (
+            r.i16()? as f64 / 4096.0,
+            r.i16()? as f64 / 4096.0,
+            r.i16()? as f64 / 4096.0,
+        )
+    };
     if let Some(entity) = shared
         .extras
         .pov
@@ -1408,7 +1649,15 @@ fn read_move_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 
 fn read_teleport_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
-    let (x, y, z) = (r.f64()?, r.f64()?, r.f64()?);
+    let (x, y, z) = if shared.proto.legacy {
+        (
+            r.i32()? as f64 / 32.0,
+            r.i32()? as f64 / 32.0,
+            r.i32()? as f64 / 32.0,
+        )
+    } else {
+        (r.f64()?, r.f64()?, r.f64()?)
+    };
     let relatives = if shared.proto.modern {
         for _ in 0..3 {
             r.f64()?;
@@ -1739,6 +1988,14 @@ fn unpack_block_pos(value: i64) -> (i32, i32, i32) {
     let x = (value >> 38) as i32;
     let y = (value << 52 >> 52) as i32;
     let z = (value << 26 >> 38) as i32;
+    (x, y, z)
+}
+
+/// Protokoll 47 legte die 12 Y-Bits noch zwischen X und Z; moderne Pakete legen sie ans Ende.
+fn unpack_legacy_block_pos(value: i64) -> (i32, i32, i32) {
+    let x = (value >> 38) as i32;
+    let y = (value << 26 >> 52) as i32;
+    let z = (value << 38 >> 38) as i32;
     (x, y, z)
 }
 
@@ -3080,6 +3337,14 @@ mod tests {
             ((x & 0x3ff_ffff) << 38) | ((z & 0x3ff_ffff) << 12) | (y & 0xfff)
         };
         assert_eq!(unpack_block_pos(pack(-12, -64, 99)), (-12, -64, 99));
+
+        let legacy = |x: i64, y: i64, z: i64| {
+            ((x & 0x3ff_ffff) << 38) | ((y & 0xfff) << 26) | (z & 0x3ff_ffff)
+        };
+        assert_eq!(
+            unpack_legacy_block_pos(legacy(-12, 255, -99)),
+            (-12, 255, -99)
+        );
     }
 
     #[test]

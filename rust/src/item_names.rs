@@ -3,11 +3,13 @@
 //! Ein Slot enthält nur die numerische Item-ID und einen Patch gegenüber den bekannten
 //! Standard-Komponenten. Der Server schickt die eingebaute Item-Registry normalerweise nicht
 //! in der Konfigurationsphase; ein Vanilla-Client kennt sie bereits aus seiner Version. Diese
-//! vier Listen übernehmen genau diese Aufgabe. Ihre Herkunft und Prüfsummen stehen in
-//! `rust/data/README.md`.
+//! vier modernen Listen übernehmen genau diese Aufgabe. 1.8.9 verwendet dagegen die alte
+//! numerische ID plus Metadatum; dafür gibt es eine sortierte Zweierschlüssel-Liste. Herkunft und
+//! Prüfsummen stehen in `rust/data/README.md`.
 
 use std::sync::OnceLock;
 
+const V1_8_9: &str = include_str!("../data/items-1.8.9.txt");
 const V1_21_1: &str = include_str!("../data/items-1.21.1.txt");
 const V1_21_11: &str = include_str!("../data/items-1.21.11.txt");
 const V26_1: &str = include_str!("../data/items-26.1.txt");
@@ -33,6 +35,30 @@ pub fn get(protocol: &str, id: i32) -> Option<&'static str> {
         .get(usize::try_from(id).ok()?)
         .copied()
 }
+
+/// Ressourcenname eines 1.8.9-Gegenstands. Für Werkzeuge mit Haltbarkeit ist nur Metadatum 0 in
+/// der Registry-Tabelle nötig; ein abgenutzter Gegenstand fällt deshalb auf denselben Namen zurück.
+pub fn get_legacy(id: i32, damage: i16) -> Option<&'static str> {
+    let values = LEGACY.get_or_init(|| {
+        V1_8_9
+            .lines()
+            .filter_map(|line| {
+                let (key, name) = line.split_once('\t')?;
+                let (id, damage) = key.split_once(':')?;
+                Some((id.parse().ok()?, damage.parse().ok()?, name))
+            })
+            .collect()
+    });
+    let find = |damage| {
+        values
+            .binary_search_by_key(&(id, damage), |(id, damage, _)| (*id, *damage))
+            .ok()
+            .map(|index| values[index].2)
+    };
+    find(damage).or_else(|| find(0))
+}
+
+static LEGACY: OnceLock<Vec<(i32, i16, &'static str)>> = OnceLock::new();
 
 /// Je Protokollversion ein Verzeichnis, das erst beim ersten Nachschlagen entsteht. Eine Bauform,
 /// die nie ein Feld anzeigt, zahlt dafür kein Byte.
@@ -78,5 +104,13 @@ mod tests {
         assert_eq!(get("1.21.11", 1504), Some("minecraft:ominous_bottle"));
         assert_eq!(get("26.1", 1505), Some("minecraft:ominous_bottle"));
         assert_eq!(get("26.2", 1536), Some("minecraft:ominous_bottle"));
+    }
+
+    #[test]
+    fn alte_ids_beruecksichtigen_metadaten_und_haltbarkeit() {
+        assert_eq!(V1_8_9.lines().count(), 581);
+        assert_eq!(get_legacy(345, 0), Some("minecraft:compass"));
+        assert_eq!(get_legacy(276, 123), Some("minecraft:diamond_sword"));
+        assert_eq!(get_legacy(-1, 0), None);
     }
 }

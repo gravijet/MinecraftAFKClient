@@ -145,12 +145,6 @@ fn run(options: Options) {
 /// Das Panel schickt allen Bauformen dieselben Argumente. Damit `--antiafk` im schlanken Build
 /// nicht still verpufft, wird hier einmal gesagt, was dieser Build nicht kann.
 fn warn_about_unused_options(console: &Console, options: &Options) {
-    if !options.ignored.is_empty() {
-        console.warn(&format!(
-            "{} gibt es nur im Java-Client; wird ignoriert.",
-            options.ignored.join(", ")
-        ));
-    }
     #[cfg(feature = "antiafk")]
     let _ = options;
     #[cfg(not(feature = "antiafk"))]

@@ -115,6 +115,7 @@ fn system_resolvers() -> Vec<String> {
 ///
 /// Bewusst als reine Funktion über den Text: nur so lässt sich das Format prüfen, ohne dass der
 /// Test von der Datei des Rechners abhängt, auf dem er gerade läuft.
+#[cfg(any(unix, test))]
 fn parse_resolv_conf(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {

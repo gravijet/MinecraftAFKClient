@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use zip::ZipArchive;
 
+const STATES_1_8_9: &[u8] = include_bytes!("../data/block-states-1.8.9.txt.gz");
 const STATES_1_21_1: &[u8] = include_bytes!("../data/block-states-1.21.1.txt.gz");
 const STATES_1_21_11: &[u8] = include_bytes!("../data/block-states-1.21.11.txt.gz");
 const STATES_26_1: &[u8] = include_bytes!("../data/block-states-26.1.txt.gz");
@@ -454,7 +455,9 @@ impl Assets {
             .copied()
             .and_then(|state| self.render_block_icon(state))
             .or_else(|| self.render_item_model(name))
+            .or_else(|| self.render_legacy_item_model(name))
             .or_else(|| self.raw(&direct))
+            .or_else(|| self.raw(&format!("assets/{}/textures/items/{}.png", namespace, path)))
             .unwrap_or_else(|| self.missing_png.clone());
         if let Ok(mut cache) = self.item_icons.lock() {
             cache.insert(name.to_string(), bytes.clone());
@@ -481,6 +484,37 @@ impl Assets {
         let model = first_item_model(definition.get("model")?, 0)?;
         let mut cache = HashMap::new();
         let textures = resolved_model_textures(&mut archive, model, 0, &mut cache)?;
+
+        let mut layers = Vec::new();
+        for index in 0..8 {
+            let Some(reference) = textures.get(&format!("layer{}", index)) else {
+                break;
+            };
+            let resolved = resolve_texture(reference, &textures);
+            if resolved.is_empty() {
+                continue;
+            }
+            let (texture_namespace, texture_path) = resource_id(&resolved);
+            let bytes = read_zip(
+                &mut archive,
+                &format!("assets/{}/textures/{}.png", texture_namespace, texture_path),
+                MAX_ARCHIVE_ASSET_BYTES,
+            )?;
+            layers.push(decode_png(&bytes).ok()?);
+        }
+        composite_item_layers(&layers)
+    }
+
+    /// Vor 1.21.2 gab es noch keine `items/*.json`: Das Item verwies unmittelbar auf ein
+    /// Modell unter `models/item`. Dessen `layer0`/`layer1` koennen weiterhin mit demselben
+    /// Renderer zusammengesetzt werden; nur der Einstieg in die Modellkette ist ein anderer.
+    #[cfg(feature = "items")]
+    fn render_legacy_item_model(&self, name: &str) -> Option<Vec<u8>> {
+        let (namespace, path) = resource_id(name);
+        let mut archive = self.archive.lock().ok()?;
+        let model = format!("{}:item/{}", namespace, path);
+        let mut cache = HashMap::new();
+        let textures = resolved_model_textures(&mut archive, &model, 0, &mut cache)?;
 
         let mut layers = Vec::new();
         for index in 0..8 {
@@ -998,6 +1032,7 @@ impl Loader {
 
 fn state_table(protocol: &str) -> Result<String, String> {
     let bytes = match protocol {
+        "1.8.9" => STATES_1_8_9,
         "1.21.1" => STATES_1_21_1,
         "1.21.11" => STATES_1_21_11,
         "26.1" => STATES_26_1,
@@ -1537,6 +1572,7 @@ mod tests {
     #[test]
     fn state_tabellen_sind_lueckenlos() {
         for (version, expected) in [
+            ("1.8.9", 4_096),
             ("1.21.1", 26_684),
             ("1.21.11", 29_671),
             ("26.1", 29_873),
@@ -1714,6 +1750,24 @@ mod tests {
         // Beim zweiten Aufruf kommt dasselbe bereits gerenderte Icon aus dem Cache.
         assert_eq!(assets.item_png("minecraft:stone"), stone_icon);
         for name in ["minecraft:clock", "minecraft:compass", "minecraft:potion"] {
+            let icon = assets.item_png(name);
+            assert_ne!(icon, assets.missing_png, "{} blieb die Fehlertextur", name);
+            assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n", "{}", name);
+        }
+    }
+
+    /// Gegenprobe fuer das alte Ressourcenlayout ohne `version.json`, moderne `items/*.json`
+    /// und den Singularordner `textures/item`.
+    /// `AFK_POV_RESOURCES=/pfad/1.8.9.jar cargo test --features pov-client -- --ignored originale_client_jar_1_8_9`
+    #[test]
+    #[ignore]
+    #[cfg(feature = "items")]
+    fn originale_client_jar_1_8_9() {
+        let path = std::env::var("AFK_POV_RESOURCES").expect("AFK_POV_RESOURCES fehlt");
+        let assets = Assets::load(Path::new(&path), "1.8.9").expect("1.8.9-Assets laden");
+        assert_eq!(assets.material_count(), 4_096);
+        assert_ne!(assets.sample(16, 3, 0.5, 0.5).0, 248); // Stein statt Fehlertextur
+        for name in ["minecraft:stone", "minecraft:compass", "minecraft:clock"] {
             let icon = assets.item_png(name);
             assert_ne!(icon, assets.missing_png, "{} blieb die Fehlertextur", name);
             assert_eq!(&icon[..8], b"\x89PNG\r\n\x1a\n", "{}", name);

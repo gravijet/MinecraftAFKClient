@@ -145,7 +145,9 @@ fn act(shared: &Arc<Shared>) {
         return;
     }
     let mut swing = Writer::packet(shared.proto.extra.sb_swing);
-    swing.var_int(0); // Haupthand
+    if !shared.proto.legacy {
+        swing.var_int(0); // Haupthand; 1.8.9 hat keine Nutzlast
+    }
     shared.send(swing);
 
     let Some((_, _, _, yaw, pitch)) = shared.position() else {

@@ -4,7 +4,8 @@
 //! MCProtocolLib (`MinecraftCodec.CODEC`), die pro Zustand und Richtung bei 0 beginnt – also
 //! genau der Quelle, aus der auch der Java-Client seine IDs bezieht. Abgelesen aus den Jars
 //! `protocol-1.21` (767), `protocol-1.21.11-1` (774), `protocol-26.1-1` (775) und
-//! `protocol-26.2` (776).
+//! `protocol-26.2` (776). Die 1.8.9-Daten (Protokoll 47) stammen aus dem Vanilla-Protokollschema
+//! von PrismarineJS/minecraft-data und wurden gegen den offiziellen 1.8.9-Client abgeglichen.
 //!
 //! Bei einem MC-Update dort neu ablesen, nicht raten.
 
@@ -23,6 +24,9 @@ pub struct Protocol {
     pub name: &'static str,
     /// Protokollnummer im Handshake.
     pub version: i32,
+    /// Altes Protokoll 47: keine Konfigurationsphase, JSON-Komponenten, 32-Bit-KeepAlive und die
+    /// vor der Flattening-Umstellung verwendeten Chunk-/Slot-Formate.
+    pub legacy: bool,
     /// Paketformate ab 1.21.2 statt 1.21/1.21.1. Betrifft geprüfte Stellen: Prüfsumme im
     /// Chat-Paket, `globalIndex` im Spieler-Chat, Partikel-Status in den Client-Einstellungen,
     /// das Positionspaket (Vektor- statt Einzelfeldformat), den Verhaltenskodex der
@@ -130,6 +134,8 @@ pub struct Extra {
 
     // ---- Live-Ansicht: Welt ----
     pub cb_level_chunk: i32,
+    /// 1.8.9 kann mehrere Chunks in einem eigenen Sammelpaket schicken.
+    pub cb_level_chunk_bulk: i32,
     /// Nachgereichtes Licht zu einem bereits geschickten Chunk. Die ID ist nicht geraten: Die
     /// Pakete der Spielphase stehen nach ihrem Registry-Namen sortiert, und zwischen
     /// `level_chunk_with_light` und `login` liegen genau `level_event`, `level_particles` und
@@ -169,6 +175,9 @@ pub struct Extra {
 #[cfg(feature = "board")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TeamLayout {
+    /// 1.8.9: alle sichtbaren Texte sind alte Zeichenketten; Präfix/Suffix stehen direkt hinter
+    /// dem Anzeigenamen, Farbe und Flags sind Bytes.
+    V1_8,
     /// 1.21.1: Anzeigename, Flags (Byte), Sichtbarkeit **als Zeichenkette**, Kollision **als
     /// Zeichenkette**, Farbe (VarInt), Präfix, Suffix.
     Legacy,
@@ -179,10 +188,11 @@ pub enum TeamLayout {
 }
 
 /// Ohne Anzeigetafel wird das Team-Paket nie gelesen; das Feld bleibt trotzdem in der Tabelle,
-/// damit die vier Versionstabellen in jeder Bauform gleich aussehen.
+/// damit die fünf Versionstabellen in jeder Bauform gleich aussehen.
 #[cfg(all(feature = "extras", not(feature = "board")))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TeamLayout {
+    V1_8,
     Legacy,
     VarIntRules,
     Reordered,
@@ -258,6 +268,8 @@ pub enum In {
     // ---- Live-Ansicht ----
     #[cfg(feature = "pov")]
     LevelChunk,
+    #[cfg(feature = "pov")]
+    LevelChunkBulk,
     /// Nachgereichtes Licht zu einem schon bekannten Chunk.
     #[cfg(feature = "pov")]
     LightUpdate,
@@ -283,7 +295,7 @@ pub enum In {
     Ignored,
 }
 
-pub const PROTOCOLS: &[Protocol] = &[P1_21_1, P1_21_11, P26_1, P26_2];
+pub const PROTOCOLS: &[Protocol] = &[P1_8_9, P1_21_1, P1_21_11, P26_1, P26_2];
 
 /// Ohne `--mc` gilt die neueste stabile Version.
 pub const DEFAULT: &Protocol = &P26_1;
@@ -373,6 +385,8 @@ impl Protocol {
         {
             if id == e.cb_level_chunk {
                 return In::LevelChunk;
+            } else if id == e.cb_level_chunk_bulk {
+                return In::LevelChunkBulk;
             } else if id == e.cb_light_update {
                 return In::LightUpdate;
             } else if id == e.cb_block_update {
@@ -434,9 +448,103 @@ impl Protocol {
 
 // ===================== Tabellen =====================
 
+const P1_8_9: Protocol = Protocol {
+    name: "1.8.9",
+    version: 47,
+    legacy: true,
+    modern: false,
+    #[cfg(feature = "extras")]
+    extra: Extra {
+        // Protokoll 47, Spielphase Server -> Client.
+        cb_reset_score: -1, // Entfernen ist Aktion 1 im SetScore-Paket.
+        cb_set_display_objective: 0x3d,
+        cb_set_objective: 0x3b,
+        cb_set_player_team: 0x3e,
+        cb_set_score: 0x3c,
+
+        cb_container_close: 0x2e,
+        cb_container_set_content: 0x30,
+        cb_container_set_slot: 0x2f,
+        cb_open_screen: 0x2d,
+        cb_set_player_inventory: -1,
+        sb_container_click: 0x0e,
+        sb_container_close: 0x0d,
+
+        sb_player_command: 0x0b,
+        sb_player_input: 0x0c,
+        sb_set_carried_item: 0x09,
+        sb_swing: 0x0a,
+        sb_use_item: 0x08,
+
+        cb_level_chunk: 0x21,
+        cb_level_chunk_bulk: 0x26,
+        cb_light_update: -1,
+        cb_forget_level_chunk: -1, // Entladen ist ChunkData mit leerer Abschnittsmaske.
+        cb_block_update: 0x23,
+        cb_section_blocks_update: 0x22,
+        cb_add_entity: 0x0c, // NamedEntitySpawn; die POV zeigt nur Spieler.
+        cb_remove_entities: 0x13,
+        cb_move_entity_pos: 0x15,
+        cb_move_entity_pos_rot: 0x17,
+        cb_teleport_entity: 0x18,
+        cb_entity_position_sync: -1,
+        player_entity_type: -1,
+
+        section_fluid_count: false,
+        team_layout: TeamLayout::V1_8,
+        #[cfg(feature = "items")]
+        components: Components {
+            // 1.8.9 benutzt benanntes NBT statt Komponenten; diese Werte werden nie gelesen.
+            custom_name: 0,
+            item_name: 0,
+            lore: 0,
+            shapes: "",
+        },
+    },
+    game: Game {
+        cb_chunk_batch_finished: -1,
+        cb_chunk_batch_start: -1,
+        cb_cookie_request: -1,
+        cb_disconnect: 0x40,
+        cb_keep_alive: 0x00,
+        cb_login: 0x01,
+        cb_ping: -1,
+        cb_player_chat: -1,
+        cb_player_position: 0x08,
+        cb_resource_pack_push: 0x48,
+        cb_respawn: 0x07,
+        cb_set_health: 0x06,
+        cb_start_configuration: -1,
+        cb_store_cookie: -1,
+        cb_system_chat: 0x02,
+        cb_transfer: -1,
+
+        sb_accept_teleportation: -1,
+        sb_chat: 0x01,
+        sb_chat_ack: -1,
+        sb_chat_command: 0x01,
+        sb_chunk_batch_received: -1,
+        sb_client_tick_end: -1,
+        sb_client_command: 0x16,
+        sb_client_information: 0x15,
+        sb_configuration_acknowledged: -1,
+        sb_cookie_response: -1,
+        sb_custom_payload: 0x17,
+        sb_keep_alive: 0x00,
+        sb_move_player_pos: 0x04,
+        sb_move_player_pos_rot: 0x06,
+        #[cfg(feature = "movement")]
+        sb_move_player_rot: 0x05,
+        sb_player_loaded: -1,
+        sb_pong: -1,
+        sb_resource_pack: 0x19,
+    },
+};
+
 const P1_21_1: Protocol = Protocol {
     name: "1.21.1",
     version: 767,
+    legacy: false,
     modern: false,
     #[cfg(feature = "extras")]
     extra: Extra {
@@ -463,6 +571,7 @@ const P1_21_1: Protocol = Protocol {
         sb_use_item: 57,
 
         cb_level_chunk: 39,
+        cb_level_chunk_bulk: -1,
         cb_light_update: 42,
         cb_forget_level_chunk: 33,
         cb_block_update: 9,
@@ -528,6 +637,7 @@ const P1_21_1: Protocol = Protocol {
 const P1_21_11: Protocol = Protocol {
     name: "1.21.11",
     version: 774,
+    legacy: false,
     modern: true,
     #[cfg(feature = "extras")]
     extra: Extra {
@@ -552,6 +662,7 @@ const P1_21_11: Protocol = Protocol {
         sb_use_item: 64,
 
         cb_level_chunk: 44,
+        cb_level_chunk_bulk: -1,
         cb_light_update: 47,
         cb_forget_level_chunk: 37,
         cb_block_update: 8,
@@ -617,6 +728,7 @@ const P1_21_11: Protocol = Protocol {
 const P26_1: Protocol = Protocol {
     name: "26.1",
     version: 775,
+    legacy: false,
     modern: true,
     #[cfg(feature = "extras")]
     extra: Extra {
@@ -641,6 +753,7 @@ const P26_1: Protocol = Protocol {
 const P26_2: Protocol = Protocol {
     name: "26.2",
     version: 776,
+    legacy: false,
     modern: true,
     #[cfg(feature = "extras")]
     extra: Extra {
@@ -681,6 +794,7 @@ const EXTRA_26: Extra = Extra {
     sb_use_item: 67,
 
     cb_level_chunk: 45,
+    cb_level_chunk_bulk: -1,
     cb_light_update: 48,
     cb_forget_level_chunk: 37,
     cb_block_update: 8,
@@ -875,9 +989,8 @@ const SHAPES_26_2: &str = concat!(
 
 // ===================== versionsunabhängige IDs =====================
 //
-// Handshake, Login und Konfiguration sind in allen vier Protokollen deckungsgleich – bis auf
-// den Verhaltenskodex, den es erst ab 1.21.11 gibt (in 1.21.1 hat die Konfigurationsphase gar
-// so viele Pakete nicht, die IDs können dort also nicht kollidieren).
+// Handshake und die grundlegenden Login-IDs sind versionsunabhaengig. 1.8.9 springt danach
+// unmittelbar ins Spiel; die vier modernen Versionen verwenden zusaetzlich die Konfigurationsphase.
 
 /// Handshake (nur ein Paket).
 pub mod handshake {

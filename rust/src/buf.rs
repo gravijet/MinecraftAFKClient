@@ -204,6 +204,11 @@ impl Writer {
         self.data.extend_from_slice(&v.to_be_bytes());
     }
 
+    #[cfg(feature = "extras")]
+    pub fn i16(&mut self, v: i16) {
+        self.data.extend_from_slice(&v.to_be_bytes());
+    }
+
     pub fn i32(&mut self, v: i32) {
         self.data.extend_from_slice(&v.to_be_bytes());
     }

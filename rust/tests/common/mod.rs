@@ -363,6 +363,7 @@ impl Conn {
 /// dreimal ändert (siehe `proto::TeamLayout`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TeamLayout {
+    V1_8,
     /// 1.21.1: Flags, Sichtbarkeit und Kollision als **Zeichenketten**, dann Farbe, Präfix, Suffix.
     Legacy,
     /// 1.21.11 und 26.1: wie Legacy, aber Sichtbarkeit und Kollision als VarInt.
@@ -373,6 +374,7 @@ pub enum TeamLayout {
 
 pub struct Ids {
     pub name: &'static str,
+    pub legacy: bool,
     pub modern: bool,
     pub fluid_count: bool,
     pub team_layout: TeamLayout,
@@ -426,6 +428,7 @@ pub struct Ids {
 
 pub static MC_26_1: Ids = Ids {
     name: "26.1",
+    legacy: false,
     modern: true,
     fluid_count: true,
     team_layout: TeamLayout::VarIntRules,
@@ -471,6 +474,7 @@ pub static MC_26_1: Ids = Ids {
 
 pub static MC_1_21_1: Ids = Ids {
     name: "1.21.1",
+    legacy: false,
     modern: false,
     fluid_count: false,
     team_layout: TeamLayout::Legacy,
@@ -520,6 +524,52 @@ pub static MC_26_2: Ids = Ids {
     name: "26.2",
     team_layout: TeamLayout::Reordered,
     ..MC_26_1
+};
+
+pub static MC_1_8_9: Ids = Ids {
+    name: "1.8.9",
+    legacy: true,
+    modern: false,
+    fluid_count: false,
+    team_layout: TeamLayout::V1_8,
+    cb_set_objective: 0x3b,
+    cb_set_display_objective: 0x3d,
+    cb_set_player_team: 0x3e,
+    cb_set_score: 0x3c,
+    cb_open_screen: 0x2d,
+    cb_container_set_content: 0x30,
+    component_custom_name: -1,
+    component_lore: -1,
+    cb_login: 0x01,
+    cb_position: 0x08,
+    cb_system_chat: 0x02,
+    cb_player_chat: -1,
+    cb_keep_alive: 0x00,
+    cb_level_chunk: 0x21,
+    cb_chunk_batch_finished: -1,
+    cb_chunk_batch_start: -1,
+    cb_block_update: 0x23,
+    sb_chat_command: 0x01,
+    sb_chat: 0x01,
+    sb_chunk_batch_received: -1,
+    sb_accept_teleportation: -1,
+    sb_client_tick_end: -1,
+    sb_custom_payload: 0x17,
+    sb_keep_alive: 0x00,
+    sb_move_pos: 0x04,
+    sb_move: 0x06,
+    sb_move_rot: 0x05,
+    sb_player_input: 0x0c,
+    sb_use_item: 0x08,
+    sb_player_loaded: -1,
+    cb_respawn: 0x07,
+    cb_set_health: 0x06,
+    cb_transfer: -1,
+    cb_store_cookie: -1,
+    sb_client_command: 0x16,
+    sb_set_carried_item: 0x09,
+    sb_container_click: 0x0e,
+    sb_container_close: 0x0d,
 };
 
 // ===================== Server =====================
@@ -681,7 +731,7 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
 
     // Verschlüsselung wie auf einem Online-Mode-Server. Reihenfolge wie in Vanilla:
     // EncryptionRequest, danach SetCompression, zuletzt LoginSuccess.
-    if plan.encrypt && !encrypt(conn, &out) {
+    if plan.encrypt && !encrypt(conn, &out, ids.legacy) {
         return;
     }
 
@@ -711,32 +761,39 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     }
 
     let mut ok = Buf::packet(2); // CB_FINISHED
-    ok.uuid(&[7u8; 16]).string(&name).var_int(0).bool(true);
-    conn.send(&ok);
-    if conn.recv().is_none() {
-        return; // SB_ACKNOWLEDGED
+    if ids.legacy {
+        ok.string("07070707-0707-0707-0707-070707070707")
+            .string(&name);
+    } else {
+        ok.uuid(&[7u8; 16]).string(&name).var_int(0).bool(true);
     }
-
-    // --- Konfigurationsphase ---
-    let mut registry = Buf::packet(7); // CB_REGISTRY_DATA
-    registry.string("minecraft:dimension_type").var_int(1);
-    registry.string("minecraft:overworld").bool(true);
-    registry.nbt_ints(&[("min_y", -64), ("height", 384)]);
-    conn.send(&registry);
-    conn.send(&Buf::packet(3)); // CB_FINISH
-
-    loop {
-        let Some((id, payload)) = conn.recv() else {
-            return;
-        };
-        if id == 0 && payload.len() > 1 {
-            // ClientInformation: Sprache (String), dann die Sichtweite als ein Byte.
-            let mut c = Cursor::new(&payload);
-            let _locale = c.string();
-            let _ = tx.send(Note::ViewDistance(c.u8()));
+    conn.send(&ok);
+    if !ids.legacy {
+        if conn.recv().is_none() {
+            return; // SB_ACKNOWLEDGED
         }
-        if id == 3 {
-            break; // SB_FINISH -> Spielphase
+
+        // --- Konfigurationsphase ---
+        let mut registry = Buf::packet(7); // CB_REGISTRY_DATA
+        registry.string("minecraft:dimension_type").var_int(1);
+        registry.string("minecraft:overworld").bool(true);
+        registry.nbt_ints(&[("min_y", -64), ("height", 384)]);
+        conn.send(&registry);
+        conn.send(&Buf::packet(3)); // CB_FINISH
+
+        loop {
+            let Some((id, payload)) = conn.recv() else {
+                return;
+            };
+            if id == 0 && payload.len() > 1 {
+                // ClientInformation: Sprache (String), dann die Sichtweite als ein Byte.
+                let mut c = Cursor::new(&payload);
+                let _locale = c.string();
+                let _ = tx.send(Note::ViewDistance(c.u8()));
+            }
+            if id == 3 {
+                break; // SB_FINISH -> Spielphase
+            }
         }
     }
 
@@ -745,28 +802,38 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
         thread::sleep(Duration::from_millis(plan.before_login_ms));
     }
     let mut login = Buf::packet(ids.cb_login);
-    login
-        .i32(42) // eigene Entity-Nummer
-        .bool(false) // hardcore
-        .var_int(1)
-        .string("minecraft:overworld") // Weltliste
-        .var_int(20) // maxPlayers
-        .var_int(8) // viewDistance
-        .var_int(8) // simulationDistance
-        .bool(false)
-        .bool(true)
-        .bool(false)
-        .var_int(0) // Dimension-Typ-ID
-        .string("minecraft:overworld")
-        .i64(0) // hashedSeed
-        .u8(0) // gameMode
-        .u8(255) // previousGameMode
-        .bool(false)
-        .bool(false)
-        .bool(false) // lastDeathPos: nein
-        .var_int(0) // portalCooldown
-        .var_int(63) // seaLevel
-        .bool(false);
+    login.i32(42); // eigene Entity-Nummer
+    if ids.legacy {
+        login
+            .u8(0) // gameMode
+            .u8(0) // Dimension: Overworld
+            .u8(1) // Schwierigkeit
+            .u8(20) // maxPlayers
+            .string("default")
+            .bool(false);
+    } else {
+        login
+            .bool(false) // hardcore
+            .var_int(1)
+            .string("minecraft:overworld") // Weltliste
+            .var_int(20) // maxPlayers
+            .var_int(8) // viewDistance
+            .var_int(8) // simulationDistance
+            .bool(false)
+            .bool(true)
+            .bool(false)
+            .var_int(0) // Dimension-Typ-ID
+            .string("minecraft:overworld")
+            .i64(0) // hashedSeed
+            .u8(0) // gameMode
+            .u8(255) // previousGameMode
+            .bool(false)
+            .bool(false)
+            .bool(false) // lastDeathPos: nein
+            .var_int(0) // portalCooldown
+            .var_int(63) // seaLevel
+            .bool(false);
+    }
     conn.send(&login);
     let _ = tx.send(Note::Joined);
 
@@ -787,27 +854,34 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
             .f32(0.0)
             .f32(0.0)
             .i32(0);
+    } else if ids.legacy {
+        pos.f64(x).f64(y).f64(z).f32(0.0).f32(0.0).u8(0);
     } else {
         pos.f64(x).f64(y).f64(z).f32(0.0).f32(0.0).u8(0).var_int(1);
     }
     conn.send(&pos);
 
     // Chunks – wie beim echten Server in einen Stapel geklammert: Start, Inhalt, Abschluss.
-    if !plan.chunks.is_empty() {
+    if !ids.legacy && !plan.chunks.is_empty() {
         conn.send(&Buf::packet(ids.cb_chunk_batch_start));
     }
     for (cx, cz) in &plan.chunks {
-        conn.send(&chunk_packet(
-            ids,
-            *cx,
-            *cz,
-            plan.solid_section,
-            plan.mixed_palette,
-            plan.filled_sections.max(1),
-            plan.sky_light,
-        ));
+        let chunk = if ids.legacy {
+            legacy_chunk_packet(*cx, *cz, plan.solid_section, plan.sky_light)
+        } else {
+            chunk_packet(
+                ids,
+                *cx,
+                *cz,
+                plan.solid_section,
+                plan.mixed_palette,
+                plan.filled_sections.max(1),
+                plan.sky_light,
+            )
+        };
+        conn.send(&chunk);
     }
-    if !plan.chunks.is_empty() {
+    if !ids.legacy && !plan.chunks.is_empty() {
         let mut done = Buf::packet(ids.cb_chunk_batch_finished);
         done.var_int(plan.chunks.len() as i32);
         conn.send(&done);
@@ -821,16 +895,35 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
 
     for line in &plan.chat {
         let mut chat = Buf::packet(ids.cb_system_chat);
-        chat.nbt_text(line).bool(false);
+        if ids.legacy {
+            chat.string(&format!(
+                "{{\"text\":{}}}",
+                serde_json::to_string(line).unwrap()
+            ))
+            .u8(1);
+        } else {
+            chat.nbt_text(line).bool(false);
+        }
         conn.send(&chat);
     }
     for line in &plan.player_chat {
-        conn.send(&player_chat_packet(
-            ids,
-            "Hugo",
-            line,
-            plan.player_chat_filter,
-        ));
+        if ids.legacy {
+            let mut chat = Buf::packet(ids.cb_system_chat);
+            let rendered = format!("<Hugo> {}", line);
+            chat.string(&format!(
+                "{{\"text\":{}}}",
+                serde_json::to_string(&rendered).unwrap()
+            ))
+            .u8(0);
+            conn.send(&chat);
+        } else {
+            conn.send(&player_chat_packet(
+                ids,
+                "Hugo",
+                line,
+                plan.player_chat_filter,
+            ));
+        }
     }
 
     // Auflegen, sobald der Chat draußen ist: Der Client muss die Zeilen dann trotzdem noch
@@ -854,11 +947,19 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     // sie im Netz-Thread, bleibt er darin stecken und beantwortet kein KeepAlive mehr.
     for index in 0..plan.chat_flood {
         let mut chat = Buf::packet(ids.cb_system_chat);
-        chat.nbt_text(&format!(
+        let line = format!(
             "Flut {} – eine lange Zeile, damit die Pipe des Clients schnell voll ist ........",
             index
-        ))
-        .bool(false);
+        );
+        if ids.legacy {
+            chat.string(&format!(
+                "{{\"text\":{}}}",
+                serde_json::to_string(&line).unwrap()
+            ))
+            .u8(1);
+        } else {
+            chat.nbt_text(&line).bool(false);
+        }
         conn.send(&chat);
     }
 
@@ -891,12 +992,17 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
     // Ab hier nur noch mitlesen und am Leben halten.
     let deadline = Instant::now() + Duration::from_secs(plan.hold_secs.max(1));
     let keep_alive_id = ids.cb_keep_alive;
+    let legacy = ids.legacy;
     let wire = Arc::clone(&out);
     thread::spawn(move || {
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(500));
             let mut ka = Buf::packet(keep_alive_id);
-            ka.i64(1234);
+            if legacy {
+                ka.var_int(1234);
+            } else {
+                ka.i64(1234);
+            }
             let mut guard = wire.lock().unwrap();
             guard.send(&ka);
             if guard.stream.flush().is_err() {
@@ -930,18 +1036,22 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
         // hinterher. Siehe [`Plan::respawn_after_death`].
         if respawn_after_death && id == client_command {
             let mut respawn = Buf::packet(ids.cb_respawn);
-            respawn
-                .var_int(0) // Dimension-Typ-ID
-                .string("minecraft:overworld")
-                .i64(0) // hashedSeed
-                .u8(0) // gameMode
-                .u8(255) // previousGameMode
-                .bool(false) // isDebug
-                .bool(false) // isFlat
-                .bool(false) // lastDeathPos: nein
-                .var_int(0) // portalCooldown
-                .var_int(63) // seaLevel
-                .u8(0); // dataToKeep
+            if ids.legacy {
+                respawn.i32(0).u8(1).u8(0).string("default");
+            } else {
+                respawn
+                    .var_int(0) // Dimension-Typ-ID
+                    .string("minecraft:overworld")
+                    .i64(0) // hashedSeed
+                    .u8(0) // gameMode
+                    .u8(255) // previousGameMode
+                    .bool(false) // isDebug
+                    .bool(false) // isFlat
+                    .bool(false) // lastDeathPos: nein
+                    .var_int(0) // portalCooldown
+                    .var_int(63) // seaLevel
+                    .u8(0); // dataToKeep
+            }
             conn.send(&respawn);
         }
         if id == move_pos && payload.len() == 25 {
@@ -951,7 +1061,15 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::ChunkBatchReceived(c.f32()));
         }
-        if id == chat_command {
+        if ids.legacy && id == chat {
+            let mut c = Cursor::new(&payload);
+            let message = c.string();
+            if let Some(command) = message.strip_prefix('/') {
+                let _ = tx.send(Note::Command(command.to_string()));
+            } else {
+                let _ = tx.send(Note::Chat(message));
+            }
+        } else if id == chat_command {
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::Command(c.string()));
         } else if id == chat {
@@ -959,16 +1077,22 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
             let _ = tx.send(Note::Chat(c.string()));
         } else if id == custom_payload {
             let mut c = Cursor::new(&payload);
-            if c.string() == "minecraft:brand" {
+            let channel = c.string();
+            if channel == "minecraft:brand" || channel == "MC|Brand" {
                 let _ = tx.send(Note::Brand(c.string()));
             }
-        } else if id == use_item {
+        } else if id == use_item && !ids.legacy {
             let mut c = Cursor::new(&payload);
             let _hand = c.var_int();
             let _ = tx.send(Note::UseSequence(c.var_int()));
         } else if id == player_input {
             let mut c = Cursor::new(&payload);
             let _ = tx.send(Note::PlayerInput(c.u8()));
+        }
+        if ids.legacy && id == 0x15 {
+            let mut c = Cursor::new(&payload);
+            let _locale = c.string();
+            let _ = tx.send(Note::ViewDistance(c.u8()));
         }
         // Zusätzlich immer die rohe Länge: Sie verrät, ob ein Paket den Aufbau der jeweiligen
         // Protokollversion hat – ein Feld zu viel oder zu wenig fällt genau daran auf.
@@ -984,7 +1108,7 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
 /// ein Proxy macht, der sie selbst übernommen hat.
 ///
 /// `false` = das Handshake ist gescheitert.
-fn encrypt(conn: &mut Conn, out: &Arc<Mutex<Wire>>) -> bool {
+fn encrypt(conn: &mut Conn, out: &Arc<Mutex<Wire>>, legacy: bool) -> bool {
     // 1024 Bit wie Minecraft selbst.
     let private = RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).expect("RSA-Schlüssel");
     let der = RsaPublicKey::from(&private)
@@ -996,8 +1120,10 @@ fn encrypt(conn: &mut Conn, out: &Arc<Mutex<Wire>>) -> bool {
     request
         .string("")
         .byte_array(der.as_bytes())
-        .byte_array(&challenge)
-        .bool(false); // shouldAuthenticate
+        .byte_array(&challenge);
+    if !legacy {
+        request.bool(false); // shouldAuthenticate
+    }
     conn.send(&request);
 
     let Some((id, answer)) = conn.recv() else {
@@ -1051,28 +1177,39 @@ fn player_chat_packet(ids: &Ids, sender: &str, content: &str, filter: i32) -> Bu
 /// Eine Seitenleiste, wie sie ein gewöhnlicher Server aufbaut: Der Eintrag selbst ist ein
 /// unsichtbarer Platzhalter, der sichtbare Text steckt in Präfix und Suffix eines Teams.
 ///
-/// Genau das ist die Stelle, an der sich die vier Protokolle dreimal unterscheiden – deshalb wird
+/// Genau das ist die Stelle, an der sich die fünf Protokolle viermal unterscheiden – deshalb wird
 /// hier je nach [`TeamLayout`] eine andere Feldreihenfolge geschrieben.
 fn send_scoreboard(conn: &mut Conn, ids: &Ids) {
     // Ziel anlegen: Name, Aktion 0 (anlegen), Anzeigename, Punktart, kein Zahlenformat.
     let mut objective = Buf::packet(ids.cb_set_objective);
-    objective
-        .string("sb")
-        .u8(0)
-        .nbt_text("Testserver")
-        .var_int(0)
-        .bool(false);
+    objective.string("sb").u8(0);
+    if ids.legacy {
+        objective.string("Testserver").string("integer");
+    } else {
+        objective.nbt_text("Testserver").var_int(0).bool(false);
+    }
     conn.send(&objective);
 
     // In die Seitenleiste damit (Bereich 1).
     let mut display = Buf::packet(ids.cb_set_display_objective);
-    display.var_int(1).string("sb");
+    display.u8(1).string("sb");
     conn.send(&display);
 
     // Team anlegen – Präfix und Suffix tragen den sichtbaren Text.
     let mut team = Buf::packet(ids.cb_set_player_team);
-    team.string("t1").u8(0).nbt_text("Team 1");
+    team.string("t1").u8(0);
+    if !ids.legacy {
+        team.nbt_text("Team 1");
+    }
     match ids.team_layout {
+        TeamLayout::V1_8 => {
+            team.string("Team 1")
+                .string("Rang: ")
+                .string(" *")
+                .u8(0)
+                .string("always")
+                .u8(10);
+        }
         TeamLayout::Legacy => {
             team.u8(0) // Flags
                 .string("always") // Sichtbarkeit der Namensschilder
@@ -1104,12 +1241,12 @@ fn send_scoreboard(conn: &mut Conn, ids: &Ids) {
 
     // Punktzahl: Eintrag, Ziel, Wert, kein eigener Anzeigetext, kein Zahlenformat.
     let mut score = Buf::packet(ids.cb_set_score);
-    score
-        .string("hugo")
-        .string("sb")
-        .var_int(5)
-        .bool(false)
-        .bool(false);
+    score.string("hugo");
+    if ids.legacy {
+        score.var_int(0).string("sb").var_int(5);
+    } else {
+        score.string("sb").var_int(5).bool(false).bool(false);
+    }
     conn.send(&score);
 }
 
@@ -1117,7 +1254,14 @@ fn send_scoreboard(conn: &mut Conn, ids: &Ids) {
 /// Lore-Zeilen. Genau so kommt ein Shop- oder Warp-Menü von einem gewöhnlichen Server.
 fn send_menu(conn: &mut Conn, ids: &Ids) {
     let mut open = Buf::packet(ids.cb_open_screen);
-    open.var_int(1).var_int(2).nbt_text("Warp-Menü");
+    if ids.legacy {
+        open.u8(1)
+            .string("minecraft:chest")
+            .string("{\"text\":\"Warp-Menü\"}")
+            .u8(9);
+    } else {
+        open.var_int(1).var_int(2).nbt_text("Warp-Menü");
+    }
     conn.send(&open);
 
     let mut content = Buf::packet(ids.cb_container_set_content);
@@ -1127,22 +1271,76 @@ fn send_menu(conn: &mut Conn, ids: &Ids) {
     } else {
         content.u8(1);
     }
-    content.var_int(1).var_int(9); // Zustandszähler, Feldanzahl
+    if ids.legacy {
+        content.i16(9);
+    } else {
+        content.var_int(1).var_int(9); // Zustandszähler, Feldanzahl
+    }
     for slot in 0..9 {
         if slot == 4 {
-            item_with_lore(
-                &mut content,
-                ids,
-                848,
-                "Zum Spawn",
-                &["Klicken", "kostet nichts"],
-            );
+            if ids.legacy {
+                legacy_item_with_lore(
+                    &mut content,
+                    345,
+                    "Zum Spawn",
+                    &["Klicken", "kostet nichts"],
+                );
+            } else {
+                item_with_lore(
+                    &mut content,
+                    ids,
+                    848,
+                    "Zum Spawn",
+                    &["Klicken", "kostet nichts"],
+                );
+            }
+        } else if ids.legacy {
+            content.i16(-1); // leeres Feld
         } else {
             content.var_int(0); // leeres Feld
         }
     }
-    content.var_int(0); // nichts in der Hand
+    if !ids.legacy {
+        content.var_int(0); // nichts in der Hand
+    }
     conn.send(&content);
+}
+
+/// Ein vollstaendiger 1.8.9-Chunk mit genau einem Steinabschnitt. Das alte Format schreibt
+/// globale Blockzustands-IDs als little-endian `u16`, danach Block- und Himmelslicht sowie die
+/// 256 Biome der Spalte.
+fn legacy_chunk_packet(x: i32, z: i32, solid_section: usize, sky_light: Option<u8>) -> Buf {
+    // Die gemeinsamen Testplaene zaehlen moderne Abschnitte ab -64; 1.8.9 beginnt bei y=0.
+    let section = solid_section.saturating_sub(4).min(15);
+    let mut data = Vec::with_capacity(8192 + 2048 + 2048 + 256);
+    // Stein: Block-ID 1 in den oberen 12 Bits, Metadatenwert 0 in den unteren vier Bits.
+    for _ in 0..4096 {
+        data.extend_from_slice(&16u16.to_le_bytes());
+    }
+    data.extend_from_slice(&[0; 2048]); // kein Blocklicht
+    data.extend_from_slice(&[sky_light.unwrap_or(15) * 0x11; 2048]);
+    data.extend_from_slice(&[1; 256]); // Plains
+
+    let mut packet = Buf::packet(MC_1_8_9.cb_level_chunk);
+    packet
+        .i32(x)
+        .i32(z)
+        .bool(true)
+        .i16((1u16 << section) as i16)
+        .byte_array(&data);
+    packet
+}
+
+fn legacy_item_with_lore(buf: &mut Buf, id: i16, name: &str, lore: &[&str]) {
+    buf.i16(id).u8(1).i16(0); // Slot-Kopf
+    buf.u8(10).i16(0); // benanntes Wurzel-Compound mit leerem Namen
+    buf.u8(10).i16(7).raw(b"display");
+    buf.u8(8).i16(4).raw(b"Name").nbt_string(name);
+    buf.u8(9).i16(4).raw(b"Lore").u8(8).i32(lore.len() as i32);
+    for line in lore {
+        buf.nbt_string(line);
+    }
+    buf.u8(0).u8(0); // display und Wurzel schließen
 }
 
 /// Ein Gegenstand mit Anzeigename und Lore – die beiden Komponenten, die der Client wirklich liest.

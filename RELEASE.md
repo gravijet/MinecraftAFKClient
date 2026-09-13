@@ -1,7 +1,7 @@
 # Welche Release-Datei ist welche?
 
 Alle neuen Zusatzvarianten in dieser Tabelle sind **ausschließlich Rust-Clients**. Jede Rust-Datei
-spricht Minecraft `1.21.1`, `1.21.11`, `26.1` und `26.2`; die gewünschte Version wird beim Start
+spricht Minecraft `1.8.9`, `1.21.1`, `1.21.11`, `26.1` und `26.2`; die gewünschte Version wird beim Start
 mit `--mc <version>` gewählt. Windows-Dateien enden auf `.exe`, Linux-Dateien haben keine Endung.
 
 ## Rust-Dateien
@@ -78,16 +78,11 @@ die Zahlenformate der Zeilen bleiben erhalten. Dazu gehören farbige Punktwerte,
 ausgeblendete Zahlen. Mit `--events` werden sie zusätzlich als `@event board ...` mit `§`-Codes
 ausgegeben.
 
-## Java-Dateien
-
-`afk-1.21.1.jar`, `afk-1.21.11.jar`, `afk-26.1.jar` und `afk-26.2.jar` sind die bisherigen
-Java-Clients, jeweils für genau die im Dateinamen genannte Version. Die neuen Items-, POV-,
-Premium-Items- und Ultra-Varianten gibt es bewusst nur für Rust.
-
 ## Startbeispiele
 
 ```powershell
 .\items-afk-windows.exe mc.example.net --mc 26.1 --offline Testkonto
+.\afk-windows.exe mc.example.net --mc 1.8.9 --offline Testkonto
 .\pov-afk-windows.exe mc.example.net --mc 26.2 --account MeinKonto
 .\ultra-afk-windows.exe mc.example.net --mc 1.21.11 --account MeinKonto --antiafk 60
 ```

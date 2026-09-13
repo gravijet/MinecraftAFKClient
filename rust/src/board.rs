@@ -119,9 +119,15 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                     }
                 }
                 values::objective::ADD | values::objective::UPDATE => {
-                    let title = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
-                    r.var_int()?; // ScoreType (Integer/Hearts)
-                    let number = read_optional_number_format(r)?;
+                    let (title, number) = if shared.proto.legacy {
+                        let title = r.string()?;
+                        r.skip_string()?; // RenderType: "integer" oder "hearts"
+                        (title, None)
+                    } else {
+                        let title = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
+                        r.var_int()?; // ScoreType (Integer/Hearts)
+                        (title, read_optional_number_format(r)?)
+                    };
                     if inner.objectives.len() < MAX_ENTRIES || inner.objectives.contains_key(&name)
                     {
                         inner.objectives.insert(name, Objective { title, number });
@@ -134,6 +140,31 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         // Eintrag, Ziel, Punktzahl, optionaler Anzeigename und optionales Zahlenformat.
         In::Score => {
             let owner = r.string()?;
+            if shared.proto.legacy {
+                let action = r.var_int()?;
+                let objective = r.string()?;
+                if action == 1 {
+                    if let Some(entries) = inner.scores.get_mut(&objective) {
+                        entries.remove(&owner);
+                    }
+                    return Ok(());
+                }
+                let value = r.var_int()?;
+                if inner.scores.len() < MAX_ENTRIES || inner.scores.contains_key(&objective) {
+                    let entries = inner.scores.entry(objective).or_default();
+                    if entries.len() < MAX_ENTRIES || entries.contains_key(&owner) {
+                        entries.insert(
+                            owner,
+                            Score {
+                                value,
+                                display: None,
+                                number: None,
+                            },
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let objective = r.string()?;
             let value = r.var_int()?;
             let display = if r.bool()? {
@@ -221,6 +252,19 @@ fn read_team(shared: &Arc<Shared>, inner: &mut Inner, r: &mut Reader) -> std::io
 
     if action == values::team::CREATE || action == values::team::UPDATE {
         let team = match shared.proto.extra.team_layout {
+            TeamLayout::V1_8 => {
+                r.skip_string()?; // Anzeigename
+                let prefix = r.string()?;
+                let suffix = r.string()?;
+                r.u8()?; // Flags
+                r.skip_string()?; // Sichtbarkeit der Namensschilder
+                let color = team_color(r.i8()? as i32);
+                Team {
+                    prefix,
+                    suffix,
+                    color,
+                }
+            }
             TeamLayout::Legacy => {
                 nbt::read_network(r)?; // Anzeigename
                 r.u8()?; // Flags

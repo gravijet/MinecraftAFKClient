@@ -69,12 +69,20 @@ impl Nbt {
     }
 
     /// Textfeld eines Compounds – für `grass_color_modifier`.
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "items", feature = "pov"))]
     pub(crate) fn get_str<'a>(&'a self, key: &str) -> Option<&'a str> {
         self.get(key)?.as_str()
     }
 
-    fn as_str(&self) -> Option<&str> {
+    #[cfg(feature = "items")]
+    pub(crate) fn as_list(&self) -> Option<&[Nbt]> {
+        match self {
+            Nbt::List(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Nbt::Str(s) => Some(s),
             _ => None,
@@ -119,6 +127,19 @@ pub fn read_network(r: &mut Reader) -> io::Result<Nbt> {
     if tag == 0 {
         return Ok(Nbt::End);
     }
+    let mut budget = MAX_NODES;
+    read_payload(r, tag, 0, &mut budget)
+}
+
+/// Altes Netzwerk-NBT (bis 1.20.2): Typ-Byte, Wurzelname, dann Nutzdaten. Gegenstands-Slots in
+/// 1.8.9 benutzen dieses Format; Typ 0 bedeutet dort „kein NBT".
+#[cfg(feature = "items")]
+pub fn read_named(r: &mut Reader) -> io::Result<Nbt> {
+    let tag = r.u8()?;
+    if tag == 0 {
+        return Ok(Nbt::End);
+    }
+    let _root_name = read_nbt_string(r)?;
     let mut budget = MAX_NODES;
     read_payload(r, tag, 0, &mut budget)
 }

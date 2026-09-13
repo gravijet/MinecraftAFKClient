@@ -80,11 +80,45 @@ fn beitritt_chat_und_befehl() {
     let _ = child.kill();
 }
 
+/// Protokoll 47 hat weder Login-Bestätigung noch Konfigurationsphase. Dieser Ablauf prüft den
+/// vollständigen alten Pfad samt JSON-Chat, gemeinsamem Chat-/Befehlspaket und VarInt-KeepAlive.
+#[test]
+fn minecraft_1_8_9_beitritt_chat_befehl_und_keepalive() {
+    let server = common::start(&common::MC_1_8_9, plan_with_ground());
+    let mut child = common::spawn_client(
+        server.port,
+        "1.8.9",
+        &["--no-color", "--events", "-c", "/afk", "--join-delay", "0"],
+    );
+    let out = common::collect(child.stdout.take().unwrap());
+    let err = common::collect(child.stderr.take().unwrap());
+
+    let (joined, log) = common::wait_for(&err, TIMEOUT, "@event join");
+    assert!(joined, "1.8.9-Beitritt fehlgeschlagen. Ausgabe:\n{}", log);
+    let (chat, log) = common::wait_for(&out, TIMEOUT, "Willkommen auf dem Testserver");
+    assert!(chat, "1.8.9-Chat fehlte. Ausgabe:\n{}", log);
+    assert!(common::wait_note(&server.notes, TIMEOUT, |note| {
+        matches!(note, Note::Brand(brand) if brand == "example.invalid 1.8.9")
+    }));
+    assert!(common::wait_note(&server.notes, TIMEOUT, |note| {
+        matches!(note, Note::Command(command) if command == "afk")
+    }));
+    assert!(common::wait_note(&server.notes, TIMEOUT, |note| {
+        matches!(note, Note::Packet(0x00, 2))
+    }));
+    let _ = child.kill();
+}
+
 /// Die Client-Brand wird über Vanillas `minecraft:brand`-Payload unmittelbar beim
 /// Spielbeitritt gesendet und enthält immer die tatsächlich gewählte Minecraft-Version.
 #[test]
 fn client_brand_ist_versionsgenau_und_vollstaendig() {
-    for ids in [&common::MC_1_21_1, &common::MC_26_1, &common::MC_26_2] {
+    for ids in [
+        &common::MC_1_8_9,
+        &common::MC_1_21_1,
+        &common::MC_26_1,
+        &common::MC_26_2,
+    ] {
         let server = common::start(ids, plan_with_ground());
         let mut child = common::spawn_client(server.port, ids.name, &["--no-color"]);
         let expected = format!("example.invalid {}", ids.name);
@@ -892,7 +926,12 @@ fn cookies_ueberleben_den_transfer() {
 #[cfg(feature = "board")]
 #[test]
 fn seitenleiste_auf_allen_feldreihenfolgen() {
-    for ids in [&common::MC_1_21_1, &common::MC_26_1, &common::MC_26_2] {
+    for ids in [
+        &common::MC_1_8_9,
+        &common::MC_1_21_1,
+        &common::MC_26_1,
+        &common::MC_26_2,
+    ] {
         let mut plan = plan_with_ground();
         plan.scoreboard = true;
         let server = common::start(ids, plan);
@@ -929,7 +968,7 @@ fn seitenleiste_auf_allen_feldreihenfolgen() {
 #[cfg(feature = "items")]
 #[test]
 fn menue_inhalt_auf_beiden_komponententabellen() {
-    for ids in [&common::MC_1_21_1, &common::MC_26_1] {
+    for ids in [&common::MC_1_8_9, &common::MC_1_21_1, &common::MC_26_1] {
         let mut plan = plan_with_ground();
         plan.menu = true;
         let server = common::start(ids, plan);
@@ -1581,11 +1620,12 @@ fn browser_viewer_liefert_ein_texturiertes_bild() {
     let _ = child.kill();
 }
 
-/// Alle 25 Chunks müssen ankommen **und** lesbar sein – auf beiden Protokollformaten.
+/// Alle 25 Chunks müssen ankommen **und** lesbar sein – auch im alten 1.8.9-Format.
 #[cfg(feature = "pov")]
 #[test]
 fn pov_liest_alle_chunks() {
     for (ids, compression) in [
+        (&common::MC_1_8_9, None),
         (&common::MC_26_1, None),
         (&common::MC_1_21_1, None),
         // Chunk-Pakete sind die groessten, die je kommen – und auf einem echten Server sind sie

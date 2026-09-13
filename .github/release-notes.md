@@ -1,7 +1,7 @@
 ## Welche Datei ist welche?
 
-Die Zusatzvarianten sind ausschließlich Rust-Clients. Jede Rust-Datei unterstützt Minecraft
-`1.21.1`, `1.21.11`, `26.1` und `26.2`; ausgewählt wird mit `--mc <version>`.
+Alle Downloads sind Rust-Clients. Jede Datei unterstützt Minecraft `1.8.9`, `1.21.1`, `1.21.11`,
+`26.1` und `26.2`; ausgewählt wird mit `--mc <version>`.
 
 | Windows | Linux | Enthaltene Funktionen |
 | --- | --- | --- |
@@ -13,9 +13,35 @@ Die Zusatzvarianten sind ausschließlich Rust-Clients. Jede Rust-Datei unterstü
 | `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV mit Terminal-Fallback, texturiertem Browser-HUD, Menüs und Gegenständen |
 | `ultra-afk-windows.exe` | `ultra-afk-linux` | alle Rust-Funktionen in einer Datei: Premium, Items und mit `:pov live` zuschaltbare POV |
 
-Die vier Java-Dateien bleiben getrennt nach Protokollversion: `afk-1.21.1.jar`,
-`afk-1.21.11.jar`, `afk-26.1.jar` und `afk-26.2.jar`. Items-, POV-, Premium-Items- und
-Ultra-Varianten gibt es bewusst nur für Rust.
+Java und die vier JAR-Artefakte wurden vollständig aus Projekt und Release entfernt.
+
+---
+
+# Rust-Client 2.7.0 – Minecraft 1.8.9 und Rust-only
+
+Stand: 13. September 2026
+
+* **Minecraft 1.8.9 (Protokoll 47) ist in allen sieben Dateien enthalten.** Dazu gehören der alte
+  Login ohne Konfigurationsphase, VarInt-KeepAlive, JSON-Chat, die 100-Zeichen-Chatgrenze,
+  Teleports, Client-Einstellungen, Brand, Resource-Packs und Respawn.
+* **Premium-, Items- und POV-Funktionen verstehen die alten Formate.** Scoreboard-Teams und
+  Objectives, Fenster/Slots mit numerischen Item-IDs, Damage/Metadaten und benanntem NBT sowie
+  alte Chunk-, Licht-, Blockänderungs- und Entity-Pakete werden versionsabhängig gelesen und
+  geschrieben.
+* **Die 1.8.9-Browser-POV benutzt die echte Original-Client-JAR.** Eingebettet ist nur die
+  lückenlose Zuordnung der 4.096 Netzwerk-Blockzustände. Modelle und Texturen kommen weiterhin aus
+  der lokalen oder automatisch von Mojang geladenen, SHA-1-geprüften JAR; das alte
+  `models/item`-/`textures/items`-Layout wird unterstützt.
+* **Das Projekt ist jetzt vollständig Rust-only.** Java-Quellen, Gradle-Wrapper, Java-Buildjob,
+  lokale Java-Buildpfade und JAR-Downloads sind entfernt. `latest` enthält nur noch `RELEASE.md`
+  und je sieben Windows- und Linux-Binaries.
+* **Die Protokolldaten sind nachvollziehbar dokumentiert.** Paket-IDs, 581 alte Item-/Metadaten-
+  Kombinationen und die State-Tabelle sind mit Quellen und Prüfsummen in `rust/data/README.md`
+  festgehalten.
+* **Geprüfter Release-Build:** Rustfmt und Clippy laufen mit allen Targets/Features ohne Warnung;
+  die optimierten Basisläufe bestehen 95 Modul- und 29 Socket-Tests, der All-Features-Lauf 169
+  Modul- und 49 Socket-Tests. Zusätzlich lädt ein Integrationstest die offizielle
+  1.8.9-Client-JAR und rendert daraus Block- und Itemressourcen.
 
 ---
 

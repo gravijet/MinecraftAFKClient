@@ -1,8 +1,7 @@
 # Funktionen im Detail
 
 Diese Datei beschreibt die Rust-Bauformen und ihre Grenzen. Die konkreten Downloadnamen stehen
-zusätzlich in [RELEASE.md](RELEASE.md). Die neuen Zusatzfunktionen werden ausschließlich für Rust
-gebaut; der Java-Code bleibt davon unberührt.
+zusätzlich in [RELEASE.md](RELEASE.md).
 
 ## Die sieben Rust-Bauformen
 
@@ -22,7 +21,7 @@ Tablist und Playerlist sind aus sämtlichen Rust-Varianten entfernt.
 
 Jede Bauform **nimmt trotzdem die Optionen aller anderen an** und meldet nur, dass sie sie
 ignoriert – ein Panel kann also allen Dateien dieselbe Befehlszeile schicken, ohne vorher zu
-wissen, welche vor ihm steht. Dasselbe gilt für den Java-Client in beide Richtungen.
+wissen, welche vor ihm steht.
 
 ## Grundfunktionen jeder Rust-Datei
 
@@ -30,7 +29,7 @@ wissen, welche vor ihm steht. Dasselbe gilt für den Java-Client in beide Richtu
 
 | Funktion | Bedienung/Verhalten |
 | --- | --- |
-| Vier Minecraft-Versionen | `--mc 1.21.1 \| 1.21.11 \| 26.1 \| 26.2` (Standard `26.1`) |
+| Fünf Minecraft-Versionen | `--mc 1.8.9 \| 1.21.1 \| 1.21.11 \| 26.1 \| 26.2` (Standard `26.1`) |
 | SRV-Auflösung | automatisch, sofern kein Port angegeben wurde |
 | IPv6 | z. B. `[::1]:25566` |
 | SOCKS5-/HTTP-Proxy | `--proxy <adresse>` |
@@ -179,9 +178,9 @@ Die Gegenstandsvarianten lesen pro Slot:
 - leere und serverseitig aktualisierte Felder;
 - das eigene Inventar (Fenster 0 und ab 1.21.11 Einzelupdates).
 
-Die Vanilla-ID-Namenslisten stammen aus den offiziellen Mojang-Server-JARs und sind je Version
-getrennt; Herkunft, SHA-1 und Eintragszahl stehen in `rust/data/README.md`. Die Komponententabelle
-ist ebenfalls versionsabhängig und aus den Codec-Jars der vier Protokolle abgelesen.
+Die Vanilla-ID-Namenslisten sind je Version getrennt; Herkunft, Prüfsummen und Eintragszahl stehen
+in `rust/data/README.md`. 1.8.9 verwendet numerische IDs plus Metadaten und altes NBT, die neueren
+Versionen Registry-IDs und Komponenten.
 Da Item-Komponenten im Paket keine eigene Längenangabe haben, stoppt ein nicht hinterlegter Typ das
 Lesen des restlichen Pakets mit einer sichtbaren Warnung. Er wird nicht geraten und trennt die
 Verbindung nicht.
@@ -520,7 +519,7 @@ Paket-IDs, Textformatierung, Item-Komponenten, Chunk-Paletten und Koordinaten-Pa
 
 Geraten wird dabei nicht. Beispiel `LightUpdate`: Die Serverpakete werden in
 `MinecraftCodec.CODEC` alphabetisch nach Registrierungsnamen eingetragen, und `light_update` steht
-zwischen `level_particles` und `login`. Also gilt in **jeder** der vier Tabellen
+zwischen `level_particles` und `login`. Also gilt in **jeder** der vier modernen Tabellen
 `cb_light_update == cb_login - 1 == cb_level_chunk + 3` – nachgerechnet ergibt das 42, 47 und 48.
 Ein Test hält diese Beziehung fest, damit sie beim nächsten Protokoll auffällt, statt still falsch
 zu werden.

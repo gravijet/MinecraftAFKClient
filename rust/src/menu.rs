@@ -68,6 +68,24 @@ fn menu_type(kind: i32) -> &'static str {
         .unwrap_or("unknown")
 }
 
+/// Alte Fenstertyp-Namen auf die internen modernen Namen abbilden, die der Browser bereits kennt.
+#[cfg(feature = "pov")]
+fn legacy_menu_type(kind: &str, slots: usize) -> i32 {
+    match kind {
+        "minecraft:chest" | "minecraft:container" => (slots / 9).clamp(1, 6) as i32 - 1,
+        "minecraft:dispenser" | "minecraft:dropper" => 6,
+        "minecraft:anvil" => 8,
+        "minecraft:beacon" => 9,
+        "minecraft:brewing_stand" => 11,
+        "minecraft:crafting_table" => 12,
+        "minecraft:enchanting_table" => 13,
+        "minecraft:furnace" => 14,
+        "minecraft:hopper" => 16,
+        "minecraft:villager" => 19,
+        _ => -1,
+    }
+}
+
 /// Ein geöffnetes Fenster.
 struct Open {
     /// Fenster-Nummer des Servers. Vanilla vergibt 1..100 – klein genug, dass VarInt und
@@ -124,11 +142,28 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
     match kind {
         // Fenster-Nummer, Typ, Überschrift.
         In::OpenScreen => {
-            let id = r.var_int()?;
-            let kind = r.var_int()?;
+            let (id, kind, title, announced_slots) = if shared.proto.legacy {
+                let id = r.u8()? as i32;
+                let old_kind = r.string()?;
+                #[cfg(not(feature = "pov"))]
+                let _ = &old_kind;
+                let title = nbt::render_json(&r.string()?, Fmt::Legacy);
+                let slots = r.u8()? as usize;
+                #[cfg(feature = "pov")]
+                let kind = legacy_menu_type(&old_kind, slots);
+                #[cfg(not(feature = "pov"))]
+                let kind = -1;
+                (id, kind, title, slots)
+            } else {
+                (
+                    r.var_int()?,
+                    r.var_int()?,
+                    nbt::render(&nbt::read_network(r)?, Fmt::Legacy),
+                    0,
+                )
+            };
             #[cfg(not(feature = "pov"))]
             let _ = kind;
-            let title = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
             shared.console.info(&format!(
                 "Menü geöffnet: {} (:menu, :click <feld>)",
                 shared.console.text(&title)
@@ -142,7 +177,7 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 kind,
                 title,
                 state: 0,
-                slots: 0,
+                slots: announced_slots,
                 #[cfg(feature = "items")]
                 items: Vec::new(),
                 #[cfg(feature = "items")]
@@ -153,10 +188,14 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         // Fenster-Nummer, Zustandszähler, Feldanzahl – danach die Gegenstände.
         In::ContainerContent => {
             let id = read_container_id(shared, r)?;
-            let state = r.var_int()?;
+            let state = if shared.proto.legacy { 0 } else { r.var_int()? };
             // Gedeckelt wie der gelesene Inhalt: sonst stünde in `:menu` eine Feldzahl, die es
             // gar nicht geben kann, und `:click` prüfte gegen sie.
-            let slots = (r.var_int()?.max(0) as usize).min(MAX_SLOTS);
+            let slots = if shared.proto.legacy {
+                (r.i16()?.max(0) as usize).min(MAX_SLOTS)
+            } else {
+                (r.var_int()?.max(0) as usize).min(MAX_SLOTS)
+            };
             #[cfg(feature = "items")]
             let content = read_content(shared, r, slots);
 
@@ -184,7 +223,7 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         // Fenster-Nummer, Zustandszähler, Feld, Gegenstand.
         In::ContainerSlot => {
             let id = read_container_id(shared, r)?;
-            let state = r.var_int()?;
+            let state = if shared.proto.legacy { 0 } else { r.var_int()? };
             #[cfg(feature = "items")]
             let slot = r.i16()?;
             #[cfg(feature = "items")]
@@ -323,10 +362,16 @@ fn read_item_slot_with(
     let mut slot = items::read_slot(shared.proto, r)?;
     if let Some(item) = slot.item.as_mut() {
         if item.name.is_none() {
-            item.name = usize::try_from(item.id)
-                .ok()
-                .and_then(|id| names.get(id).cloned())
-                .or_else(|| crate::item_names::get(shared.proto.name, item.id).map(str::to_string));
+            item.name = if shared.proto.legacy {
+                crate::item_names::get_legacy(item.id, item.legacy_damage).map(str::to_string)
+            } else {
+                usize::try_from(item.id)
+                    .ok()
+                    .and_then(|id| names.get(id).cloned())
+                    .or_else(|| {
+                        crate::item_names::get(shared.proto.name, item.id).map(str::to_string)
+                    })
+            };
         }
     }
     Ok(slot)
@@ -640,12 +685,26 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) -> bool {
 
     let mut w = Writer::packet(shared.proto.extra.sb_container_click);
     write_container_id(shared, &mut w, id);
-    w.var_int(state);
-    w.u16(slot as u16); // Feldnummer ist ein Short
-    w.u8(button);
-    w.u8(mode);
-    w.var_int(0); // keine geänderten Felder – die rechnet der Server ohnehin selbst nach
-    w.u8(0); // nichts in der Hand
+    if shared.proto.legacy {
+        let action = state.wrapping_add(1) as i16;
+        w.i16(slot as i16);
+        w.u8(button);
+        w.i16(action);
+        w.u8(mode);
+        w.i16(-1); // leerer angeklickter Slot
+        if let Some(current) = shared.extras.menu.open.lock().unwrap().as_mut() {
+            if current.id == id {
+                current.state = action as i32;
+            }
+        }
+    } else {
+        w.var_int(state);
+        w.u16(slot as u16); // Feldnummer ist ein Short
+        w.u8(button);
+        w.u8(mode);
+        w.var_int(0); // keine geänderten Felder – die rechnet der Server ohnehin selbst nach
+        w.u8(0); // nichts in der Hand
+    }
     shared.send(w);
     shared.console.info(&format!("Feld {} angeklickt.", slot));
     true

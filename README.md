@@ -4,13 +4,12 @@ Schlanker Minecraft-AFK-Client. Er meldet sich mit einem Microsoft-Konto an, tri
 bei, bleibt verbunden und zeigt den Chat. Kein Menü, keine Konfigurationsdatei: **alles steht im
 Startbefehl.**
 
-Es gibt den Rust-Client in getrennten Bauformen und den bisherigen Java-Client:
+Den Rust-Client gibt es in sieben getrennten Bauformen:
 
 | | Datei | Minecraft-Versionen | Verbrauch |
 | --- | --- | --- | --- |
-| **Rust** (empfohlen) | `afk-windows.exe`, `afk-linux` | alle vier in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 4 Threads (Netz, Senden, je Ausgabestrom einer) |
+| **Rust** | `afk-windows.exe`, `afk-linux` | alle fünf in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 4 Threads (Netz, Senden, je Ausgabestrom einer) |
 | **Rust mit Zusätzen** | `items-afk-*`, `premium-afk-*`, `premium-items-afk-*`, `pov-afk-*`, `ultra-afk-*` | dieselbe eine Datei je Bauform | nur die jeweils genannten Funktionen sind einkompiliert |
-| **Java** | `afk-1.21.1.jar` … `afk-26.2.jar` | eine Jar je Version | ~10 MB Jar, 40–70 MB RAM |
 
 Der **Premium-Client** kann alles, was der schlanke kann, plus Bewegung, farbiges Scoreboard,
 Menü-Klicks und automatisches Anti-AFK. Eigene zusätzliche Dateien liefern sichtbare Gegenstände,
@@ -18,10 +17,6 @@ eine echte paketbasierte Live-POV oder alles zusammen als Ultra. Wer nur AFK ste
 schlanken Client – er ist kleiner und hält im Leerlauf keinen Welt-/Menüzustand. Die exakte
 Dateiauswahl steht in **[RELEASE.md](RELEASE.md)**, der Funktionsvergleich in
 **[FEATURES.md](FEATURES.md)**.
-
-Warum beim Java-Client eine Jar pro Version: MCProtocolLib spricht pro Build genau ein Protokoll.
-Alle vier in eine Jar zu packen hieße vierfache Größe und Classloader-Trickserei – der Rust-Client
-löst das sauberer, weil er das Protokoll selbst spricht.
 
 ## Download
 
@@ -40,34 +35,25 @@ afk --login
 afk mc.example.net --mc 26.1 -c 300:/afk
 ```
 
-Mit dem Java-Client genauso, nur mit `java -jar`:
-
-```bash
-java -jar afk-26.1.jar --login
-java -jar afk-26.1.jar mc.example.net -c 300:/afk
-```
-
 ## Optionen
 
-Die Grundoptionen verstehen beide Clients gleich. Die mit **R** markierten gibt es nur im
-Rust-Client, die mit **P** nur im Premium-Build, die mit **V** nur in den POV-Bauformen. Jede
+Die mit **P** markierten Optionen gibt es nur im Premium-Build, die mit **V** nur in den
+POV-Bauformen. Jede
 Bauform **nimmt auch die Optionen der anderen an** und sagt nur, dass sie sie ignoriert – so kann
-das Panel allen Bauformen dieselbe Befehlszeile schicken. Das gilt in beide Richtungen: der
-Java-Client schluckt `--offline`, `--proxy`, `--pov …`. Die Reconnect-Schalter verstehen inzwischen
-**beide** gleich – auch `--reconnect-tries`, das es vorher nur im Rust-Client gab.
+das Panel allen Bauformen dieselbe Befehlszeile schicken.
 
 | Option | Bedeutung |
 | --- | --- |
 | `-s`, `--server <host[:port]>` | Serveradresse. Geht auch ohne `-s` als erstes Argument. Ohne Port wird der SRV-Eintrag gefragt. |
 | `-a`, `--account <name>` | gespeichertes Konto (Standard: das erste) |
-| `--offline <name>` | **R** Offline-/Cracked-Konto statt Microsoft-Login. Nur auf Servern mit `online-mode=false`. |
-| `-m`, `--mc <version>` | `1.21.1` \| `1.21.11` \| `26.1` \| `26.2` (Standard `26.1`). Beim Java-Client muss die Angabe zur Jar passen. |
-| `--proxy <adresse>` | **R** Spielverbindung über `socks5://[nutzer:pass@]host:port` oder `http://...` |
-| `--fakehost <host[:port]>` | **R** diese Adresse im Handshake statt der echten (TCP geht weiter ans echte Ziel) |
+| `--offline <name>` | Offline-/Cracked-Konto statt Microsoft-Login. Nur auf Servern mit `online-mode=false`. |
+| `-m`, `--mc <version>` | `1.8.9` \| `1.21.1` \| `1.21.11` \| `26.1` \| `26.2` (Standard `26.1`). |
+| `--proxy <adresse>` | Spielverbindung über `socks5://[nutzer:pass@]host:port` oder `http://...` |
+| `--fakehost <host[:port]>` | diese Adresse im Handshake statt der echten (TCP geht weiter ans echte Ziel) |
 | `-c`, `--cmd [sek:]<befehl>` | Befehl nach dem Beitritt, mehrfach angebbar. Ohne `sek:` einmalig, sonst alle `sek` Sekunden. Beispiel: `-c 300:/afk` |
 | `--join-delay <sek>` | Wartezeit nach dem Beitritt vor dem ersten Befehl (Standard 4) |
-| `--on <auslöser>=<aktion>` | **R** Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
-| `--on-cooldown <sek>` | **R** Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
+| `--on <auslöser>=<aktion>` | Makro. Auslöser: `join`, `world`, `death`, `chat:<text>`. Mehrfach angebbar. |
+| `--on-cooldown <sek>` | Sperrzeit je Regel (Standard 3), damit sich eine Regel nicht selbst nachtriggert |
 | `--chat-delay <ms>` | Mindestabstand ausgehender Nachrichten (Standard 1000, gegen Spam-Kick) |
 | `--no-reconnect` | nach einem Abbruch **nicht** neu verbinden, sondern mit Status 1 enden |
 | `--reconnect-delay <sek>` | Wartezeit vor dem ersten Versuch (Standard 5) |
@@ -76,7 +62,7 @@ Java-Client schluckt `--offline`, `--proxy`, `--pov …`. Die Reconnect-Schalter
 | `--view-distance <n>` | dem Server gemeldete Sichtweite in Chunks, 2–32. Standard 2 – die POV-Bauformen 6, weil nur sie Chunks überhaupt auswerten. Kleiner heißt weniger Bandbreite, CPU und RAM. Auch `--sichtweite`. |
 | `--no-color` | keine ANSI-Farben |
 | `-q`, `--quiet` | keine Statusmeldungen – wirklich nur Chat |
-| `--events` | **R** zusätzlich maschinenlesbare `@event …`-Zeilen (auch mit `-q`) |
+| `--events` | zusätzlich maschinenlesbare `@event …`-Zeilen (auch mit `-q`) |
 | `--antiafk <sek>` | **P** alle `sek` Sekunden eine kleine Bewegung (mindestens 15, `0` = aus) |
 | `--sneak` | **P** beim Beitritt geduckt bleiben |
 | `--pov <an\|aus>` | **V** Live-Ansicht gleich nach dem Beitritt starten. Standard: POV-Datei `an`, Ultra `aus`. |
@@ -144,7 +130,7 @@ werden sie verworfen.
 
 Die Microsoft-Anmeldung läuft über den Device-Code-Flow (Code eingeben, kein Browser-Callback).
 Jedes Konto liegt als eigene Datei unter `~/.config/afksystems/accounts/<name>.json` (unter Windows
-`%USERPROFILE%\.config\afksystems\`). Beide Clients teilen sich dieses Verzeichnis; ein früher
+`%USERPROFILE%\.config\afksystems\`). Ein früher
 angelegtes `hugoafk`-Verzeichnis wird beim ersten Start einmalig umbenannt.
 
 Mehrere Konten: einfach mehrfach `--login`, danach mit `--account <name>` auswählen. Geladen wird
@@ -152,39 +138,35 @@ immer nur das aktive Konto.
 
 ## Unterstützte Versionen
 
-| `--mc` | Protokoll | Java-Client baut gegen |
-| --- | --- | --- |
-| `1.21.1` | 767 | `protocol-1.21` (Snapshot vom 10.10.2024, fest gepinnt) |
-| `1.21.11` | 774 | `protocol-1.21.11-1` |
-| `26.1` | 775 | `protocol-26.1-1` |
-| `26.2` | 776 | `protocol-26.2-SNAPSHOT` (Protokoll noch in Bewegung) |
+| `--mc` | Protokoll |
+| --- | ---: |
+| `1.8.9` | 47 |
+| `1.21.1` | 767 |
+| `1.21.11` | 774 |
+| `26.1` | 775 |
+| `26.2` | 776 |
 
-Der Rust-Client spricht alle vier selbst. Seine Paket-IDs sind nicht geraten, sondern aus der
+Der Rust-Client spricht alle fünf selbst. Seine Paket-IDs sind nicht geraten, sondern für 1.8.9
+aus den veröffentlichten Protokolldaten und für die neueren Versionen aus der
 Registrierungsreihenfolge im `MinecraftCodec` der jeweiligen MCProtocolLib-Fassung abgelesen
 (siehe Kopf von `rust/src/proto.rs`) – **bei einem Minecraft-Update dort neu ablesen, nicht raten.**
 Zwischen 1.21.1 und den neueren Versionen unterscheiden sich außerdem mehrere Paketformate. Die
 gemeinsamen Unterschiede hängen an `Protocol::modern`; weitere klar getrennte Weichen beschreiben
 beispielsweise Team-Pakete, Chunk-Abschnitte und Gegenstandskomponenten.
 
-Beim Java-Client steckt derselbe Unterschied in `Net` – einmal in `java/src/api-legacy/java`
-(1.21.1) und einmal in `java/src/api-modern/java`. Der übrige Code kennt ihn nicht.
-
 ## Selbst bauen
 
 ```powershell
-.\build-all.ps1                          # alle vier Jars + alle sieben Rust-Dateien nach dist\
-.\build-all.ps1 -Only rust               # nur alle sieben Rust-Dateien
+.\build-all.ps1                          # alle sieben Rust-Dateien nach dist\
 ```
 
 ```bash
-./build-all.sh                           # alle vier Jars + alle sieben Rust-Dateien nach dist/
-./build-all.sh --only rust               # nur alle sieben Rust-Dateien
+./build-all.sh                           # alle sieben Rust-Dateien nach dist/
 ```
 
 Einzeln:
 
 ```bash
-./gradlew :java:shadowJar -Pmc=26.1     # -> java/build/libs/afk-26.1.jar
 cd rust && cargo build --release        # -> rust/target/release/afk[.exe]
 cd rust && cargo test --features ultra  # Unit- und Ende-zu-Ende-Tests
 ```
@@ -193,16 +175,8 @@ cd rust && cargo test --features ultra  # Unit- und Ende-zu-Ende-Tests
 Prozess und lässt die wirklich gebaute Datei dagegen laufen – Beitritt, Chat, Befehle, gemeldete
 Sichtweite und das Bildformat der Live-POV werden also am Socket geprüft, nicht nur im Kopf.
 
-Gradle braucht ein **JDK 21** (unter Java 25 startet es nicht); die fertigen Jars laufen auf jedem
-Java ab 21. Der Rust-Client braucht nur eine stabile Rust-Toolchain – unter Windows mit
+Der Client braucht nur eine stabile Rust-Toolchain – unter Windows mit
 GNU-Toolchain aus PowerShell bauen (aus Git Bash verdeckt `link.exe` von coreutils den Linker).
-
-Sparsame JVM-Flags für den Dauerbetrieb:
-
-```bash
-java -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -Xmx96m -Dio.netty.eventLoopThreads=1 \
-     -jar afk-26.1.jar mc.example.net -c 300:/afk
-```
 
 ## Bewegung (eigene Bauform)
 
@@ -210,7 +184,6 @@ Der schlanke Client bewegt sich **nie**. Wer gesteuerte Bewegung will (`:go`, `:
 `:route`, `:jump`, `:stop`, `:pos`), baut die zweite Bauform:
 
 ```bash
-./gradlew :java:shadowJar -Pmc=26.1 -Pmove=true   # afk-26.1-move.jar
 cd rust && cargo build --release --features movement --target-dir target/movement
 ```
 
@@ -218,7 +191,7 @@ Im schlanken Build ist davon keine einzige Klasse bzw. kein Byte enthalten. Die 
 Heimatposition und Routen in `movement.json` neben den Konten. `:fall` ist ohne eingelesene
 Weltkollision bewusst deaktiviert; der Client tastet nicht mit erfundenen Y-Positionen nach Boden.
 
-## Premium-Client (eigene Datei, nur Rust)
+## Premium-Client (eigene Datei)
 
 `premium-afk-windows.exe` / `premium-afk-linux` enthält alles vom schlanken Client **und** von der
 Bewegungs-Bauform, dazu:
@@ -293,7 +266,6 @@ rust/     Rust-Client (Cargo)      – proto.rs = Paket-IDs, client.rs = Ablauf,
           rules.rs/proxy.rs        – Makros und Proxy (auch im schlanken Build)
           extras.rs               – gemeinsame, feature-gesteuerte Zusatz-Verteilerstelle
           board.rs/menu.rs/items.rs/antiafk.rs/pov.rs – getrennte Rust-Zusatzfunktionen
-java/     Java-Client (Gradle)     – src/main = Ablauf, src/api-* = Versionsunterschiede, src/move = Bewegung
 RELEASE.md    genaue Erklärung jeder Release-Datei
 FEATURES.md   was welcher Client kann – und was bewusst fehlt
 .github/  Workflow: baut bei jedem Push auf main alles und ersetzt das Release "latest"

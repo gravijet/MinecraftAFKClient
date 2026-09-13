@@ -220,6 +220,7 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 
         #[cfg(feature = "pov")]
         In::LevelChunk
+        | In::LevelChunkBulk
         | In::ForgetChunk
         | In::BlockUpdate
         | In::SectionBlocks
@@ -388,7 +389,9 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
         }
         if matches!(verb, "swing" | "schlag" | "schlage" | "arm") {
             let mut w = Writer::packet(shared.proto.extra.sb_swing);
-            w.var_int(0); // Haupthand
+            if !shared.proto.legacy {
+                w.var_int(0); // Haupthand; 1.8.9 hat keine Nutzlast
+            }
             shared.send(w);
             shared.console.info("Arm geschwungen.");
             return true;
@@ -517,6 +520,18 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
 #[cfg(feature = "state")]
 fn use_item(shared: &Arc<Shared>) {
     let mut w = Writer::packet(shared.proto.extra.sb_use_item);
+    if shared.proto.legacy {
+        // Rechtsklick in die Luft: Blockposition (-1, 255, -1), Seite 255, kein mitgesendeter
+        // Gegenstand und neutrale Cursorposition. Genau dieses BlockPlacement-Paket benutzt 1.8.9.
+        let position = (0x3ff_ffff_i64 << 38) | (255_i64 << 26) | 0x3ff_ffff_i64;
+        w.i64(position);
+        w.u8(255);
+        w.i16(-1);
+        w.raw(&[0, 0, 0]);
+        shared.send(w);
+        shared.console.info("Gegenstand benutzt (Rechtsklick).");
+        return;
+    }
     w.var_int(0); // Haupthand
     let sequence = shared
         .extras
@@ -607,7 +622,6 @@ mod tests {
                 ("sb_swing", e.sb_swing),
                 ("sb_use_item", e.sb_use_item),
                 ("cb_level_chunk", e.cb_level_chunk),
-                ("cb_forget_level_chunk", e.cb_forget_level_chunk),
                 ("cb_block_update", e.cb_block_update),
                 ("cb_section_blocks_update", e.cb_section_blocks_update),
                 ("cb_add_entity", e.cb_add_entity),
@@ -615,9 +629,17 @@ mod tests {
                 ("cb_move_entity_pos", e.cb_move_entity_pos),
                 ("cb_move_entity_pos_rot", e.cb_move_entity_pos_rot),
                 ("cb_teleport_entity", e.cb_teleport_entity),
-                ("player_entity_type", e.player_entity_type),
             ] {
                 assert!(id > 0, "{} fehlt in {}", name, p.name);
+            }
+            if p.legacy {
+                assert_eq!(e.cb_forget_level_chunk, -1);
+                assert_eq!(e.player_entity_type, -1);
+                assert!(e.cb_level_chunk_bulk > 0);
+            } else {
+                assert!(e.cb_forget_level_chunk > 0);
+                assert!(e.player_entity_type > 0);
+                assert_eq!(e.cb_level_chunk_bulk, -1);
             }
             let only_modern = [
                 ("cb_entity_position_sync", e.cb_entity_position_sync),
