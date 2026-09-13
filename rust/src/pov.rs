@@ -1475,7 +1475,7 @@ fn legacy_section(raw: &[u8]) -> Option<Section> {
     let mut by_state = HashMap::new();
     by_state.insert(0u32, 0u16);
     let mut indices = Vec::with_capacity(SECTION_BLOCKS);
-    for bytes in raw.chunks_exact(2) {
+    for bytes in raw.as_chunks::<2>().0 {
         let state = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
         let slot = match by_state.get(&state) {
             Some(slot) => *slot,
