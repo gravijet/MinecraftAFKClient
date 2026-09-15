@@ -4,12 +4,12 @@ Schlanker Minecraft-AFK-Client. Er meldet sich mit einem Microsoft-Konto an, tri
 bei, bleibt verbunden und zeigt den Chat. Kein Menü, keine Konfigurationsdatei: **alles steht im
 Startbefehl.**
 
-Den Rust-Client gibt es in sieben getrennten Bauformen:
+Den Rust-Client gibt es in acht getrennten Bauformen:
 
 | | Datei | Minecraft-Versionen | Verbrauch |
 | --- | --- | --- | --- |
 | **Rust** | `afk-windows.exe`, `afk-linux` | alle fünf in *einer* Datei, Auswahl über `--mc` | ~1 MB Datei, wenige MB RAM, 4 Threads (Netz, Senden, je Ausgabestrom einer) |
-| **Rust mit Zusätzen** | `items-afk-*`, `premium-afk-*`, `premium-items-afk-*`, `pov-afk-*`, `ultra-afk-*` | dieselbe eine Datei je Bauform | nur die jeweils genannten Funktionen sind einkompiliert |
+| **Rust mit Zusätzen** | `items-afk-*`, `items-web-afk-*`, `premium-afk-*`, `premium-items-afk-*`, `pov-afk-*`, `ultra-afk-*` | dieselbe eine Datei je Bauform | nur die jeweils genannten Funktionen sind einkompiliert |
 
 Der **Premium-Client** kann alles, was der schlanke kann, plus Bewegung, farbiges Scoreboard,
 Menü-Klicks und automatisches Anti-AFK. Eigene zusätzliche Dateien liefern sichtbare Gegenstände,
@@ -38,7 +38,8 @@ afk mc.example.net --mc 26.1 -c 300:/afk
 ## Optionen
 
 Die mit **P** markierten Optionen gibt es nur im Premium-Build, die mit **V** nur in den
-POV-Bauformen. Jede
+POV-Bauformen, die mit **W** in den POV-Bauformen und zusätzlich in `items-web-afk-*` (Browser mit
+Hotbar/Menü, aber ohne Kamerabild). Jede
 Bauform **nimmt auch die Optionen der anderen an** und sagt nur, dass sie sie ignoriert – so kann
 das Panel allen Bauformen dieselbe Befehlszeile schicken.
 
@@ -68,8 +69,8 @@ das Panel allen Bauformen dieselbe Befehlszeile schicken.
 | `--pov <an\|aus>` | **V** Live-Ansicht gleich nach dem Beitritt starten. Standard: POV-Datei `an`, Ultra `aus`. |
 | `--pov-size <b>x<h>` | **V** Auflösung der Live-Ansicht, 24–160 × 12–80 (Standard 64x32). Trennzeichen `x`, `*`, `:` oder Leerzeichen; auch `--pov-groesse`. |
 | `--pov-fps <n>` | **V** Bilder je Sekunde, 1–20 (Standard 8) |
-| `--pov-web <port\|ip:port>` | **V** texturierten, token-geschützten Browser-Viewer starten; nur eine Portnummer bindet an `127.0.0.1` |
-| `--pov-resources <jar\|auto\|aus>` | **V** woher die echten Texturen kommen. Standard `auto`: vorhandene Minecraft-Installation benutzen, sonst einmalig von Mojang laden und im Konfigverzeichnis ablegen. Ein Pfad erzwingt genau diese JAR, `aus` verzichtet auf Texturen. |
+| `--pov-web <port\|ip:port>` | **W** texturierten, token-geschützten Browser-Viewer starten; nur eine Portnummer bindet an `127.0.0.1` |
+| `--pov-resources <jar\|auto\|aus>` | **W** woher die echten Texturen kommen. Standard `auto`: vorhandene Minecraft-Installation benutzen, sonst einmalig von Mojang laden und im Konfigverzeichnis ablegen. Ein Pfad erzwingt genau diese JAR, `aus` verzichtet auf Texturen. |
 | `--login` | Microsoft-Konto anmelden und beenden |
 | `--accounts` | gespeicherte Konten auflisten und beenden |
 | `-h`, `--help` | Hilfe |
@@ -157,11 +158,11 @@ beispielsweise Team-Pakete, Chunk-Abschnitte und Gegenstandskomponenten.
 ## Selbst bauen
 
 ```powershell
-.\build-all.ps1                          # alle sieben Rust-Dateien nach dist\
+.\build-all.ps1                          # alle acht Rust-Dateien nach dist\
 ```
 
 ```bash
-./build-all.sh                           # alle sieben Rust-Dateien nach dist/
+./build-all.sh                           # alle acht Rust-Dateien nach dist/
 ```
 
 Einzeln:
@@ -222,6 +223,17 @@ cd rust && cargo build --release --features premium,items --target-dir target/pr
 
 Standarditems erhalten dabei ihren versionsgenauen `minecraft:...`-Ressourcennamen aus den
 offiziellen Mojang-Registry-Reports; benutzerdefinierte Namen und Lore behalten ihre `§`-Farbcodes.
+
+Für Hotbar und Menü/Inventar mit **echten Texturen im Browser**, aber ohne Chunks, Weltspeicher
+oder Kamerabild, gibt es eine eigene, ebenfalls schlanke Datei:
+
+```bash
+cd rust && cargo build --release --features web-menu --target-dir target/web-menu
+```
+
+Sie liest dieselbe Original-Client-JAR wie die Live-POV (Item-Icons, Hotbar-Sprite,
+Behälter-Hintergründe), rendert aber nichts von der Welt – `--pov-web`/`--pov-resources` starten
+den Browser genauso wie bei `pov-afk`/`ultra-afk`, nur ohne `--pov`/`--pov-size`/`--pov-fps`.
 
 Die eigene POV-Datei startet nach dem Beitritt automatisch eine Live-First-Person-Ansicht aus den
 empfangenen Chunk-, Block- und Entity-Paketen. Gezeichnet wird mit dem **Licht**, das der Server

@@ -8,12 +8,41 @@ Alle Downloads sind Rust-Clients. Jede Datei unterstützt Minecraft `1.8.9`, `1.
 | `afk-windows.exe` | `afk-linux` | kleiner Basisclient: Verbindung, Chat, Befehle und Makros |
 | `afk-windows-move.exe` | `afk-linux-move` | Basisclient plus manuelle Bewegung, Blickrichtung, Routen und Sprung/Fall |
 | `items-afk-windows.exe` | `items-afk-linux` | Basisclient plus Menü-Klicks und sichtbare Menü-/Inventargegenstände mit Anzahl, Name, Farbcodes und Lore |
+| `items-web-afk-windows.exe` | `items-web-afk-linux` | wie items-afk, plus Hotbar und Menü/Inventar mit echten Texturen im Browser – ohne Chunks, Weltspeicher oder Kamerabild |
 | `premium-afk-windows.exe` | `premium-afk-linux` | Bewegung, formatiertes Scoreboard, Menü-Klicks, Tastenzustand und Anti-AFK; ohne Gegenstandsdaten und POV-Weltspeicher |
 | `premium-items-afk-windows.exe` | `premium-items-afk-linux` | Premium plus sichtbare Menü- und Inventargegenstände mit Namen, Farben und Lore |
 | `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV mit Terminal-Fallback, texturiertem Browser-HUD, Menüs und Gegenständen |
 | `ultra-afk-windows.exe` | `ultra-afk-linux` | alle Rust-Funktionen in einer Datei: Premium, Items und mit `:pov live` zuschaltbare POV |
 
 Java und die vier JAR-Artefakte wurden vollständig aus Projekt und Release entfernt.
+
+---
+
+# Rust-Client 2.8.0 – Browser-Menü ohne Live-Ansicht
+
+Stand: 15. September 2026
+
+* **Neue, achte Bauform `items-web-afk`.** Hotbar und Menü/Inventar erscheinen im Browser mit
+  denselben echten Texturen wie die Live-POV (Item-Icons, Hotbar-Sprite, Behälter-Hintergründe aus
+  der Original-Client-JAR) – aber **ohne** Kamerabild, Chunks oder Weltspeicher. Bisher gab es
+  sichtbare Gegenstände nur als Text (`:menu`/`:slot`/`:inv`, `@event slot`/`@event lore`) oder in
+  voller Größe über `pov-afk`/`ultra-afk` samt Chunk-Lesen und Raycaster; diese Datei schließt die
+  Lücke dazwischen.
+* **Bedienung wie gewohnt:** `--pov-web <port>` startet denselben token-geschützten Browser-Server,
+  `--pov-resources` wählt dieselbe JAR-Quelle. `--pov`, `--pov-size` und `--pov-fps` gibt es in
+  dieser Bauform nicht – ohne Kamera ergeben sie keinen Sinn.
+* **Sauber getrennt vom Weltcode.** Der Ressourcen-Leser (`pov_assets.rs`) und der Browser-Server
+  (`pov_web.rs`) werden von `pov-afk`/`ultra-afk` mitbenutzt, ohne dass `items-web-afk` deren
+  Chunk-Speicher, Biomfarben-Registry oder Raycaster einkompiliert – Gegenstands-Icons brauchen
+  dafür kein Biom und färben immer mit dem Ton der gemäßigten Ebene, genau wie Vanilla es in
+  Menüs tut.
+* **Vollständiger Audit vor dem Release.** Krypto/Framing, DNS, NBT, Protokolltabellen,
+  CLI-Parsing, Login/Auth, POV-Kernlogik, Bewegung und Anti-AFK wurden Zeile für Zeile durchgesehen
+  – keine Fehlfunktion gefunden. Rustfmt und Clippy laufen weiterhin mit allen acht Bauformen ohne
+  Warnung; die optimierten Basisläufe bestehen 95 Modul- und 29 Socket-Tests, der All-Features-Lauf
+  169 Modul- und 49 Socket-Tests, und `items-web-afk` allein 123 Modul- und 35 Socket-Tests
+  (`--all-features` allein reicht dafür nicht: es schaltet zugleich `pov` ein, wodurch der eigene
+  Ressourcen-Pfad von `web-menu` zurücktritt – deshalb ein eigener Testlauf in der CI).
 
 ---
 

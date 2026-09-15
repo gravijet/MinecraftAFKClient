@@ -294,6 +294,19 @@ impl Client {
             crate::pov::start_web(&shared);
             crate::pov::start_assets(&shared);
         }
+        // Wie oben, aber ohne den `pov`-Weltteil: derselbe Browser-Server, eigene Ressourcen-
+        // Ablage (siehe [`crate::pov_assets::WebAssets`]). Ohne `Pov` gibt es keinen
+        // `web_running`-Merker – dieser Zweig läuft aber wie der obige genau einmal, beim
+        // Anlegen des Clients.
+        #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+        {
+            if let Some(address) = shared.options().pov_web {
+                if let Err(error) = crate::pov_web::start(&shared, address) {
+                    shared.console.error(&format!("Browser-Menü: {}", error));
+                }
+            }
+            crate::pov_assets::load_for_web(&shared);
+        }
 
         for (name, task) in [("afk-net", true), ("afk-sender", false)] {
             let owned = Arc::clone(&shared);
@@ -469,7 +482,7 @@ impl Shared {
     }
 
     /// Startargumente – die Zusatzteile lesen daraus ihre eigenen Einstellungen.
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     pub(crate) fn options(&self) -> &Options {
         &self.options
     }

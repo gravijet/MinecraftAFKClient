@@ -11,6 +11,7 @@ mit `--mc <version>` gewählt. Windows-Dateien enden auf `.exe`, Linux-Dateien h
 | `afk-windows.exe` | `afk-linux` | Verbindung, Chat, Befehle/Makros, Kick-Schutz | möglichst kleiner Client zum bloßen AFK-Stehen |
 | `afk-windows-move.exe` | `afk-linux-move` | normal plus `:go`, `:look`, `:home`, `:route`, Sprung/Fall | AFK mit manuell gesteuerter Bewegung |
 | `items-afk-windows.exe` | `items-afk-linux` | normal plus Menü-Klicks sowie Menü- und Inventargegenstände mit Anzahl, Name, Farbcodes und Lore | schlanker Client, bei dem Inventarinhalte sichtbar sein müssen |
+| `items-web-afk-windows.exe` | `items-web-afk-linux` | wie items-afk, plus Hotbar und Menü/Inventar mit echten Texturen im Browser (`--pov-web`) | wie items-afk, aber mit sichtbaren Icons statt reinem Text – ohne Chunks, Weltspeicher oder Kamerabild |
 | `premium-afk-windows.exe` | `premium-afk-linux` | Bewegung, farbiges Scoreboard, Menü-Klicks, Schleichen/Sprinten, Benutzen/Handwechsel, Anti-AFK | vollständige AFK-Steuerung ohne Gegenstandsdaten und POV-Weltspeicher |
 | `premium-items-afk-windows.exe` | `premium-items-afk-linux` | Premium plus Menü- und Inventargegenstände mit Namen, Farben und Lore | Premium-Steuerung mit sichtbaren Gegenständen |
 | `pov-afk-windows.exe` | `pov-afk-linux` | Live-POV, Browser-HUD, Menüs und Gegenstände; Terminalansicht ohne Browser automatisch | beobachten und im Browser Menüs/Hotbar bedienen |
@@ -35,6 +36,10 @@ lassen sich beim Start umstellen:
 | `--pov-fps 4` | Bilder je Sekunde (1–20, Standard 8) |
 | `--pov-web 8765` | token-geschützten Browser-Viewer auf `127.0.0.1:8765` starten |
 | `--pov-resources <jar\|auto\|aus>` | woher die echten Texturen kommen. Standard `auto`: vorhandene Minecraft-Installation benutzen, sonst einmalig von Mojang laden |
+
+`items-web-afk-*` kennt davon nur `--pov-web` und `--pov-resources`: Der Browser zeigt Hotbar und
+Menü/Inventar mit denselben echten Texturen, aber **ohne** Kamerabild – die Bauform liest keine
+Chunks und hält keinen Weltspeicher. `--pov`, `--pov-size` und `--pov-fps` gibt es dort nicht.
 
 Örtliche Befehle im laufenden Client:
 
@@ -63,12 +68,15 @@ JAR-Ressourcen und Lese-Endpunkte nicht erreichbar.
 
 ## Gegenstände und Scoreboard
 
-`items-afk-*`, `premium-items-afk-*` und `ultra-afk-*` bieten:
+`items-afk-*`, `items-web-afk-*`, `premium-items-afk-*` und `ultra-afk-*` bieten:
 
 - `:menu` für das offene Menü samt belegten Feldern;
 - `:slot <nummer>` für Name, Anzahl, Registry-ID und Lore eines Menüfelds;
 - `:inv` für das eigene Inventar;
 - `@event slot ...` und `@event lore ...` mit unveränderten `§`-Farbcodes bei `--events`.
+
+Mit `--pov-web` zeigt `items-web-afk-*` Hotbar und Menü/Inventar zusätzlich im Browser – als
+echte Icons statt als Text, siehe oben.
 
 Unveränderte Vanilla-Items erhalten ihren echten Ressourcenname aus der zur gewählten
 Minecraft-Version gehörenden Item-ID-Liste; sie fallen daher nicht bloß auf eine Nummer zurück.
@@ -83,12 +91,14 @@ ausgegeben.
 ```powershell
 .\items-afk-windows.exe mc.example.net --mc 26.1 --offline Testkonto
 .\afk-windows.exe mc.example.net --mc 1.8.9 --offline Testkonto
+.\items-web-afk-windows.exe mc.example.net --mc 26.1 --offline Testkonto --pov-web 8765
 .\pov-afk-windows.exe mc.example.net --mc 26.2 --account MeinKonto
 .\ultra-afk-windows.exe mc.example.net --mc 1.21.11 --account MeinKonto --antiafk 60
 ```
 
 ```bash
 ./items-afk-linux mc.example.net --mc 26.1 --offline Testkonto
+./items-web-afk-linux mc.example.net --mc 26.1 --offline Testkonto --pov-web 8765
 ./pov-afk-linux mc.example.net --mc 26.2 --account MeinKonto
 ./ultra-afk-linux mc.example.net --mc 1.21.11 --account MeinKonto --antiafk 60
 ```

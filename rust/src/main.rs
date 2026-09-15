@@ -39,11 +39,13 @@ mod nbt;
 mod options;
 #[cfg(feature = "pov")]
 mod pov;
-#[cfg(feature = "pov")]
+// `web-menu` liest dieselben JAR-Ressourcen und startet denselben Browser-Server wie die volle
+// Live-Ansicht – nur ohne `pov` (Chunks, Weltspeicher, Raycaster).
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_assets;
-#[cfg(feature = "pov")]
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_resources;
-#[cfg(feature = "pov")]
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_web;
 mod proto;
 mod proxy;
@@ -159,24 +161,25 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
             console.warn("--sneak braucht den Premium- oder Ultra-Client; wird ignoriert.");
         }
     }
+    // Kamera-Optionen: die gibt es nur mit vollem `pov` (Chunks/Raycaster). `web-menu` kennt
+    // Hotbar/Menü, aber kein Bild – deshalb bleiben `--pov-web`/`--pov-resources` hier aussen vor.
     #[cfg(not(feature = "pov"))]
-    {
-        if options.pov_size.is_some()
-            || options.pov_autostart.is_some()
-            || options.pov_fps.is_some()
-            || options.pov_web.is_some()
-            || options.pov_resources.is_some()
-        {
-            console.warn(
-                "--pov/--pov-size/--pov-fps/--pov-web/--pov-resources brauchen die POV- oder Ultra-Datei; wird ignoriert.",
-            );
-        }
+    if options.pov_size.is_some() || options.pov_autostart.is_some() || options.pov_fps.is_some() {
+        console
+            .warn("--pov/--pov-size/--pov-fps brauchen die POV- oder Ultra-Datei; wird ignoriert.");
     }
-    #[cfg(feature = "pov")]
+    // `--pov-web`/`--pov-resources` brauchen mindestens `web-menu` (Hotbar/Menü im Browser).
+    #[cfg(not(any(feature = "pov", feature = "web-menu")))]
+    if options.pov_web.is_some() || options.pov_resources.is_some() {
+        console.warn(
+            "--pov-web/--pov-resources brauchen die POV-, Ultra- oder Browser-Menü-Datei; wird ignoriert.",
+        );
+    }
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     if options.pov_resources != pov_resources::Source::Auto && options.pov_web.is_none() {
         console.warn("--pov-resources wird ohne --pov-web nicht geladen.");
     }
-    #[cfg(all(feature = "state", feature = "pov"))]
+    #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
     let _ = console;
 }
 
@@ -322,6 +325,8 @@ fn print_usage() {
             "Ultra-AFK-Client fuer Minecraft"
         } else if cfg!(feature = "pov-client") {
             "POV-AFK-Client fuer Minecraft"
+        } else if cfg!(feature = "web-menu") {
+            "AFK-Client mit Gegenstaenden und Browser-Menü"
         } else if cfg!(feature = "items") && cfg!(feature = "premium") {
             "Premium-AFK-Client mit Gegenstaenden"
         } else if cfg!(feature = "premium") {
@@ -349,6 +354,13 @@ fn print_usage() {
              \x20     --pov-size <b>x<h>      Bildgroesse in Pixeln, z. B. 160x80 (Standard 64x32)\n\
              \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n\
              \x20     --pov-web <port|ip:port> texturierten Browser-Viewer starten\n\
+             \x20     --pov-resources <jar|auto|aus>  Original-Client-JAR fuer echte Texturen.\n\
+             \x20                             Standard 'auto': vorhandene Minecraft-Installation\n\
+             \x20                             benutzen, sonst einmalig von Mojang laden.\n"
+        } else if cfg!(feature = "web-menu") {
+            "\nBrowser-Menü:\n\
+             \x20     --pov-web <port|ip:port> Hotbar und Menü/Inventar mit echten Texturen im\n\
+             \x20                             Browser zeigen (kein Kamerabild, keine Weltdaten)\n\
              \x20     --pov-resources <jar|auto|aus>  Original-Client-JAR fuer echte Texturen.\n\
              \x20                             Standard 'auto': vorhandene Minecraft-Installation\n\
              \x20                             benutzen, sonst einmalig von Mojang laden.\n"

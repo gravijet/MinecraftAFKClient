@@ -1,4 +1,5 @@
-//! Lokaler, token-geschuetzter HTTP-Viewer fuer die texturierte Live-POV.
+//! Lokaler, token-geschuetzter HTTP-Viewer fuer die texturierte Live-POV bzw. (`--features
+//! web-menu`, ohne `pov`) fuer Hotbar und Menue/Inventar ohne Kamerabild.
 //!
 //! Kein Framework und kein CDN: HTML, CSS und JavaScript kommen aus der Binary, Frames und
 //! Zustandsdaten nur aus dem laufenden Client. Dadurch funktioniert die Ansicht offline und ein
@@ -41,7 +42,7 @@ pub(crate) fn start(shared: &Arc<Shared>, address: SocketAddr) -> Result<(), Str
             "Browser-POV lauscht ausserhalb von localhost. Die URL enthaelt den Zugriffstoken; nicht weitergeben.",
         );
     }
-    if let Some(note) = shared.extras.pov.asset_note() {
+    if let Some(note) = asset_note(shared) {
         shared.console.info(&format!("Browser-POV: {}", note));
     }
 
@@ -135,6 +136,61 @@ fn serve(listener: TcpListener, shared: Arc<Shared>, token: String) {
     }
 }
 
+/// Original-Ressourcen kommen je nach Bauform aus `pov::Pov` (volle Live-Ansicht, `feature =
+/// "pov"`) oder aus `pov_assets::WebAssets` (`--features web-menu`, ohne Weltteil) – hier an
+/// einer Stelle entschieden, damit die Endpunkte darunter nicht zweimal geschrieben werden müssen.
+#[cfg(feature = "pov")]
+fn asset_note(shared: &Arc<Shared>) -> Option<String> {
+    shared.extras.pov.asset_note()
+}
+#[cfg(not(feature = "pov"))]
+fn asset_note(shared: &Arc<Shared>) -> Option<String> {
+    shared.extras.web.note()
+}
+
+#[cfg(feature = "pov")]
+fn asset_bytes(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
+    crate::pov::web_asset(shared, path)
+}
+#[cfg(not(feature = "pov"))]
+fn asset_bytes(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
+    crate::pov_assets::web_asset(shared, path)
+}
+
+#[cfg(feature = "pov")]
+fn missing_bytes(shared: &Arc<Shared>) -> Option<Vec<u8>> {
+    crate::pov::web_missing(shared)
+}
+#[cfg(not(feature = "pov"))]
+fn missing_bytes(shared: &Arc<Shared>) -> Option<Vec<u8>> {
+    crate::pov_assets::web_missing(shared)
+}
+
+#[cfg(all(feature = "items", feature = "pov"))]
+fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
+    crate::pov::web_item(shared, id)
+}
+#[cfg(all(feature = "items", not(feature = "pov")))]
+fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
+    crate::pov_assets::web_item(shared, id)
+}
+
+/// Zustand für `/api/state.json` ohne den `pov`-Weltteil: nur Verbindung, Position und ob
+/// Texturen bereitstehen – keine Chunks/Entities/Dimension, die es in dieser Bauform nicht gibt.
+#[cfg(not(feature = "pov"))]
+fn menu_state(shared: &Arc<Shared>) -> serde_json::Value {
+    let position = shared.position();
+    serde_json::json!({
+        "connected": shared.in_game.load(Ordering::Relaxed),
+        "position": position.map(|value| serde_json::json!({
+            "x": value.0, "y": value.1, "z": value.2,
+            "yaw": value.3, "pitch": value.4
+        })),
+        "textures": shared.extras.web.get().is_some(),
+        "texture_error": shared.extras.web.note(),
+    })
+}
+
 fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -186,9 +242,7 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
                 b"Ungueltiger Ressourcenpfad",
             );
         }
-        let Some(bytes) =
-            crate::pov::web_asset(shared, resource).or_else(|| crate::pov::web_missing(shared))
-        else {
+        let Some(bytes) = asset_bytes(shared, resource).or_else(|| missing_bytes(shared)) else {
             return response(
                 &mut stream,
                 503,
@@ -210,7 +264,10 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             );
         }
         ("GET", "/api/state.json") => {
+            #[cfg(feature = "pov")]
             let mut value = crate::pov::web_world(shared);
+            #[cfg(not(feature = "pov"))]
+            let mut value = menu_state(shared);
             if let Some(object) = value.as_object_mut() {
                 #[cfg(feature = "menu")]
                 object.insert("menu".to_string(), crate::menu::web_state(shared));
@@ -232,6 +289,7 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
                 Err(_) => response(&mut stream, 500, "application/json", b"{}"),
             }
         }
+        #[cfg(feature = "pov")]
         ("GET", "/api/frame.png") => {
             let width = query_value(query, "w")
                 .and_then(|value| value.parse().ok())
@@ -254,9 +312,7 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             let id = query_value(query, "id")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(-1);
-            let Some(bytes) =
-                crate::pov::web_item(shared, id).or_else(|| crate::pov::web_missing(shared))
-            else {
+            let Some(bytes) = item_bytes(shared, id).or_else(|| missing_bytes(shared)) else {
                 return response(
                     &mut stream,
                     503,
@@ -392,6 +448,7 @@ fn response_with_cache(
 /// Bewusst ohne Bibliothek oder fremde Assets. Alle `background-image`-URLs zeigen in die vom
 /// Nutzer bereitgestellte Original-JAR. `image-rendering: pixelated` entspricht der
 /// naechstgelegenen Skalierung des Spiels fuer GUI-Texturen.
+#[cfg(feature = "pov")]
 const PAGE: &str = r###"<!doctype html>
 <html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AFKSystems – Live-POV</title>
@@ -432,6 +489,49 @@ async function frameLoop(){try{const r=await fetch(api('/api/frame.png?w=426&h=2
 stateLoop();frameLoop();
 </script></body></html>"###;
 
+/// Wie [`PAGE`], aber ohne Kamerabild: `--features web-menu` liest keine Chunks und hat keinen
+/// Raycaster, also gibt es auch kein Bild dafür anzufordern. Hotbar, Menü/Inventar und ihre
+/// Texturen sind identisch zur vollen Live-Ansicht – dieselben `renderHotbar`/`renderMenu`-
+/// Funktionen, nur ohne `#view`/`frameLoop()`.
+#[cfg(not(feature = "pov"))]
+const PAGE: &str = r###"<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AFKSystems – Browser-Menü</title>
+<style>
+:root{--gui:3;--shadow:#3f3f3f}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff;font-family:monospace}button{font:inherit}
+#game{position:relative;width:100%;height:100%;background:#2b2b30;user-select:none}
+#status{position:absolute;left:8px;top:7px;padding:4px 6px;background:rgba(0,0,0,.45);text-shadow:2px 2px #222;font-size:13px}#error{display:none;color:#ff5555;margin-left:8px}
+#hotbar{position:absolute;left:50%;bottom:8px;width:182px;height:22px;transform:translateX(-50%) scale(var(--gui));transform-origin:bottom center;background:0 0/182px 22px no-repeat;image-rendering:pixelated}
+#selection{position:absolute;top:-1px;width:24px;height:23px;background:0 0/24px 23px no-repeat;image-rendering:pixelated;pointer-events:none}.hot-slot{position:absolute;top:3px;width:20px;height:18px;border:0;background:transparent;padding:1px}.hot-slot img,.slot img{width:16px;height:16px;object-fit:contain;image-rendering:pixelated}.count{position:absolute;right:0;bottom:-1px;color:#fff;text-shadow:1px 1px #3f3f3f;font:bold 8px monospace}
+#menu-wrap{display:none;position:absolute;inset:0;background:rgba(0,0,0,.68);align-items:center;justify-content:center}#menu{position:relative;width:176px;transform:scale(var(--gui));image-rendering:pixelated;color:#3f3f3f;font-size:7px;text-shadow:none}.screen-bg{position:absolute;inset:0;background-repeat:no-repeat;background-position:0 0;image-rendering:pixelated}.chest-top{position:absolute;left:0;top:0;width:176px;background:url('/assets/minecraft/textures/gui/container/generic_54.png?token=__TOKEN__') 0 0/256px 256px no-repeat}.chest-bottom{position:absolute;left:0;width:176px;height:96px;background:url('/assets/minecraft/textures/gui/container/generic_54.png?token=__TOKEN__') 0 -126px/256px 256px no-repeat}.title{position:absolute;left:8px;top:6px;white-space:nowrap;overflow:hidden;width:160px}.slot{position:absolute;width:18px;height:18px;border:0;background:transparent;padding:1px}.slot:hover{background:rgba(255,255,255,.45)}#tooltip{display:none;position:absolute;z-index:20;max-width:250px;padding:6px 8px;background:rgba(16,0,16,.94);border:1px solid #2a0a35;color:#fff;text-shadow:1px 1px #222;font-size:12px;pointer-events:none;white-space:pre-line}
+@media(max-width:700px),(max-height:520px){:root{--gui:2}}
+</style></head><body><div id="game"><div id="status">Verbinde …<span id="error"></span></div><div id="hotbar"><div id="selection"></div></div><div id="menu-wrap"><div id="menu"></div></div><div id="tooltip"></div></div>
+<script>
+const token='__TOKEN__', api=(path)=>path+(path.includes('?')?'&':'?')+'token='+token;
+const hud={hotbar:'/assets/minecraft/textures/gui/sprites/hud/hotbar.png?token=__TOKEN__',selection:'/assets/minecraft/textures/gui/sprites/hud/hotbar_selection.png?token=__TOKEN__'};
+const status=document.querySelector('#status'),error=document.querySelector('#error'),hotbar=document.querySelector('#hotbar'),selection=document.querySelector('#selection'),wrap=document.querySelector('#menu-wrap'),menuEl=document.querySelector('#menu'),tooltip=document.querySelector('#tooltip');
+let lastHotbarKey='',lastMenuKey='',assetsReady=false;
+function setAssetsReady(ready){if(!ready||assetsReady)return;assetsReady=true;hotbar.style.backgroundImage=`url('${hud.hotbar}')`;selection.style.backgroundImage=`url('${hud.selection}')`;lastHotbarKey='';lastMenuKey=''}
+function itemNode(item,slot,hot=false,ready=assetsReady){const b=document.createElement('button');b.className=hot?'hot-slot':'slot';b.dataset.slot=slot;if(item){if(ready){const img=document.createElement('img');img.src=api('/api/item.png?id='+item.id);img.alt=item.name||'';b.append(img)}if(item.count>1){const c=document.createElement('span');c.className='count';c.textContent=item.count;b.append(c)}b.onmouseenter=(e)=>showTip(e,item);b.onmousemove=moveTip;b.onmouseleave=()=>tooltip.style.display='none'}return b}
+function showTip(e,item){tooltip.textContent=item.name+(item.lore?.length?'\n'+item.lore.join('\n'):'');tooltip.style.display='block';moveTip(e)}function moveTip(e){tooltip.style.left=(e.clientX+14)+'px';tooltip.style.top=(e.clientY+14)+'px'}
+function renderHotbar(state){setAssetsReady(state.textures===true);const inv=state.menu?.inventory||[],key=JSON.stringify([assetsReady,state.selected_hotbar||0,inv.slice(36,45)]);if(key===lastHotbarKey)return;lastHotbarKey=key;hotbar.querySelectorAll('.hot-slot').forEach(n=>n.remove());for(let i=0;i<9;i++){const b=itemNode(inv[36+i]||null,i,true);b.style.left=(3+i*20)+'px';b.onclick=()=>fetch(api('/api/hotbar?slot='+i),{method:'POST'});hotbar.append(b)}selection.style.left=(-1+(state.selected_hotbar||0)*20)+'px'}
+function putSlot(parent,item,index,x,y){const b=itemNode(item,index);b.style.left=x+'px';b.style.top=y+'px';b.onclick=(e)=>fetch(api('/api/click?slot='+index+'&action='+(e.shiftKey?'shift':'left')),{method:'POST'});b.oncontextmenu=(e)=>{e.preventDefault();fetch(api('/api/click?slot='+index+'&action=right'),{method:'POST'})};parent.append(b)}
+const grid=(x,y,w,n)=>Array.from({length:n},(_,i)=>[x+(i%w)*18,y+Math.floor(i/w)*18]);
+const layouts={
+ generic_3x3:{bg:'dispenser',own:grid(62,17,3,9)},crafter_3x3:{bg:'crafter',own:grid(26,17,3,9).concat([[134,35]])},
+ anvil:{bg:'anvil',own:[[27,47],[76,47],[134,47]]},beacon:{bg:'beacon',w:230,h:219,own:[[136,110]],inv:[36,137,195]},
+ blast_furnace:{bg:'blast_furnace',own:[[56,17],[56,53],[116,35]]},brewing_stand:{bg:'brewing_stand',own:[[56,51],[79,58],[102,51],[79,17],[17,17]]},
+ crafting:{bg:'crafting_table',own:grid(30,17,3,9).concat([[124,35]])},enchantment:{bg:'enchanting_table',own:[[15,47],[35,47]]},furnace:{bg:'furnace',own:[[56,17],[56,53],[116,35]]},
+ grindstone:{bg:'grindstone',own:[[49,19],[49,40],[129,34]]},hopper:{bg:'hopper',h:133,own:grid(44,20,5,5),inv:[8,51,109]},loom:{bg:'loom',own:[[13,26],[33,26],[143,58]]},
+ merchant:{bg:'villager',w:276,h:166,textureW:512,own:[[136,37],[162,37],[220,37]],inv:[108,84,142]},shulker_box:{bg:'shulker_box',own:grid(8,18,9,27)},
+ smithing:{bg:'smithing',own:[[8,48],[26,48],[44,48],[98,48]]},smoker:{bg:'smoker',own:[[56,17],[56,53],[116,35]]},cartography_table:{bg:'cartography_table',own:[[15,15],[15,52],[145,39]]},stonecutter:{bg:'stonecutter',own:[[20,33],[143,33]]}
+};
+function renderMenu(data){const key=JSON.stringify([assetsReady,data||null]);if(key===lastMenuKey)return;lastMenuKey=key;if(!data?.open){wrap.style.display='none';return}wrap.style.display='flex';menuEl.replaceChildren();const ownCount=Math.max(0,(data.slots||0)-36),generic=(data.type||'').startsWith('generic_9x'),rows=Math.max(1,Math.ceil(ownCount/9));let own,invX=8,invY=84,hotY=142,w=176,h=166;if(generic){const topH=17+rows*18;h=topH+96;own=grid(8,17,9,ownCount);const top=document.createElement('div');top.className='chest-top';top.style.height=topH+'px';const bottom=document.createElement('div');bottom.className='chest-bottom';bottom.style.top=topH+'px';menuEl.append(top,bottom);invY=topH+14;hotY=topH+72}else{const l=layouts[data.type]||{bg:'generic_54',own:grid(8,18,9,ownCount)};w=l.w||176;h=l.h||166;own=l.own||[];if(l.inv)[invX,invY,hotY]=l.inv;const bg=document.createElement('div');bg.className='screen-bg';if(assetsReady)bg.style.backgroundImage=`url('/assets/minecraft/textures/gui/container/${l.bg}.png?token=__TOKEN__')`;bg.style.backgroundSize=`${l.textureW||256}px 256px`;menuEl.append(bg)}menuEl.style.width=w+'px';menuEl.style.height=h+'px';const title=document.createElement('div');title.className='title';title.textContent=data.title||'';menuEl.append(title);for(let i=0;i<ownCount;i++){const p=own[i]||[8+(i%9)*18,18+Math.floor(i/9)*18];putSlot(menuEl,data.items?.[i]||null,i,p[0],p[1])}for(let i=0;i<27;i++){const index=ownCount+i;putSlot(menuEl,data.items?.[index]||null,index,invX+(i%9)*18,invY+Math.floor(i/9)*18)}for(let i=0;i<9;i++){const index=ownCount+27+i;putSlot(menuEl,data.items?.[index]||null,index,invX+i*18,hotY)}}
+wrap.onclick=(e)=>{if(e.target===wrap)fetch(api('/api/close'),{method:'POST'})};
+async function stateLoop(){try{const r=await fetch(api('/api/state.json'),{cache:'no-store'});if(!r.ok)throw Error(await r.text());const s=await r.json(),p=s.position;status.firstChild.textContent=p?`x ${p.x.toFixed(1)}  y ${p.y.toFixed(1)}  z ${p.z.toFixed(1)}`:'Noch nicht im Spiel';error.style.display=s.texture_error?'inline':'none';error.textContent=s.texture_error?' · '+s.texture_error:'';renderHotbar(s);renderMenu(s.menu)}catch(e){status.firstChild.textContent='Viewer getrennt';error.style.display='inline';error.textContent=' · '+e.message}setTimeout(stateLoop,document.hidden?1000:250)}
+stateLoop();
+</script></body></html>"###;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,7 +567,12 @@ mod tests {
             "jede JAR-Ressource muss den Zugriffstoken mitsenden"
         );
         assert!(PAGE.contains("setAssetsReady(state.textures===true)"));
-        assert!(PAGE.contains("<img id=\"crosshair\" alt=\"\">"));
         assert!(PAGE.contains("if(ready){const img="));
+        // Das Kamerabild (Kreuzfadenvisier) gibt es nur mit der vollen Live-Ansicht – `web-menu`
+        // liest keine Chunks und hat also auch kein Bild dafür anzufordern.
+        #[cfg(feature = "pov")]
+        assert!(PAGE.contains("<img id=\"crosshair\" alt=\"\">"));
+        #[cfg(not(feature = "pov"))]
+        assert!(!PAGE.contains("crosshair"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "afk"
-version = "2.7.0"
+version = "2.8.0"
 edition = "2021"
 description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.8.9, 1.21.1, 1.21.11, 26.1 und 26.2"
 
@@ -16,6 +16,8 @@ path = "src/main.rs"
 #   (ohne)              schlanker AFK-Client – kein Byte darüber hinaus
 #   --features movement   zusätzlich :go/:look/:home/:route
 #   --features items      zusätzlich Menüs samt Feldinhalten (Name, Farben, Lore)
+#   --features web-menu   Menüs und Gegenstaende plus Browser-Ansicht mit echten Texturen,
+#                         aber ohne Chunks/Weltspeicher (siehe pov-client fuer die volle Live-Ansicht)
 #   --features pov-client Live-Ansicht samt Browser-HUD, Menues und Gegenstaenden
 #   --features premium    zusätzlich Anzeigetafel, Menüs, Anti-AFK, Schleichen
 #   --features premium,items   Premium plus Feldinhalte
@@ -44,6 +46,10 @@ pov = ["extras", "dep:png", "dep:zip"]
 # Eigene POV-Datei: startet die Ansicht nach dem Beitritt automatisch. Ultra enthält zwar den
 # POV-Code, startet ihn aber nur auf Wunsch mit `:pov live`.
 pov-client = ["pov", "items", "state"]
+# Browser-Menü mit echten Texturen (Hotbar, Behaelter, Item-Icons aus der Original-JAR), aber
+# ohne den `pov`-Weltteil: kein Chunk-Lesen, kein Weltspeicher, kein Raycaster. Braucht `png`/`zip`
+# selbst, weil dieselbe JAR gelesen wird wie fuer die volle Live-Ansicht.
+web-menu = ["items", "state", "dep:png", "dep:zip"]
 
 # --- Fertige Bauformen ---------------------------------------------------------------------
 premium = ["movement", "board", "menu", "state", "antiafk"]

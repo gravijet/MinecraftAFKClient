@@ -31,7 +31,7 @@ const MAX_SLOTS: usize = 200;
 /// `minecraft:menu` ist in allen vier unterstuetzten offiziellen Server-Reports identisch. Die
 /// Reihenfolge wurde zusammen mit den Block-State-Tabellen geprueft; die Nummer aus OpenScreen
 /// wird dadurch im Browser nicht mehr als generische Kiste missverstanden.
-#[cfg(feature = "pov")]
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 const MENU_TYPES: [&str; 25] = [
     "generic_9x1",
     "generic_9x2",
@@ -60,7 +60,7 @@ const MENU_TYPES: [&str; 25] = [
     "stonecutter",
 ];
 
-#[cfg(feature = "pov")]
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 fn menu_type(kind: i32) -> &'static str {
     usize::try_from(kind)
         .ok()
@@ -69,7 +69,7 @@ fn menu_type(kind: i32) -> &'static str {
 }
 
 /// Alte Fenstertyp-Namen auf die internen modernen Namen abbilden, die der Browser bereits kennt.
-#[cfg(feature = "pov")]
+#[cfg(any(feature = "pov", feature = "web-menu"))]
 fn legacy_menu_type(kind: &str, slots: usize) -> i32 {
     match kind {
         "minecraft:chest" | "minecraft:container" => (slots / 9).clamp(1, 6) as i32 - 1,
@@ -92,7 +92,7 @@ struct Open {
     /// vorzeichenloses Byte dasselbe Byte ergeben (1.21.1 sendet ein Byte, ab 1.21.11 VarInt).
     id: i32,
     /// Vanilla-Menue-Typ aus `OpenScreen`; der Browser waehlt damit den passenden Hintergrund.
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     kind: i32,
     /// Überschrift als `§`-Text (siehe [`crate::nbt::Fmt::Legacy`]).
     title: String,
@@ -145,13 +145,13 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             let (id, kind, title, announced_slots) = if shared.proto.legacy {
                 let id = r.u8()? as i32;
                 let old_kind = r.string()?;
-                #[cfg(not(feature = "pov"))]
+                #[cfg(not(any(feature = "pov", feature = "web-menu")))]
                 let _ = &old_kind;
                 let title = nbt::render_json(&r.string()?, Fmt::Legacy);
                 let slots = r.u8()? as usize;
-                #[cfg(feature = "pov")]
+                #[cfg(any(feature = "pov", feature = "web-menu"))]
                 let kind = legacy_menu_type(&old_kind, slots);
-                #[cfg(not(feature = "pov"))]
+                #[cfg(not(any(feature = "pov", feature = "web-menu")))]
                 let kind = -1;
                 (id, kind, title, slots)
             } else {
@@ -162,7 +162,7 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                     0,
                 )
             };
-            #[cfg(not(feature = "pov"))]
+            #[cfg(not(any(feature = "pov", feature = "web-menu")))]
             let _ = kind;
             shared.console.info(&format!(
                 "Menü geöffnet: {} (:menu, :click <feld>)",
@@ -173,7 +173,7 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 .event("menu", &format!("open id={} {}", id, title));
             *shared.extras.menu.open.lock().unwrap() = Some(Open {
                 id,
-                #[cfg(feature = "pov")]
+                #[cfg(any(feature = "pov", feature = "web-menu"))]
                 kind,
                 title,
                 state: 0,
@@ -384,7 +384,7 @@ fn read_item_slot_with(
 /// Netz-Thread mit an – kein KeepAlive mehr, also `disconnect.timeout` wegen einer Anzeige.
 struct Snapshot {
     id: i32,
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     kind: i32,
     title: String,
     slots: usize,
@@ -399,7 +399,7 @@ fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
     let current = open.as_ref()?;
     Some(Snapshot {
         id: current.id,
-        #[cfg(feature = "pov")]
+        #[cfg(any(feature = "pov", feature = "web-menu"))]
         kind: current.kind,
         title: current.title.clone(),
         slots: current.slots,
@@ -412,7 +412,7 @@ fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
 
 /// JSON-Abzug fuer die Browser-POV. Unter der Menuesperre wird nur kopiert; PNG-Ausgabe und
 /// Socket-Schreiben passieren danach und koennen den Netzwerkthread daher nie festhalten.
-#[cfg(all(feature = "items", feature = "pov"))]
+#[cfg(all(feature = "items", any(feature = "pov", feature = "web-menu")))]
 pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
     let open = snapshot(shared);
     let inventory = shared.extras.menu.inventory.lock().unwrap().clone();
@@ -742,7 +742,7 @@ pub fn close_command(shared: &Arc<Shared>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     use super::menu_type;
     use crate::proto::values;
 
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "pov")]
+    #[cfg(any(feature = "pov", feature = "web-menu"))]
     fn browser_fenstertypen_folgen_der_offiziellen_registry() {
         assert_eq!(menu_type(0), "generic_9x1");
         assert_eq!(menu_type(8), "anvil");

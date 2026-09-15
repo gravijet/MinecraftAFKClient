@@ -1446,6 +1446,76 @@ fn browser_viewer_antwortet_nur_mit_token() {
     let _ = child.kill();
 }
 
+/// Derselbe Browser-Viewer wie oben, aber im schlanken `web-menu`-Build (kein `pov`): Hotbar und
+/// Menü/Inventar mit echten Texturen, aber ohne Kamerabild und ohne Weltdaten. Prüft genau die
+/// Abgrenzung, um die es bei dieser Bauform geht – `state.json` bleibt ohne `chunks`/`entities`,
+/// und `/api/frame.png` gibt es in dieser Bauform gar nicht erst.
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[test]
+fn browser_menue_ohne_pov_liefert_hotbar_aber_keine_weltdaten() {
+    let server = common::start(&common::MC_26_1, plan_with_ground());
+
+    let mut attempt = 0;
+    let (port, mut child, token) = loop {
+        attempt += 1;
+        let port = common::free_port();
+        let mut child = common::spawn_client(
+            server.port,
+            "26.1",
+            &[
+                "--no-color",
+                "--pov-web",
+                &port.to_string(),
+                "--pov-resources",
+                "aus",
+            ],
+        );
+        let err = common::collect(child.stderr.take().unwrap());
+        let (found, log) = common::wait_for(&err, Duration::from_secs(10), "Browser-POV: http://");
+        if found {
+            let token = log
+                .split("?token=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .expect("Token in der Adresse")
+                .to_string();
+            break (port, child, token);
+        }
+        let _ = child.kill();
+        assert!(
+            attempt < 4,
+            "Viewer kam auch nach {} Versuchen nicht hoch. Letzte Ausgabe:\n{}",
+            attempt,
+            log
+        );
+    };
+
+    // Die Seite zeigt Hotbar/Menü, aber keine Kamera – dafür gibt es in dieser Bauform weder
+    // Bilddaten noch die zugehörigen Elemente.
+    let (status, _, body) = common::http_get(port, &format!("/?token={}", token));
+    assert_eq!(status, 200);
+    let page = String::from_utf8_lossy(&body);
+    assert!(!page.contains("Live-POV"), "zeigt die volle Live-Ansicht");
+    assert!(!page.contains("crosshair"), "zeigt ein Kamera-Fadenkreuz");
+    assert!(page.contains("renderHotbar"), "keine Hotbar-Logik");
+
+    // Der Zustand hat Position und Texturen, aber keine Chunks/Entities – die gibt es ohne `pov`
+    // nicht, weil der Client keine Chunk-Pakete liest.
+    let (status, _, body) = common::http_get(port, &format!("/api/state.json?token={}", token));
+    assert_eq!(status, 200);
+    let state: serde_json::Value = serde_json::from_slice(&body).expect("gueltiges JSON");
+    assert_eq!(state["textures"], serde_json::Value::Bool(false));
+    assert!(state.get("chunks").is_none(), "state.json: {}", state);
+    assert!(state.get("entities").is_none(), "state.json: {}", state);
+    assert!(state.get("dimension").is_none(), "state.json: {}", state);
+
+    // Kein Kamerabild in dieser Bauform – der Endpunkt existiert schlicht nicht.
+    let (status, _, _) = common::http_get(port, &format!("/api/frame.png?token={}", token));
+    assert_eq!(status, 404);
+
+    let _ = child.kill();
+}
+
 /// Die Steuerung im Browser sendet wirklich etwas an den Server – nicht nur an die eigene
 /// Ansicht.
 ///

@@ -3,13 +3,14 @@
 Diese Datei beschreibt die Rust-Bauformen und ihre Grenzen. Die konkreten Downloadnamen stehen
 zusätzlich in [RELEASE.md](RELEASE.md).
 
-## Die sieben Rust-Bauformen
+## Die acht Rust-Bauformen
 
 | Bauform | Release-Dateien | Cargo-Features | Zusätze gegenüber normal |
 | --- | --- | --- | --- |
 | normal | `afk-windows.exe`, `afk-linux` | keine | keine |
 | Bewegung | `afk-windows-move.exe`, `afk-linux-move` | `movement` | manuelle Bewegung und Routen |
 | Items | `items-afk-windows.exe`, `items-afk-linux` | `items` | Menüs, Klicks, Inventar-/Menügegenstände |
+| Items + Browser-Menü | `items-web-afk-windows.exe`, `items-web-afk-linux` | `web-menu` | wie Items, plus Hotbar/Menü mit echten Texturen im Browser – ohne Chunks, Weltspeicher oder Kamerabild |
 | Premium | `premium-afk-windows.exe`, `premium-afk-linux` | `premium` | Bewegung, Scoreboard, Menü-Klicks, Tastenzustand, Anti-AFK |
 | Premium + Items | `premium-items-afk-windows.exe`, `premium-items-afk-linux` | `premium,items` | Premium plus sichtbare Gegenstände |
 | POV | `pov-afk-windows.exe`, `pov-afk-linux` | `pov-client` | Live-POV, Browser-HUD, Menüs und Gegenstände |
@@ -230,6 +231,20 @@ kopierten Texturdateien. Die beim Start ausgegebene URL enthält einen zufällig
 
 ```bash
 pov-afk-linux mc.example.net --mc 26.2 --pov-web 8765
+```
+
+#### Dieselbe Browser-Ansicht ohne Welt (`items-web-afk`, `--features web-menu`)
+
+`items-web-afk-*` bringt denselben Browser-Server, dieselben Item-/Menü-/Hotbar-Texturen aus der
+Original-JAR und dieselbe Bedienung (Klicken, Schnellleiste wechseln) mit – aber **kein**
+Kamerabild: Diese Bauform liest keine Chunk-Pakete, hält keinen Weltspeicher und hat keinen
+Raycaster. `state.json` bleibt entsprechend ohne `chunks`/`entities`/`dimension`, und
+`/api/frame.png` gibt es in dieser Bauform gar nicht. Gegenstands-Icons brauchen dafür auch kein
+Biom: Sie werden immer mit dem Ton der gemäßigten Ebene gezeichnet, genau wie Vanilla seine
+Inventar-Icons zeichnet.
+
+```bash
+items-web-afk-linux mc.example.net --mc 26.1 --pov-web 8765
 ```
 
 #### Woher die Texturen kommen
@@ -491,10 +506,18 @@ local
    ├─ state
    └─ pov ── pov-client (= pov + items + state)
 
-antiafk = movement + state
-premium = movement + board + menu + state + antiafk
-ultra   = premium + items + pov
+antiafk  = movement + state
+premium  = movement + board + menu + state + antiafk
+ultra    = premium + items + pov
+web-menu = items + state + dep:png + dep:zip   (kein pov: keine Chunks, kein Weltspeicher)
 ```
+
+`web-menu` teilt sich `rust/src/pov_assets.rs` (JAR lesen, Item-/HUD-Icons rendern) und
+`rust/src/pov_web.rs` (Browser-Server) mit `pov`, verzichtet aber auf `rust/src/pov.rs` selbst –
+dessen Weltzustand, Biomfarben-Registry und Raycaster braucht ein reiner Menü-/Hotbar-Viewer nicht.
+Die beiden geteilten Module bleiben deshalb `#[cfg(any(feature = "pov", feature = "web-menu"))]`
+kompiliert, alles, was wirklich eine Welt braucht (`Assets::biome_tint`, der Raycaster `Assets::hit`
+und ihre Hilfsfunktionen), bleibt `#[cfg(feature = "pov")]`.
 
 Die maßgeblichen Module sind getrennt:
 
@@ -504,7 +527,9 @@ Die maßgeblichen Module sind getrennt:
 | `rust/src/board.rs` | Scoreboard |
 | `rust/src/menu.rs` | Menüs, Klicks, Inventarzustand |
 | `rust/src/items.rs` | Slot-Komponenten, Name, Farbe, Lore |
-| `rust/src/pov.rs` | Chunks, Blocks, Entities und Renderer |
+| `rust/src/pov.rs` | Chunks, Blocks, Entities und Renderer (nur `pov`) |
+| `rust/src/pov_assets.rs` | Original-JAR lesen, Item-/HUD-Icons rendern (`pov` und `web-menu`) |
+| `rust/src/pov_web.rs` | token-geschützter Browser-Server (`pov` und `web-menu`) |
 | `rust/src/antiafk.rs` | Anti-AFK |
 | `rust/src/movement.rs` | manuelle Bewegung/Routen |
 | `rust/tests/common/mod.rs` | Nachbau eines Minecraft-Servers für die Tests |

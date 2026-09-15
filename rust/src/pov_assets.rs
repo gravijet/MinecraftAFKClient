@@ -12,6 +12,10 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Mutex;
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+use std::sync::{Arc, OnceLock};
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+use std::thread;
 use zip::ZipArchive;
 
 const STATES_1_8_9: &[u8] = include_bytes!("../data/block-states-1.8.9.txt.gz");
@@ -28,6 +32,7 @@ const MAX_TEXTURE_PIXELS: usize = 16 * 1024 * 1024;
 /// Reihenfolge der sechs Blockseiten in Material und Treffer: West, Ost, Unten, Oben, Nord,
 /// Sued. Die Namen entsprechen denen in den Vanilla-Modelldateien.
 pub(crate) const FACE_NAMES: [&str; 6] = ["west", "east", "down", "up", "north", "south"];
+#[cfg(feature = "pov")]
 pub(crate) type TexturedHit = ((u8, u8, u8, u8), f64, usize);
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +109,7 @@ impl BiomeTint {
     };
 
     /// Ohne geladene Farbkarten: Wasser steht schon in der Registry, Gras und Laub nicht.
+    #[cfg(feature = "pov")]
     pub(crate) fn without_colormaps(params: &crate::pov::BiomeParams) -> BiomeTint {
         BiomeTint {
             water: rgb(params.water),
@@ -122,12 +128,14 @@ impl BiomeTint {
     }
 }
 
+#[cfg(feature = "pov")]
 fn rgb(value: u32) -> [u8; 3] {
     [(value >> 16) as u8, (value >> 8) as u8, value as u8]
 }
 
 /// Eine Farbkarte der JAR als 256x256-Tabelle. Fehlt oder passt sie nicht, bleibt es beim
 /// Ebene-Ton – erfunden wird keine.
+#[cfg(feature = "pov")]
 fn load_colormap(archive: &mut ZipArchive<File>, name: &str) -> Option<Box<[[u8; 3]]>> {
     let path = format!("assets/minecraft/textures/colormap/{}.png", name);
     let bytes = read_zip(archive, &path, MAX_ARCHIVE_ASSET_BYTES)?;
@@ -155,6 +163,7 @@ fn load_colormap(archive: &mut ZipArchive<File>, name: &str) -> Option<Box<[[u8;
 /// Die Karte ist 256x256 groß und wird **nicht** linear abgetastet: Der Niederschlag geht mit der
 /// Temperatur multipliziert ein, und beide Achsen laufen rückwärts. Genau diese Rechnung steht
 /// hier – eine eigene, „vernünftigere" wäre eine andere Welt.
+#[cfg(feature = "pov")]
 fn colormap_sample(map: &[[u8; 3]], temperature: f32, downfall: f32) -> [u8; 3] {
     let temperature = temperature.clamp(0.0, 1.0) as f64;
     let downfall = downfall.clamp(0.0, 1.0) as f64 * temperature;
@@ -198,8 +207,11 @@ pub(crate) struct Assets {
     archive: Mutex<ZipArchive<File>>,
     missing_png: Vec<u8>,
     /// Die beiden Farbkarten der JAR, je 256x256 RGB. Aus ihnen kommt der Gras- und Laubton
-    /// eines Bioms – dieselbe Tabelle, die auch das Spiel selbst abtastet.
+    /// eines Bioms – dieselbe Tabelle, die auch das Spiel selbst abtastet. Nur die volle
+    /// Live-Ansicht braucht sie: Gegenstands-Icons färben immer mit `BiomeTint::PLAINS`.
+    #[cfg(feature = "pov")]
     grass_map: Option<Box<[[u8; 3]]>>,
+    #[cfg(feature = "pov")]
     foliage_map: Option<Box<[[u8; 3]]>>,
 }
 
@@ -263,7 +275,9 @@ impl Assets {
 
         let missing_png = encode_rgba_png(16, 16, &loader.textures[0].rgba)
             .map_err(|error| format!("Fehlertextur konnte nicht codiert werden: {}", error))?;
+        #[cfg(feature = "pov")]
         let grass_map = load_colormap(&mut loader.archive, "grass");
+        #[cfg(feature = "pov")]
         let foliage_map = load_colormap(&mut loader.archive, "foliage");
         Ok(Assets {
             states,
@@ -275,7 +289,9 @@ impl Assets {
             item_icons: Mutex::new(HashMap::new()),
             archive: Mutex::new(loader.archive),
             missing_png,
+            #[cfg(feature = "pov")]
             grass_map,
+            #[cfg(feature = "pov")]
             foliage_map,
         })
     }
@@ -284,6 +300,7 @@ impl Assets {
     ///
     /// Ausdrücklich gesetzte Farben aus der Registry gewinnen; sonst kommt der Ton aus der
     /// Farbkarte der JAR, abgetastet mit Temperatur und Niederschlag genau dieses Bioms.
+    #[cfg(feature = "pov")]
     pub(crate) fn biome_tint(&self, params: &crate::pov::BiomeParams) -> BiomeTint {
         use crate::pov::GrassModifier;
 
@@ -320,6 +337,10 @@ impl Assets {
     /// Naechster sichtbarer Modellelement-Treffer innerhalb eines Blocks. Das ist mehr als ein
     /// Texturlookup: Slabs, Treppen, Zaunpfosten und gedrehte Cross-Modelle benutzen ihre echten
     /// JSON-Elemente statt zwangsweise einen vollen Einheitswuerfel zu belegen.
+    ///
+    /// Nur vom Raycaster der vollen Live-Ansicht gebraucht; Gegenstands-Icons rastern ihre
+    /// Elemente stattdessen direkt (siehe `raster_triangle`).
+    #[cfg(feature = "pov")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn hit(
         &self,
@@ -1222,14 +1243,17 @@ fn matrix_vector(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
     })
 }
 
+#[cfg(feature = "pov")]
 fn transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     std::array::from_fn(|row| std::array::from_fn(|column| matrix[column][row]))
 }
 
+#[cfg(feature = "pov")]
 fn subtract(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+#[cfg(feature = "pov")]
 fn add_scaled(origin: [f64; 3], direction: [f64; 3], distance: f64) -> [f64; 3] {
     [
         origin[0] + direction[0] * distance,
@@ -1360,6 +1384,7 @@ fn raster_triangle(
 /// Strahl gegen eine ungedrehte Model-AABB. Zurueck kommen Eintritt und Austritt jeweils mit
 /// lokaler Modellseite. Beide werden gebraucht, wenn die Kamera innerhalb eines Elements steht
 /// oder ein Modell nur auf einer Seite eine Flaeche besitzt.
+#[cfg(feature = "pov")]
 fn ray_box(
     origin: [f64; 3],
     direction: [f64; 3],
@@ -1565,6 +1590,120 @@ pub(crate) fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Resul
     Ok(bytes)
 }
 
+// ===================== Browser-Menü ohne Live-Ansicht (`--features web-menu`) =====================
+//
+// Dieselben Original-Ressourcen wie die volle Live-Ansicht (Item-Icons, Hotbar-/Menü-Texturen),
+// aber ohne jede Kenntnis der Welt: `Assets::load` braucht nur die Block-State-Tabelle der
+// Version, und Gegenstands-Icons werden immer mit dem statischen `BiomeTint::PLAINS` gefärbt
+// (siehe `raster_triangle`) – ein eigener Weltspeicher wie in [`crate::pov::Pov`] ist dafür nicht
+// nötig. Deshalb ein eigener, kleiner Halter statt `Pov`/`Assets_` für diesen schlanken Fall zu
+// verbiegen.
+
+/// Ressourcen-Zustand für `--features web-menu`. Gleiches Muster wie `Assets_` in `pov.rs`, aber
+/// eigenständig: dieser Build hat kein `Pov` und keinen Weltspeicher.
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[derive(Default)]
+pub(crate) struct WebAssets {
+    ready: OnceLock<Arc<Assets>>,
+    /// Klartext für den Browser: was gerade läuft, oder warum es keine Texturen gibt. `None`
+    /// heißt „alles in Ordnung".
+    note: Mutex<Option<String>>,
+}
+
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+impl WebAssets {
+    pub(crate) fn get(&self) -> Option<&Assets> {
+        self.ready.get().map(|assets| assets.as_ref())
+    }
+
+    pub(crate) fn note(&self) -> Option<String> {
+        self.note.lock().ok().and_then(|note| note.clone())
+    }
+
+    fn set_note(&self, note: Option<String>) {
+        if let Ok(mut slot) = self.note.lock() {
+            *slot = note;
+        }
+    }
+}
+
+/// Wie [`crate::pov::start_assets`], aber ohne Weltbezug: schreibt in `shared.extras.web` statt
+/// `shared.extras.pov.assets` und rechnet keine Biomfarben nach (es gibt keine Welt, die sie
+/// braucht).
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
+    if shared.options().pov_web.is_none() {
+        return; // Ohne Browser-Ansicht liest niemand die Texturen.
+    }
+    let web = &shared.extras.web;
+    if matches!(
+        shared.options().pov_resources,
+        crate::pov_resources::Source::Off
+    ) {
+        web.set_note(Some("ohne Texturen (--pov-resources aus)".to_string()));
+        return;
+    }
+    web.set_note(Some("Ressourcen werden geladen ...".to_string()));
+
+    let owned = Arc::clone(shared);
+    let started = thread::Builder::new()
+        .name("afk-web-assets".into())
+        .spawn(move || {
+            let version = owned.proto.name;
+            let source = &owned.options().pov_resources;
+            let web = &owned.extras.web;
+            let path = match crate::pov_resources::locate(&owned.console, version, source) {
+                Ok(path) => path,
+                Err(error) => {
+                    owned
+                        .console
+                        .warn(&format!("Browser-Menü ohne Texturen: {}", error));
+                    return web.set_note(Some(error));
+                }
+            };
+            match Assets::load(&path, version) {
+                Ok(assets) => {
+                    // `set` kann nur fehlschlagen, wenn schon jemand geladen hätte – den Thread
+                    // gibt es aber genau einmal.
+                    let _ = web.ready.set(Arc::new(assets));
+                    web.set_note(None);
+                    owned.console.ok("Browser-Menü: Texturen sind geladen.");
+                }
+                Err(error) => {
+                    owned
+                        .console
+                        .warn(&format!("Browser-Menü ohne Texturen: {}", error));
+                    web.set_note(Some(error));
+                }
+            }
+        });
+    if started.is_err() {
+        web.set_note(Some(
+            "Ressourcen-Thread liess sich nicht starten".to_string(),
+        ));
+    }
+}
+
+/// Wie [`crate::pov::web_asset`], aber für `shared.extras.web` statt `shared.extras.pov`.
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+pub(crate) fn web_asset(shared: &Arc<crate::client::Shared>, path: &str) -> Option<Vec<u8>> {
+    shared.extras.web.get()?.raw(path)
+}
+
+/// Wie [`crate::pov::web_item`], aber für `shared.extras.web` statt `shared.extras.pov`.
+/// `web-menu` zieht `items` immer mit, ein eigenes Feature-Gate dafür ist deshalb unnötig.
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+pub(crate) fn web_item(shared: &Arc<crate::client::Shared>, id: i32) -> Option<Vec<u8>> {
+    let name = crate::item_names::get(shared.proto.name, id)?;
+    Some(shared.extras.web.get()?.item_png(name))
+}
+
+/// Wie [`crate::pov::web_missing`], aber für `shared.extras.web` statt `shared.extras.pov`.
+#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+pub(crate) fn web_missing(shared: &Arc<crate::client::Shared>) -> Option<Vec<u8>> {
+    Some(shared.extras.web.get()?.missing_png().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,6 +1751,26 @@ mod tests {
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 
+    /// `WebAssets` ist der Ressourcen-Halter des `web-menu`-Builds – unabhängig von `Pov` und
+    /// ohne Weltbezug. Hier nur der Zustandsautomat selbst, ohne eine echte JAR zu laden.
+    #[test]
+    #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+    fn web_assets_meldet_ihren_eigenen_zustand() {
+        let assets = WebAssets::default();
+        assert!(assets.get().is_none(), "vor dem Laden gibt es nichts");
+        assert!(assets.note().is_none(), "vor dem ersten Hinweis: nichts");
+
+        assets.set_note(Some("Ressourcen werden geladen ...".to_string()));
+        assert_eq!(
+            assets.note().as_deref(),
+            Some("Ressourcen werden geladen ...")
+        );
+
+        // `None` heisst "alles in Ordnung" – auch nach einem vorherigen Hinweis.
+        assets.set_note(None);
+        assert!(assets.note().is_none());
+    }
+
     #[test]
     #[cfg(feature = "items")]
     fn modernes_dynamisches_item_waehlt_einen_modellzweig() {
@@ -1632,6 +1791,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pov")]
     fn slab_trifft_ihre_echte_halbe_hoehe() {
         let hit = ray_box(
             [8.0, 20.0, 8.0],
@@ -1671,6 +1831,7 @@ mod tests {
     /// `XDG_CONFIG_HOME=$(mktemp -d) cargo test --features pov-client -- --ignored biomfarben`
     #[test]
     #[ignore]
+    #[cfg(feature = "pov")]
     fn biomfarben_kommen_aus_der_farbkarte() {
         use crate::pov::{BiomeParams, GrassModifier};
         let console = crate::console::Console::new(false, false, false);

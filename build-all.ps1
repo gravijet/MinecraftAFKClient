@@ -1,5 +1,5 @@
 <#
-    Baut alle sieben Rust-Bauformen von AFKSystems und legt sie in dist\ ab.
+    Baut alle acht Rust-Bauformen von AFKSystems und legt sie in dist\ ab.
     Jede Datei unterstuetzt Minecraft 1.8.9, 1.21.1, 1.21.11, 26.1 und 26.2.
 
     Aufruf:  .\build-all.ps1
@@ -36,6 +36,7 @@ try {
     $variants = @(
         @{ Features = 'movement';      File = 'afk-windows-move.exe';          Label = 'Bewegung' },
         @{ Features = 'items';         File = 'items-afk-windows.exe';          Label = 'Items' },
+        @{ Features = 'web-menu';      File = 'items-web-afk-windows.exe';     Label = 'Items + Browser-Menü' },
         @{ Features = 'premium';       File = 'premium-afk-windows.exe';        Label = 'Premium' },
         @{ Features = 'premium,items'; File = 'premium-items-afk-windows.exe'; Label = 'Premium + Items' },
         @{ Features = 'pov-client';    File = 'pov-afk-windows.exe';            Label = 'POV' },

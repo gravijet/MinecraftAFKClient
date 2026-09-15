@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Baut alle sieben Rust-Bauformen. Jede Datei spricht Minecraft 1.8.9, 1.21.1, 1.21.11,
+# Baut alle acht Rust-Bauformen. Jede Datei spricht Minecraft 1.8.9, 1.21.1, 1.21.11,
 # 26.1 und 26.2.
 set -euo pipefail
 
@@ -19,6 +19,8 @@ echo "Rust-Build ..."
     cp target/release/afk "$dist/afk-linux-move"
     cargo build --locked --release --features items
     cp target/release/afk "$dist/items-afk-linux"
+    cargo build --locked --release --features web-menu
+    cp target/release/afk "$dist/items-web-afk-linux"
     cargo build --locked --release --features premium
     cp target/release/afk "$dist/premium-afk-linux"
     cargo build --locked --release --features premium,items

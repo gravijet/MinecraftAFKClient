@@ -29,7 +29,7 @@ use crate::buf::Writer;
 use crate::proto::values;
 #[cfg(feature = "state")]
 use std::sync::atomic::AtomicU32;
-#[cfg(all(feature = "state", feature = "pov"))]
+#[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(any(feature = "state", feature = "antiafk"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,11 @@ pub struct Extras {
     pub(crate) menu: crate::menu::Menu,
     #[cfg(feature = "pov")]
     pub(crate) pov: crate::pov::Pov,
+    /// Original-Ressourcen (Item-Icons, Hotbar-/Menü-Texturen) für den Browser-Menü-Build ohne
+    /// volle Live-Ansicht. Mit `pov` gibt es stattdessen `Pov::assets` – beide schließen sich in
+    /// den offiziellen Bauformen aus.
+    #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+    pub(crate) web: crate::pov_assets::WebAssets,
     /// Optional vom Server synchronisierte Registry-ID -> Ressourcenname. Vanilla-Namen kommen
     /// zuverlässig aus [`crate::item_names`]; diese Liste darf sie bei einem Server ersetzen,
     /// der `minecraft:item` tatsächlich synchronisiert.
@@ -68,7 +73,7 @@ pub struct Extras {
     /// senden lässt Server-Acknowledgements mehrerer Aktionen ununterscheidbar werden.
     #[cfg(feature = "state")]
     use_sequence: AtomicU32,
-    #[cfg(all(feature = "state", feature = "pov"))]
+    #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
     pub(crate) selected_hotbar: AtomicUsize,
 }
 
@@ -82,6 +87,8 @@ impl Extras {
             menu: crate::menu::Menu::new(),
             #[cfg(feature = "pov")]
             pov: crate::pov::Pov::new(options),
+            #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+            web: crate::pov_assets::WebAssets::default(),
             #[cfg(feature = "items")]
             item_names: Mutex::new(Vec::new()),
             #[cfg(feature = "antiafk")]
@@ -96,7 +103,7 @@ impl Extras {
             sprinting: AtomicBool::new(false),
             #[cfg(feature = "state")]
             use_sequence: AtomicU32::new(0),
-            #[cfg(all(feature = "state", feature = "pov"))]
+            #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
             selected_hotbar: AtomicUsize::new(0),
         }
     }
@@ -257,7 +264,7 @@ pub fn on_join(shared: &Arc<Shared>) {
         shared.extras.sneaking.store(false, Ordering::Relaxed);
         shared.extras.sprinting.store(false, Ordering::Relaxed);
         shared.extras.use_sequence.store(0, Ordering::Relaxed);
-        #[cfg(feature = "pov")]
+        #[cfg(any(feature = "pov", feature = "web-menu"))]
         shared.extras.selected_hotbar.store(0, Ordering::Relaxed);
     }
     #[cfg(feature = "antiafk")]
@@ -565,7 +572,7 @@ fn hotbar(shared: &Arc<Shared>, arg: &str) {
             let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
             w.u16(slot as u16 - 1); // übertragen wird 0..8
             shared.send(w);
-            #[cfg(feature = "pov")]
+            #[cfg(any(feature = "pov", feature = "web-menu"))]
             shared
                 .extras
                 .selected_hotbar
@@ -578,7 +585,7 @@ fn hotbar(shared: &Arc<Shared>, arg: &str) {
     }
 }
 
-#[cfg(all(feature = "state", feature = "pov"))]
+#[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
 pub(crate) fn web_hotbar(shared: &Arc<Shared>, slot: usize) -> bool {
     if slot >= 9 || !shared.ready_for_gameplay() {
         return false;
