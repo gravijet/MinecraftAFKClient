@@ -164,18 +164,14 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             };
             #[cfg(not(any(feature = "pov", feature = "web-menu")))]
             let _ = kind;
-            shared.console.info(&format!(
-                "Menü geöffnet: {} (:menu, :click <feld>)",
-                shared.console.text(&title)
-            ));
-            shared
-                .console
-                .event("menu", &format!("open id={} {}", id, title));
+            // Erst den Zustand setzen, dann melden: Wer auf die Meldung wartet (etwa der
+            // Browser-Server über `state.json`, oder ein Ablauftest über die Fehlerausgabe) muss
+            // den neuen Zustand schon vorfinden, sobald die Meldung erscheint.
             *shared.extras.menu.open.lock().unwrap() = Some(Open {
                 id,
                 #[cfg(any(feature = "pov", feature = "web-menu"))]
                 kind,
-                title,
+                title: title.clone(),
                 state: 0,
                 slots: announced_slots,
                 #[cfg(feature = "items")]
@@ -183,6 +179,13 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 #[cfg(feature = "items")]
                 unknown_from: usize::MAX,
             });
+            shared.console.info(&format!(
+                "Menü geöffnet: {} (:menu, :click <feld>)",
+                shared.console.text(&title)
+            ));
+            shared
+                .console
+                .event("menu", &format!("open id={} {}", id, title));
         }
 
         // Fenster-Nummer, Zustandszähler, Feldanzahl – danach die Gegenstände.
