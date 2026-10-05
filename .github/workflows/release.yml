@@ -1,4 +1,4 @@
-name: Build und latest-Release
+name: Build and latest release
 
 # Bei jedem Push auf main: alles bauen und das Release "latest" durch den frischen Stand ersetzen.
 # Bewusst nur main - sonst würde ein Push auf irgendeinen Nebenzweig "latest" überschreiben.
@@ -74,7 +74,7 @@ jobs:
         with:
           workspaces: rust
 
-      - name: Bauen
+      - name: Build
         working-directory: rust
         shell: bash
         run: |
@@ -126,7 +126,7 @@ jobs:
     needs: rust
     runs-on: ubuntu-latest
     steps:
-      - name: Aus dem Entwurf wird "latest"
+      - name: Publish latest release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
