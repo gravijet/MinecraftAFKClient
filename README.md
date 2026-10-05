@@ -8,7 +8,7 @@ afk --server localhost:25565 --mc 26.1
 afk --help
 ```
 
-Accounts and login tokens are stored locally and excluded from Git. Use `--account` to select a saved account and `--no-reconnect` when another process manages restarts.
+Accounts and login tokens are stored locally. Use `--account` to select a saved account and `--no-reconnect` when another process manages restarts.
 
 ## Build
 
