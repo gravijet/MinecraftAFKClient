@@ -14,6 +14,7 @@ use base64::Engine;
 use rand::RngCore;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,18 +25,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Linux-Build weder OpenSSL-Header noch `pkg-config` (siehe Cargo.toml).
 pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let builder = ureq::builder()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout(Duration::from_secs(30));
+    AGENT.get_or_init(|| agent_builder().build())
+}
 
-        #[cfg(windows)]
-        let builder = match native_tls::TlsConnector::new() {
-            Ok(tls) => builder.tls_connector(std::sync::Arc::new(tls)),
-            Err(_) => builder,
-        };
+fn agent_builder() -> ureq::AgentBuilder {
+    let builder = ureq::builder()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30));
 
-        builder.build()
+    #[cfg(windows)]
+    let builder = match native_tls::TlsConnector::new() {
+        Ok(tls) => builder.tls_connector(std::sync::Arc::new(tls)),
+        Err(_) => builder,
+    };
+
+    builder
+}
+
+/// Server mit IP-Prüfung vergleichen den Sitzungs-Join mit der Spielverbindung. Ein IPv4-Spiel
+/// und ein IPv6-Join sehen selbst auf demselben Rechner wie zwei verschiedene Clients aus.
+fn session_agent(ipv4: bool) -> &'static ureq::Agent {
+    static IPV4: OnceLock<ureq::Agent> = OnceLock::new();
+    static IPV6: OnceLock<ureq::Agent> = OnceLock::new();
+    let agent = if ipv4 { &IPV4 } else { &IPV6 };
+    agent.get_or_init(|| {
+        agent_builder()
+            .resolver(move |address: &str| {
+                Ok(address
+                    .to_socket_addrs()?
+                    .filter(|address| address.is_ipv4() == ipv4)
+                    .collect())
+            })
+            .build()
     })
 }
 
@@ -290,7 +311,7 @@ impl Account {
     }
 
     /// Meldet die Sitzung bei Mojang an – Pflicht vor dem verschlüsselten Login.
-    pub fn join_server(&mut self, server_hash: &str) -> Res<()> {
+    pub fn join_server(&mut self, server_hash: &str, ipv4: bool) -> Res<()> {
         if !self.online {
             return Err(
                 "Der Server verlangt eine echte Microsoft-Sitzung – mit --offline geht das nicht \
@@ -300,7 +321,7 @@ impl Account {
         }
         let token = self.token()?.to_string();
         let profile = hex(&self.profile_id);
-        let response = agent()
+        let response = session_agent(ipv4)
             .post("https://sessionserver.mojang.com/session/minecraft/join")
             .send_json(json!({
                 "accessToken": token,
@@ -717,6 +738,63 @@ mod tests {
         assert!(offline("viel_zu_langer_name").is_err());
         assert!(offline("mit leerzeichen").is_err());
         // Ohne Microsoft-Token darf kein Sitzungs-Join versucht werden.
-        assert!(offline("Hugo").unwrap().join_server("abc").is_err());
+        assert!(offline("Hugo").unwrap().join_server("abc", true).is_err());
+    }
+
+    #[test]
+    fn sitzungs_join_nutzt_die_ip_familie_der_spielverbindung() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Instant;
+
+        let ipv4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = ipv4.local_addr().unwrap().port();
+        let Ok(ipv6) = TcpListener::bind(("::1", port)) else {
+            return; // IPv6 ist auf manchen Build-Rechnern abgeschaltet.
+        };
+        let serve = |listener: TcpListener, body: &'static str| {
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(2)))
+                                .unwrap();
+                            let mut request = [0; 4096];
+                            assert!(stream.read(&mut request).unwrap() > 0);
+                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "HTTP-Verbindung blieb aus");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+            })
+        };
+        let v4_server = serve(ipv4, "ipv4");
+        let v6_server = serve(ipv6, "ipv6");
+        let url = format!("http://localhost:{port}/");
+        let v4_response = session_agent(true)
+            .get(&url)
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        let v6_response = session_agent(false)
+            .get(&url)
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap();
+        v4_server.join().unwrap();
+        v6_server.join().unwrap();
+        assert_eq!(v4_response, "ipv4");
+        assert_eq!(v6_response, "ipv6");
     }
 }

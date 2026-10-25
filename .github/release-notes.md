@@ -1,1 +1,1 @@
-Rust Minecraft AFK client. See the README for account setup, build commands and supported feature variants.
+2.8.1 fixes session authentication on dual-stack hosts: Mojang's session join uses the same IP address family as the Minecraft connection. This fixes WindSMP rejecting valid accounts when the game connects over IPv4 and authentication previously used IPv6.

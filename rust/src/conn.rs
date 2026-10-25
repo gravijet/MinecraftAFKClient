@@ -153,6 +153,10 @@ pub struct PacketReader {
 }
 
 impl PacketReader {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.stream.get_ref().local_addr()
+    }
+
     pub fn new(stream: TcpStream) -> Self {
         PacketReader {
             // 32 KB statt 4 KB: ein Chunk-Paket kommt selten in einem Stück, und jeder

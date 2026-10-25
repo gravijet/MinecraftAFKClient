@@ -1215,7 +1215,8 @@ fn handle_login(
 
             if should_authenticate {
                 let hash = auth::server_hash(&server_id, &secret, &public_key);
-                shared.account.lock().unwrap().join_server(&hash)?;
+                let ipv4 = reader.local_addr().map_err(|e| e.to_string())?.is_ipv4();
+                shared.account.lock().unwrap().join_server(&hash, ipv4)?;
             }
 
             let key = RsaPublicKey::from_public_key_der(&public_key)
