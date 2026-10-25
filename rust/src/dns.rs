@@ -470,13 +470,13 @@ mod tests {
 # Kommentar
 domain example.net
 nameserver 192.0.2.1
-nameserver 192.0.2.1  ; noch ein Kommentar
+nameserver 192.0.2.2  ; noch ein Kommentar
 nameserver fd00::1
 options edns0
 ";
         assert_eq!(
             parse_resolv_conf(text),
-            vec!["192.0.2.1:53", "192.0.2.1:53", "[fd00::1]:53"]
+            vec!["192.0.2.1:53", "192.0.2.2:53", "[fd00::1]:53"]
         );
 
         // Unsinn darf nicht als Resolver durchgehen.
@@ -490,7 +490,7 @@ options edns0
         );
         assert_eq!(
             parse_resolv_conf(
-                "nameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1\nnameserver 192.0.2.1"
+                "nameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver 192.0.2.3\nnameserver 192.0.2.4"
             )
             .len(),
             3

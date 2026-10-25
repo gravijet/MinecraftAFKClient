@@ -102,7 +102,9 @@ impl Proxy {
             }
         };
         if host.trim().is_empty() {
-            return Err("Proxy ohne Adresse. Beispiel: --proxy socks5://192.0.2.1:1080".to_string());
+            return Err(
+                "Proxy ohne Adresse. Beispiel: --proxy socks5://192.0.2.1:1080".to_string(),
+            );
         }
 
         Ok(Proxy {

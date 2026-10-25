@@ -932,7 +932,7 @@ mod tests {
     /// statt eine vertippte Zahl einfach zu deckeln.
     #[test]
     fn zeitangaben_haben_eine_obergrenze() {
-        let riesig = "000000000000000000"; // u64::MAX – parst, überläuft aber jede Addition
+        let riesig = &u64::MAX.to_string()[..]; // parst, überläuft aber jede Addition
         let o = options(&[
             "x",
             "--join-delay",

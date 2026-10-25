@@ -543,7 +543,7 @@ fn use_item(shared: &Arc<Shared>) {
     let sequence = shared
         .extras
         .use_sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             Some(if value >= i32::MAX as u32 {
                 0
             } else {

@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(parse("120").unwrap(), 120);
         assert!(parse("x").is_err());
         // Auch nach oben: aus einer unmöglichen Zahl darf keine unmögliche Wartezeit werden.
-        assert_eq!(parse("000000000000000000").unwrap(), MAX_SECONDS);
+        assert_eq!(parse(&u64::MAX.to_string()).unwrap(), MAX_SECONDS);
         assert!(std::time::Duration::from_secs(MAX_SECONDS)
             .checked_add(std::time::Duration::from_secs(MAX_SECONDS))
             .is_some());
