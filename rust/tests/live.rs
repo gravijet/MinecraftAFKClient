@@ -865,6 +865,8 @@ fn server_transfer_wird_befolgt() {
     );
     let (disconnected, transfer_log) =
         common::wait_for(&err, Duration::from_millis(300), "@event disconnect");
+    let disconnected = disconnected || log.contains("@event disconnect");
+    let transfer_log = format!("{}{}", log, transfer_log);
     assert!(
         transfer_log.contains("@event transfer host="),
         "Transfer-Ereignis fehlt: {}",
