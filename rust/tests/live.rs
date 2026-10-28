@@ -164,6 +164,31 @@ fn serverbefehl_wartet_auf_startposition() {
     let _ = child.kill();
 }
 
+/// stdin kann schon vor Login gefüllt sein. Kein Play-Login darf angenommene Zeilen löschen.
+#[test]
+fn stdin_vor_login_bleibt_bis_zur_startposition_erhalten() {
+    let mut plan = plan_with_ground();
+    plan.before_login_ms = 400;
+    plan.before_position_ms = 400;
+    let server = common::start(&common::MC_26_1, plan);
+    let mut child =
+        common::spawn_client(server.port, "26.1", &["--no-color", "--chat-delay", "200"]);
+    writeln!(child.stdin.as_mut().unwrap(), "/erster\n/zweiter\n/dritter").unwrap();
+    for expected in ["erster", "zweiter", "dritter"] {
+        let sent = common::wait_note(
+            &server.notes,
+            TIMEOUT,
+            |note| matches!(note, Note::Command(command) if command == expected),
+        );
+        assert!(
+            sent,
+            "vor Login angenommener Befehl ging verloren: {}",
+            expected
+        );
+    }
+    let _ = child.kill();
+}
+
 /// Moderne Vanilla-Clients markieren das Ende jedes 50-ms-Ticks mit einem leeren Paket. Ohne
 /// diese Grenze verarbeitet der Server Eingabeereignisse anders als bei einem normalen Client.
 #[test]
@@ -837,6 +862,18 @@ fn server_transfer_wird_befolgt() {
         angekommen,
         "der Client ist dem Transfer nicht gefolgt. Ausgabe:\n{}",
         log
+    );
+    let (disconnected, transfer_log) =
+        common::wait_for(&err, Duration::from_millis(300), "@event disconnect");
+    assert!(
+        transfer_log.contains("@event transfer host="),
+        "Transfer-Ereignis fehlt: {}",
+        transfer_log
+    );
+    assert!(
+        !disconnected,
+        "Ein Transfer darf keinen Disconnect-Auslöser starten: {}",
+        transfer_log
     );
     let _ = child.kill();
 }

@@ -70,9 +70,10 @@ const BRAND_PREFIX: &str = "example.invalid";
 /// `--on chat:`-Regel den Speicher langsam volllaufen lassen.
 const MAX_QUEUE: usize = 64;
 
-/// Warteschlange ausgehender Nachrichten – mit `clear()`, damit bei einem Server-Transfer keine
-/// veralteten Zeilen nachträglich im Chat landen.
+/// Warteschlange einer Spielsitzung. Weltwechsel und beabsichtigte Transfers behalten
+/// offene Zeilen; ein echter Verbindungsabbruch verwirft sie samt bereits entnommener Zeile.
 struct Queue {
+    epoch: AtomicU32,
     items: Mutex<VecDeque<String>>,
     signal: Condvar,
 }
@@ -257,6 +258,7 @@ impl Client {
             target: Mutex::new((host, port, srv)),
             cookies: Mutex::new(HashMap::new()),
             queue: Queue {
+                epoch: AtomicU32::new(0),
                 items: Mutex::new(VecDeque::new()),
                 signal: Condvar::new(),
             },
@@ -433,7 +435,9 @@ impl Queue {
     }
 
     fn clear(&self) {
-        self.items.lock().unwrap().clear();
+        let mut items = self.items.lock().unwrap();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        items.clear();
     }
 }
 
@@ -713,53 +717,65 @@ fn sender_loop(shared: Arc<Shared>) {
     let delay = Duration::from_millis(shared.options.chat_min_delay_ms);
     let mut next_allowed = Instant::now();
     while shared.running.load(Ordering::Relaxed) {
-        let input = {
+        let (input, epoch) = {
             let mut items = shared.queue.items.lock().unwrap();
             loop {
                 if !shared.running.load(Ordering::Relaxed) {
                     return;
                 }
                 if let Some(item) = items.pop_front() {
-                    break item;
+                    break (item, shared.queue.epoch.load(Ordering::SeqCst));
                 }
                 items = shared.queue.signal.wait(items).unwrap();
             }
         };
 
-        let generation = shared.generation.load(Ordering::SeqCst);
-        if !shared.wait_for_gameplay(generation) {
-            continue; // Verbindung endete, bevor die Startposition bestätigt war
-        }
-
-        // Erst säubern, dann senden: sonst könnte eine Nachricht wegfallen, deren
-        // Quittungs-Offset schon verbraucht wäre.
-        let Some(outgoing) = prepare(&input, shared.proto.legacy) else {
-            continue;
-        };
-        if !sleep_until(&shared, next_allowed)
-            || shared.generation.load(Ordering::SeqCst) != generation
-            || !shared.ready_for_gameplay()
-        {
-            continue;
-        }
-        match outgoing {
-            // Befehle tragen KEINE Quittung (das Paket hat kein lastSeenMessages-Feld),
-            // der Offset darf hier also nicht verbraucht werden.
-            Outgoing::Command(command) => {
-                let mut w = Writer::packet(shared.proto.game.sb_chat_command);
-                if shared.proto.legacy {
-                    w.string(&format!("/{}", command));
-                } else {
-                    w.string(&command);
+        // Die entnommene Zeile bleibt während eines Weltwechsels im Besitz des Senders.
+        // Ein `continue` der äußeren Schleife würde sie unbemerkt verlieren.
+        loop {
+            if !shared.running.load(Ordering::Relaxed)
+                || shared.queue.epoch.load(Ordering::SeqCst) != epoch
+            {
+                break;
+            }
+            let generation = shared.generation.load(Ordering::SeqCst);
+            if !shared.wait_for_gameplay(generation) {
+                continue;
+            }
+            if !sleep_until(&shared, next_allowed) {
+                return;
+            }
+            if shared.queue.epoch.load(Ordering::SeqCst) != epoch {
+                break;
+            }
+            if shared.generation.load(Ordering::SeqCst) != generation
+                || !shared.ready_for_gameplay()
+            {
+                continue;
+            }
+            // Erst unmittelbar vor dem Versand vorbereiten: einen Chat-Quittungs-Offset
+            // dürfen wir erst verbrauchen, wenn die Nachricht tatsächlich gesendet wird.
+            let Some(outgoing) = prepare(&input, shared.proto.legacy) else {
+                break;
+            };
+            match outgoing {
+                Outgoing::Command(command) => {
+                    let mut w = Writer::packet(shared.proto.game.sb_chat_command);
+                    if shared.proto.legacy {
+                        w.string(&format!("/{}", command));
+                    } else {
+                        w.string(&command);
+                    }
+                    shared.send(w);
                 }
-                shared.send(w);
+                Outgoing::Message(message) => {
+                    let offset = shared.unacked.swap(0, Ordering::Relaxed);
+                    shared.send(chat_packet(&shared, &message, offset));
+                }
             }
-            Outgoing::Message(message) => {
-                let offset = shared.unacked.swap(0, Ordering::Relaxed);
-                shared.send(chat_packet(&shared, &message, offset));
-            }
+            next_allowed = Instant::now() + delay;
+            break;
         }
-        next_allowed = Instant::now() + delay;
     }
 }
 
@@ -882,15 +898,21 @@ fn net_loop(shared: Arc<Shared>) {
         #[cfg(feature = "extras")]
         crate::extras::on_disconnect(&shared);
 
-        match &result {
-            Err(e) => {
-                shared.console.error(&format!("Getrennt: {}", e));
-                shared.console.event("disconnect", e);
+        let transferred = shared.intentional.swap(false, Ordering::SeqCst);
+        if !transferred {
+            match &result {
+                Err(e) => {
+                    shared.console.error(&format!("Getrennt: {}", e));
+                    shared.console.event("disconnect", e);
+                }
+                Ok(()) => shared.console.event("disconnect", ""),
             }
-            Ok(()) => shared.console.event("disconnect", ""),
+            // Ein Kick beendet die Sitzung. Auch eine vom Sender bereits entnommene Zeile
+            // wird durch die neue Queue-Epoche ungültig; niemals blind nach einem Kick senden.
+            shared.queue.clear();
+            shared.wake();
         }
-
-        if shared.intentional.swap(false, Ordering::SeqCst) {
+        if transferred {
             // Server-Transfer ist ein ausdrücklicher Protokollwechsel, kein Reconnect nach
             // einem Kick. Deshalb wird nur in diesem Fall weiterverbunden.
             //
@@ -1504,7 +1526,7 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     shared.reached_game.store(true, Ordering::SeqCst);
     // Der Server beginnt mit einer frischen Quittungsliste – unser Zähler muss mit.
     shared.unacked.store(0, Ordering::Relaxed);
-    shared.queue.clear();
+    // Offene Befehle gehören weiterhin dieser Sitzung, auch beim Unterserverwechsel.
     // Die alte Position gilt nicht mehr: der Server setzt uns gleich neu ab (auch bei einem
     // Unterserver-Wechsel, dort ist es sogar eine andere Welt).
     *shared.position.lock().unwrap() = None;
@@ -2061,6 +2083,9 @@ fn transfer(shared: &Arc<Shared>, r: &mut Reader) -> Result<bool, String> {
     shared
         .console
         .info(&format!("Server-Transfer zu {}:{}", host, port));
+    shared
+        .console
+        .event("transfer", &format!("host={} port={}", host, port));
     *shared.target.lock().unwrap() = (host, port, false);
     shared.intentional.store(true, Ordering::SeqCst);
     Ok(true)
@@ -2113,6 +2138,32 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sitzungsende_verwirft_auch_bereits_entnommene_zeilen() {
+        let queue = Queue {
+            epoch: AtomicU32::new(0),
+            items: Mutex::new(VecDeque::new()),
+            signal: Condvar::new(),
+        };
+        queue.push("/zahlung".into());
+        let (in_flight, epoch) = {
+            let mut items = queue.items.lock().unwrap();
+            (
+                items.pop_front().unwrap(),
+                queue.epoch.load(Ordering::SeqCst),
+            )
+        };
+        queue.push("/alte-sitzung".into());
+        queue.clear();
+        queue.push("/neue-sitzung".into());
+        assert_eq!(in_flight, "/zahlung");
+        assert_ne!(epoch, queue.epoch.load(Ordering::SeqCst));
+        assert_eq!(
+            queue.items.lock().unwrap().pop_front().unwrap(),
+            "/neue-sitzung"
+        );
+    }
 
     fn policy(delay: u64, max: u64) -> crate::options::Reconnect {
         crate::options::Reconnect {
