@@ -291,6 +291,7 @@ fn print_usage() {
          \x20 -s, --server <host[:port]>  Serveradresse (geht auch ohne -s als erstes Argument)\n\
          \x20 -m, --mc <version>          Protokoll: {}  (Standard: {})\n\
          \x20     --proxy <adresse>       socks5://[nutzer:pass@]host:port oder http://...\n\
+         \x20     AFK_PROXY=<adresse>     wie --proxy, aber nicht in der Prozessliste sichtbar\n\
          \x20     --fakehost <host[:port]> diese Adresse im Handshake statt der echten\n\
          \x20     --view-distance <2-32>  gemeldete Sichtweite in Chunks (Standard: {})\n\
          \x20     --no-reconnect          nach einem Kick/Abbruch beenden statt neu verbinden\n\

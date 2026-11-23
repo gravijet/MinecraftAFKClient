@@ -263,8 +263,22 @@ pub enum Command {
     Help,
 }
 
+/// Umgebungsvariable mit der Proxy-Adresse. Anders als `--proxy` taucht sie nicht in der
+/// Prozessliste auf: `/proc/<pid>/cmdline` kann jeder lokale Nutzer lesen, `/proc/<pid>/environ`
+/// nur der Eigentümer des Prozesses. Ein Panel reicht Proxy-Passwörter deshalb hierüber durch.
+pub const PROXY_ENV: &str = "AFK_PROXY";
+
 /// Startargumente auswerten. Der Fehlertext ist bereits für den Nutzer formuliert.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
+    parse_with_proxy_env(args, std::env::var(PROXY_ENV).ok())
+}
+
+/// [`parse`] mit ausdrücklich übergebenem Wert von [`PROXY_ENV`], damit Tests die Umgebung
+/// des ganzen Testprozesses nicht verändern müssen.
+fn parse_with_proxy_env<I: IntoIterator<Item = String>>(
+    args: I,
+    proxy_env: Option<String>,
+) -> Result<Command, String> {
     let mut o = Options::default();
     // Wartezeit nach dem Beitritt, bevor der erste Befehl rausgeht. Der Server braucht einen
     // Moment, bis er Chat von uns überhaupt annimmt.
@@ -402,6 +416,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
 
             other if !other.starts_with('-') && o.server.is_empty() => o.server = other.to_string(),
             other => return Err(format!("Unbekannte Option '{}'. --help zeigt alle.", other)),
+        }
+    }
+
+    // `--proxy` gewinnt: Wer die Adresse ausdrücklich angibt, meint diese.
+    if o.proxy.is_none() {
+        if let Some(text) = proxy_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            o.proxy =
+                Some(Proxy::parse(text).map_err(|error| format!("{}: {}", PROXY_ENV, error))?);
         }
     }
 
@@ -660,7 +686,42 @@ mod tests {
     use super::*;
 
     fn parse_args(args: &[&str]) -> Result<Command, String> {
-        parse(args.iter().map(|s| s.to_string()))
+        parse_with_proxy_env(args.iter().map(|s| s.to_string()), None)
+    }
+
+    #[test]
+    fn proxy_kommt_auch_aus_der_umgebung() {
+        let run = |args: &[&str], env: Option<&str>| match parse_with_proxy_env(
+            args.iter().map(|s| s.to_string()),
+            env.map(String::from),
+        ) {
+            Ok(Command::Run(o)) => Ok(o.proxy.map(|proxy| proxy.describe())),
+            Ok(_) => panic!("kein Lauf-Befehl"),
+            Err(error) => Err(error),
+        };
+        let from_env = run(
+            &["mc.example.net"],
+            Some("socks5://nutzer:geheim@192.0.2.1:1080"),
+        )
+        .unwrap()
+        .expect("Proxy aus AFK_PROXY");
+        assert!(from_env.contains("192.0.2.1:1080"));
+        assert!(
+            !from_env.contains("geheim"),
+            "Passwort darf nicht in der Anzeige stehen"
+        );
+        // Leer oder nur Leerzeichen heißt: kein Proxy.
+        assert_eq!(run(&["mc.example.net"], Some("  ")).unwrap(), None);
+        // Die Option gewinnt gegen die Umgebung.
+        let explicit = run(
+            &["mc.example.net", "--proxy", "socks5://192.0.2.9:1080"],
+            Some("socks5://192.0.2.1:1080"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(explicit.contains("192.0.2.9"));
+        let error = run(&["mc.example.net"], Some("ftp://192.0.2.1:21")).unwrap_err();
+        assert!(error.starts_with("AFK_PROXY: "), "{}", error);
     }
 
     fn options(args: &[&str]) -> Options {

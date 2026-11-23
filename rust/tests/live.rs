@@ -1457,7 +1457,11 @@ fn browser_viewer_antwortet_nur_mit_token() {
     assert_eq!(status, 200);
     assert!(head.contains("text/html"), "{}", head);
     let page = String::from_utf8_lossy(&body);
-    assert!(page.contains("Live-POV"), "unerwartete Seite");
+    assert!(
+        page.contains("AFKSystems Live-Ansicht"),
+        "unerwartete Seite"
+    );
+    assert!(page.contains("const CAMERA = true;"), "Kamerabild fehlt");
     assert!(
         !page.contains("https://"),
         "die Seite laedt von aussen nach"
@@ -1534,8 +1538,10 @@ fn browser_menue_ohne_pov_liefert_hotbar_aber_keine_weltdaten() {
     let (status, _, body) = common::http_get(port, &format!("/?token={}", token));
     assert_eq!(status, 200);
     let page = String::from_utf8_lossy(&body);
-    assert!(!page.contains("Live-POV"), "zeigt die volle Live-Ansicht");
-    assert!(!page.contains("crosshair"), "zeigt ein Kamera-Fadenkreuz");
+    assert!(
+        page.contains("const CAMERA = false;"),
+        "zeigt die volle Live-Ansicht"
+    );
     assert!(page.contains("renderHotbar"), "keine Hotbar-Logik");
 
     // Der Zustand hat Position und Texturen, aber keine Chunks/Entities – die gibt es ohne `pov`
@@ -1920,7 +1926,7 @@ fn browser_pov_liefert_seite_und_live_zustand() {
 
     let page = String::from_utf8(get(web_port, &format!("/?token={}", token))).unwrap();
     assert!(page.starts_with("HTTP/1.1 200"), "{}", page);
-    assert!(page.contains("AFKSystems – Live-POV"), "HTML fehlt");
+    assert!(page.contains("AFKSystems Live-Ansicht"), "HTML fehlt");
 
     let state =
         String::from_utf8(get(web_port, &format!("/api/state.json?token={}", token))).unwrap();

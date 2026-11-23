@@ -8,7 +8,7 @@ afk --server localhost:25565 --mc 26.1
 afk --help
 ```
 
-Accounts and login tokens are stored locally. Use `--account` to select a saved account and `--no-reconnect` when another process manages restarts.
+Accounts and login tokens are stored locally. Use `--account` to select a saved account and `--no-reconnect` when another process manages restarts. Pass proxy credentials through `AFK_PROXY` instead of `--proxy` so other local users cannot read them from the process list.
 
 ## Build
 
