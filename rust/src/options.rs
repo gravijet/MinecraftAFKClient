@@ -204,11 +204,8 @@ pub struct Options {
     /// Client sie selbst (siehe [`crate::pov_resources`]); ins Binary eingebettet wird nichts.
     /// Gilt für die volle Live-Ansicht genauso wie fürs Browser-Menü ohne Weltteil (`web-menu`) –
     /// beide lesen dieselbe JAR.
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     pub pov_resources: crate::pov_resources::Source,
     /// Ohne Live-Ansicht und ohne Browser-Menü ist die Angabe wirkungslos und wird nur gemeldet.
-    #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-    pub pov_resources: Option<String>,
 
     /// Nach einem Kick oder Netzabbruch neu verbinden. Standardmäßig gesetzt; `None` steht für
     /// `--no-reconnect`, dann endet der Prozess mit Status 1.
@@ -243,10 +240,7 @@ impl Default for Options {
             pov_size: None,
             pov_fps: None,
             pov_web: None,
-            #[cfg(any(feature = "pov", feature = "web-menu"))]
             pov_resources: crate::pov_resources::Source::Auto,
-            #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-            pov_resources: None,
             reconnect: None,
         }
     }
@@ -362,13 +356,8 @@ fn parse_with_proxy_env<I: IntoIterator<Item = String>>(
             }
             "--pov-resources" | "--pov-assets" => {
                 let wanted = value("--pov-resources")?;
-                #[cfg(any(feature = "pov", feature = "web-menu"))]
                 {
                     o.pov_resources = crate::pov_resources::Source::parse(&wanted);
-                }
-                #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-                {
-                    o.pov_resources = Some(wanted);
                 }
             }
             "-m" | "--mc" | "--version" => {
@@ -1061,7 +1050,6 @@ mod tests {
             "/tmp/client.jar",
         ]);
         assert_eq!(web.pov_web.unwrap().to_string(), "127.0.0.1:8765");
-        #[cfg(any(feature = "pov", feature = "web-menu"))]
         {
             use crate::pov_resources::Source;
             assert_eq!(
@@ -1075,8 +1063,6 @@ mod tests {
                 Source::Off
             );
         }
-        #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-        assert_eq!(web.pov_resources.as_deref(), Some("/tmp/client.jar"));
         assert!(parse_args(&["x", "--pov-web", "localhost:8765"]).is_err());
         assert!(parse_args(&["x", "--pov-web", "0"]).is_err());
     }

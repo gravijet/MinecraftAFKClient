@@ -20,60 +20,44 @@ use crate::options::Options;
 use crate::proto::In;
 
 use std::sync::Arc;
-#[cfg(feature = "items")]
 use std::sync::Mutex;
 
-#[cfg(feature = "state")]
 use crate::buf::Writer;
-#[cfg(feature = "state")]
 use crate::proto::values;
-#[cfg(feature = "state")]
 use std::sync::atomic::AtomicU32;
-#[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
 use std::sync::atomic::AtomicUsize;
-#[cfg(any(feature = "state", feature = "antiafk"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Zustand aller Zusatzteile. Hängt in `Shared` und lebt damit genauso lange wie der Client.
 pub struct Extras {
-    #[cfg(feature = "board")]
     pub(crate) board: crate::board::Board,
-    #[cfg(feature = "menu")]
     pub(crate) menu: crate::menu::Menu,
     #[cfg(feature = "pov")]
     pub(crate) pov: crate::pov::Pov,
     /// Original-Ressourcen (Item-Icons, Hotbar-/Menü-Texturen) für den Browser-Menü-Build ohne
     /// volle Live-Ansicht. Mit `pov` gibt es stattdessen `Pov::assets` – beide schließen sich in
     /// den offiziellen Bauformen aus.
-    #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+    #[cfg(not(feature = "pov"))]
     pub(crate) web: crate::pov_assets::WebAssets,
     /// Optional vom Server synchronisierte Registry-ID -> Ressourcenname. Vanilla-Namen kommen
     /// zuverlässig aus [`crate::item_names`]; diese Liste darf sie bei einem Server ersetzen,
     /// der `minecraft:item` tatsächlich synchronisiert.
-    #[cfg(feature = "items")]
     pub(crate) item_names: Mutex<Vec<String>>,
 
     /// Sekunden zwischen zwei Anti-AFK-Aktionen; 0 = aus.
-    #[cfg(feature = "antiafk")]
     pub(crate) antiafk: std::sync::atomic::AtomicU64,
     /// Läuft der Anti-AFK-Thread gerade? Verhindert, dass `:antiafk on` einen zweiten startet.
-    #[cfg(feature = "antiafk")]
     pub(crate) antiafk_running: AtomicBool,
 
     /// Beim Beitritt automatisch losschleichen (`--sneak`).
-    #[cfg(feature = "state")]
     sneak_on_join: bool,
     /// Aktueller Tastenzustand – ab 1.21.11 wird er als ganzes Bitfeld gesendet, deshalb müssen
     /// wir ihn kennen und nicht nur die Änderung.
-    #[cfg(feature = "state")]
     sneaking: AtomicBool,
-    #[cfg(feature = "state")]
     sprinting: AtomicBool,
     /// Sequenz der Weltinteraktionen. Vanilla erhöht sie bei jeder Benutzung; dauerhaft `0` zu
     /// senden lässt Server-Acknowledgements mehrerer Aktionen ununterscheidbar werden.
-    #[cfg(feature = "state")]
     use_sequence: AtomicU32,
-    #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
     pub(crate) selected_hotbar: AtomicUsize,
 }
 
@@ -81,29 +65,19 @@ impl Extras {
     pub fn new(options: &Options) -> Extras {
         let _ = options;
         Extras {
-            #[cfg(feature = "board")]
             board: crate::board::Board::new(),
-            #[cfg(feature = "menu")]
             menu: crate::menu::Menu::new(),
             #[cfg(feature = "pov")]
             pov: crate::pov::Pov::new(options),
-            #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+            #[cfg(not(feature = "pov"))]
             web: crate::pov_assets::WebAssets::default(),
-            #[cfg(feature = "items")]
             item_names: Mutex::new(Vec::new()),
-            #[cfg(feature = "antiafk")]
             antiafk: std::sync::atomic::AtomicU64::new(options.antiafk_seconds),
-            #[cfg(feature = "antiafk")]
             antiafk_running: AtomicBool::new(false),
-            #[cfg(feature = "state")]
             sneak_on_join: options.sneak,
-            #[cfg(feature = "state")]
             sneaking: AtomicBool::new(false),
-            #[cfg(feature = "state")]
             sprinting: AtomicBool::new(false),
-            #[cfg(feature = "state")]
             use_sequence: AtomicU32::new(0),
-            #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
             selected_hotbar: AtomicUsize::new(0),
         }
     }
@@ -113,17 +87,13 @@ impl Extras {
 /// die eine aktive Bauform wirklich benötigt; ein Paket ist bereits längenbegrenzt, deshalb darf
 /// der Rest aller anderen Register ungelesen verworfen werden.
 pub fn registry(shared: &Arc<Shared>, r: &mut Reader) {
-    #[cfg(any(feature = "items", feature = "pov"))]
     registry_used(shared, r);
     // Bauformen ohne Gegenstände und ohne Live-Ansicht brauchen aus der Registry nichts.
-    #[cfg(not(any(feature = "items", feature = "pov")))]
-    let _ = (shared, r);
 }
 
-#[cfg(any(feature = "items", feature = "pov"))]
 fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     let Ok(registry) = r.string() else { return };
-    let wants_items = cfg!(feature = "items") && registry == "minecraft:item";
+    let wants_items = true && registry == "minecraft:item";
     let wants_dimensions = cfg!(feature = "pov") && registry == "minecraft:dimension_type";
     // Aus den Biomen kommt die Einfärbung von Gras, Laub und Wasser. Ihre Reihenfolge hier ist
     // genau die, die die Chunk-Paletten als Nummer nennen.
@@ -140,7 +110,6 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     // Nur der wirklich gesuchte Vektor bekommt Platz. `minecraft:item` hat gut anderthalbtausend
     // Einträge – dafür in einer POV-Bauform, die die Liste gar nicht will, Speicher anzufordern,
     // wäre reine Verschwendung.
-    #[cfg(feature = "items")]
     let mut item_names = match wants_items {
         true => Vec::with_capacity(count as usize),
         false => Vec::new(),
@@ -173,7 +142,6 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         // Beides zugleich kann nicht sein – es ist ein Register je Paket. Das `continue` spart
         // deshalb nur die Kopie des Namens: `minecraft:item` hat gut anderthalbtausend Einträge,
         // und die wurden bisher alle doppelt angelegt.
-        #[cfg(feature = "items")]
         if wants_items {
             item_names.push(name);
             continue;
@@ -189,7 +157,6 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         }
     }
 
-    #[cfg(feature = "items")]
     if wants_items {
         *shared.extras.item_names.lock().unwrap() = item_names;
     }
@@ -210,19 +177,14 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
 pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
     // Eine Bauform, die nur sendet (`state`, `antiafk`), wertet überhaupt kein Zusatzpaket aus –
     // dann bleiben beide Parameter ungenutzt.
-    #[cfg(not(any(feature = "board", feature = "menu", feature = "pov")))]
-    let _ = (&shared, &r);
     match kind {
-        #[cfg(feature = "board")]
         In::Objective | In::Score | In::ResetScore | In::DisplayObjective | In::Team => {
             crate::board::incoming(shared, kind, r)
         }
 
-        #[cfg(feature = "menu")]
         In::OpenScreen | In::ContainerContent | In::ContainerSlot | In::ContainerClose => {
             crate::menu::incoming(shared, kind, r)
         }
-        #[cfg(feature = "items")]
         In::PlayerInventory => crate::menu::incoming(shared, kind, r),
 
         #[cfg(feature = "pov")]
@@ -243,40 +205,24 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 }
 
 pub fn on_join(shared: &Arc<Shared>) {
-    #[cfg(not(any(
-        feature = "board",
-        feature = "menu",
-        feature = "pov",
-        feature = "state",
-        feature = "antiafk"
-    )))]
-    let _ = &shared;
     // Der alte Stand gilt nicht mehr – der neue Server schickt seinen eigenen.
-    #[cfg(feature = "board")]
     shared.extras.board.clear();
-    #[cfg(feature = "menu")]
     shared.extras.menu.clear();
     #[cfg(feature = "pov")]
     crate::pov::on_join(shared);
 
-    #[cfg(feature = "state")]
     {
         shared.extras.sneaking.store(false, Ordering::Relaxed);
         shared.extras.sprinting.store(false, Ordering::Relaxed);
         shared.extras.use_sequence.store(0, Ordering::Relaxed);
-        #[cfg(any(feature = "pov", feature = "web-menu"))]
         shared.extras.selected_hotbar.store(0, Ordering::Relaxed);
     }
-    #[cfg(feature = "antiafk")]
     crate::antiafk::on_join(shared);
 }
 
 /// Der Login allein reicht für Spieleraktionen noch nicht: Erst nach dem ersten Teleport kennt
 /// der Client seine autoritative Position. Genau danach wird ein gewünschtes `--sneak` gesendet.
 pub fn on_position(shared: &Arc<Shared>, initial: bool) {
-    #[cfg(not(feature = "state"))]
-    let _ = (shared, initial);
-    #[cfg(feature = "state")]
     if initial && shared.extras.sneak_on_join {
         set_sneak(shared, true);
     }
@@ -284,9 +230,7 @@ pub fn on_position(shared: &Arc<Shared>, initial: bool) {
 
 pub fn on_disconnect(shared: &Shared) {
     let _ = shared;
-    #[cfg(feature = "board")]
     shared.extras.board.clear();
-    #[cfg(feature = "menu")]
     shared.extras.menu.clear();
     #[cfg(feature = "pov")]
     shared.extras.pov.clear();
@@ -302,13 +246,11 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
     // dahinter wäre unerreichbarer Code, über den der Compiler zu Recht klagt.
     let _ = (shared, verb, arg);
 
-    #[cfg(feature = "board")]
     if matches!(verb, "board" | "tafel" | "scoreboard") {
         crate::board::print_sidebar(shared);
         return true;
     }
 
-    #[cfg(feature = "menu")]
     {
         if matches!(verb, "menu" | "menü" | "container" | "kiste") {
             crate::menu::print(shared);
@@ -324,7 +266,6 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
         }
     }
 
-    #[cfg(feature = "items")]
     {
         if matches!(verb, "slot" | "feld") {
             crate::menu::print_slot(shared, arg);
@@ -342,7 +283,6 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
         return true;
     }
 
-    #[cfg(feature = "state")]
     {
         let game_action = matches!(
             verb,
@@ -413,7 +353,6 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
         }
     }
 
-    #[cfg(feature = "antiafk")]
     if matches!(verb, "antiafk" | "anti-afk" | "zappeln") {
         crate::antiafk::command(shared, arg);
         return true;
@@ -425,25 +364,18 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
 /// Zeilen für `:help` – nur die, die dieser Build wirklich hat.
 pub fn help_lines() -> &'static [&'static str] {
     &[
-        #[cfg(feature = "board")]
         ":board                                 Seitenleiste (mit Farbcodes)",
-        #[cfg(feature = "menu")]
         ":menu  ·  :click <feld> [rechts|shift] ·  :close",
-        #[cfg(feature = "items")]
         ":slot <feld>  ·  :inv                  Gegenstand mit Lore · eigenes Inventar",
         #[cfg(feature = "pov")]
         ":pov [live|stop|frame|size|info]       Live-Ansicht dessen, was der Spieler sieht",
-        #[cfg(feature = "state")]
         ":sneak [on|off]  ·  :sprint [on|off]   Schleichen · Sprinten",
-        #[cfg(feature = "state")]
         ":swing  ·  :use  ·  :hand <1-9>        Arm · Rechtsklick · Schnellleiste",
-        #[cfg(feature = "antiafk")]
         ":antiafk [on|off|<sek>]                automatische kleine Bewegung",
     ]
 }
 
 /// `on|off|an|aus` oder ohne Angabe umschalten – für `:sneak` und `:sprint` gleich.
-#[cfg(feature = "state")]
 fn toggle(
     shared: &Arc<Shared>,
     arg: &str,
@@ -469,7 +401,6 @@ fn toggle(
 
 // ===================== Tastenzustand =====================
 
-#[cfg(feature = "state")]
 pub(crate) fn set_sneak(shared: &Arc<Shared>, on: bool) {
     shared.extras.sneaking.store(on, Ordering::Relaxed);
     send_state(
@@ -480,7 +411,6 @@ pub(crate) fn set_sneak(shared: &Arc<Shared>, on: bool) {
     );
 }
 
-#[cfg(feature = "state")]
 pub(crate) fn set_sprint(shared: &Arc<Shared>, on: bool) {
     shared.extras.sprinting.store(on, Ordering::Relaxed);
     send_state(
@@ -497,7 +427,6 @@ pub(crate) fn set_sprint(shared: &Arc<Shared>, on: bool) {
 ///   nur die *Änderung* gemeldet.
 /// * **ab 1.21.11** gibt es stattdessen ein Eingabepaket mit einem Bitfeld aller Tasten. Es
 ///   beschreibt den *Gesamtzustand*, deshalb müssen beide Bits jedes Mal mit hinein.
-#[cfg(feature = "state")]
 fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
     if shared.proto.modern {
         let mut bits = 0u8;
@@ -524,7 +453,6 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
 /// Die Blickrichtung steht erst ab 1.21.2 mit im Paket. In 1.21.1 besteht
 /// `ServerboundUseItemPacket` nur aus Hand und Sequenznummer – die acht zusätzlichen Bytes
 /// haben dort den Paket-Decoder des Servers aus dem Tritt gebracht und die Verbindung gekostet.
-#[cfg(feature = "state")]
 fn use_item(shared: &Arc<Shared>) {
     let mut w = Writer::packet(shared.proto.extra.sb_use_item);
     if shared.proto.legacy {
@@ -565,14 +493,12 @@ fn use_item(shared: &Arc<Shared>) {
 }
 
 /// `:hand 1..9` – das Feld in der Schnellleiste wechseln.
-#[cfg(feature = "state")]
 fn hotbar(shared: &Arc<Shared>, arg: &str) {
     match arg.trim().parse::<u8>() {
         Ok(slot @ 1..=9) => {
             let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
             w.u16(slot as u16 - 1); // übertragen wird 0..8
             shared.send(w);
-            #[cfg(any(feature = "pov", feature = "web-menu"))]
             shared
                 .extras
                 .selected_hotbar
@@ -585,7 +511,6 @@ fn hotbar(shared: &Arc<Shared>, arg: &str) {
     }
 }
 
-#[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
 pub(crate) fn web_hotbar(shared: &Arc<Shared>, slot: usize) -> bool {
     if slot >= 9 || !shared.ready_for_gameplay() {
         return false;
@@ -603,7 +528,6 @@ mod tests {
 
     /// Das Bitfeld ab 1.21.11 beschreibt den Gesamtzustand: beide Tasten müssen sich unabhängig
     /// setzen lassen, ohne einander zu überschreiben.
-    #[cfg(feature = "state")]
     #[test]
     fn eingabebits_stoeren_sich_nicht() {
         use crate::proto::values;

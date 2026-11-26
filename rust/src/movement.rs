@@ -213,7 +213,6 @@ impl Mover {
         self.active.swap(0, Ordering::SeqCst) != 0
     }
 
-    #[cfg(feature = "antiafk")]
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst) != 0
     }

@@ -1,6 +1,6 @@
 [package]
 name = "afk"
-version = "2.9.0"
+version = "3.0.0"
 edition = "2021"
 description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.8.9, 1.21.1, 1.21.11, 26.1 und 26.2"
 
@@ -8,52 +8,13 @@ description = "AFKSystems – schlanker Minecraft-AFK-Client für MC 1.8.9, 1.21
 name = "afk"
 path = "src/main.rs"
 
-# Bauformen aus derselben Quelle. Was eine Bauform nicht kann, ist in ihr auch nicht
-# einkompiliert – weder der Code noch die Zustandstabellen. Die Skripte bauen jede Variante in ein
-# eigenes Zielverzeichnis, damit sie sich nicht gegenseitig überschreiben
-# (siehe build-all.ps1 / build-all.sh, Dateinamen in RELEASE.md).
-#
-#   (ohne)              schlanker AFK-Client – kein Byte darüber hinaus
-#   --features movement   zusätzlich :go/:look/:home/:route
-#   --features items      zusätzlich Menüs samt Feldinhalten (Name, Farben, Lore)
-#   --features web-menu   Menüs und Gegenstaende plus Browser-Ansicht mit echten Texturen,
-#                         aber ohne Chunks/Weltspeicher (siehe pov-client fuer die volle Live-Ansicht)
-#   --features pov-client Live-Ansicht samt Browser-HUD, Menues und Gegenstaenden
-#   --features premium    zusätzlich Anzeigetafel, Menüs, Anti-AFK, Schleichen
-#   --features premium,items   Premium plus Feldinhalte
-#   --features ultra      alles zusammen
+# Zwei Bauformen aus derselben Quelle (siehe build-all.sh / build-all.ps1):
+#   (ohne)          Standard: Chat, Befehle, Makros, Bewegung mit echter Physik, Anzeigetafel,
+#                   Menüs, Inventar, Tastenzustand, Anti-AFK, Browser-Menü
+#   --features pov  zusätzlich die Live-Ansicht (Kamerabild aus den Chunks)
 [features]
 default = []
-
-# --- Einzelteile ---------------------------------------------------------------------------
-# Örtliche ':'-Befehle überhaupt (Eingabeschleife, :help, :pos).
-local = []
-movement = ["local"]
-# Gemeinsame Zusatz-Paket-IDs aller Ausbaustufen (proto::Extra).
-extras = ["local"]
-# Anzeigetafel (Seitenleiste).
-board = ["extras"]
-# Behälter/Menüs öffnen, anklicken, schließen.
-menu = ["extras"]
-# Feldinhalte lesen: Name, Farbformatierung, Lore.
-items = ["menu"]
-# Tastenzustand: Schleichen, Sprinten, Arm, Rechtsklick, Schnellleiste.
-state = ["extras"]
-# Automatische kleine Bewegung – braucht sb_swing (state) und das Bewegungspaket.
-antiafk = ["movement", "state"]
-# Live-Ansicht: Chunks lesen und als Bild zeichnen.
-pov = ["extras", "dep:png", "dep:zip"]
-# Eigene POV-Datei: startet die Ansicht nach dem Beitritt automatisch. Ultra enthält zwar den
-# POV-Code, startet ihn aber nur auf Wunsch mit `:pov live`.
-pov-client = ["pov", "items", "state"]
-# Browser-Menü mit echten Texturen (Hotbar, Behaelter, Item-Icons aus der Original-JAR), aber
-# ohne den `pov`-Weltteil: kein Chunk-Lesen, kein Weltspeicher, kein Raycaster. Braucht `png`/`zip`
-# selbst, weil dieselbe JAR gelesen wird wie fuer die volle Live-Ansicht.
-web-menu = ["items", "state", "dep:png", "dep:zip"]
-
-# --- Fertige Bauformen ---------------------------------------------------------------------
-premium = ["movement", "board", "menu", "state", "antiafk"]
-ultra = ["premium", "items", "pov"]
+pov = []
 
 [dependencies]
 # HTTPS nur für Login/Token-Refresh und den Sitzungs-Join (kurze Bursts, danach wieder frei).
@@ -77,8 +38,8 @@ p256 = { version = "0.13", features = ["pkcs8"] }
 # Die Browser-POV decodiert die PNGs aus der Original-Client-JAR und schreibt ihre Frames als
 # PNG. Beides bleibt auf POV/Ultra beschraenkt; die schlanke Binary zieht die Abhaengigkeiten
 # nicht mit.
-png = { version = "0.17", optional = true }
-zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"], optional = true }
+png = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 [target.'cfg(windows)'.dependencies]
 # TLS über SChannel (im System vorhanden) – spart den Wurzelzertifikat-Speicher im Binary.

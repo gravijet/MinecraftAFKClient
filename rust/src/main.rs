@@ -1,39 +1,26 @@
-//! AFKSystems (Rust) – schlanker Minecraft-AFK-Client, **eine Binary für alle unterstützten
-//! Protokolle** (1.21.1, 1.21.11, 26.1, 26.2; Auswahl über `--mc`).
+//! AFKSystems – Minecraft-AFK-Client, **eine Binary für alle unterstützten Protokolle**
+//! (Auswahl über `--mc`).
 //!
-//! Kein Menü, keine Konfigurationsdatei: alles steht im Startbefehl. Der Client meldet sich an,
-//! tritt bei und gibt danach ausschließlich Chat auf der Standardausgabe aus – Statusmeldungen
-//! gehen auf die Standardfehlerausgabe, Eingabezeilen gehen als Chat raus. Damit lässt er sich
-//! ohne Terminal betreiben und von einem anderen Programm (z. B. einer Website) fernsteuern.
+//! Kein Menü, keine Konfigurationsdatei: alles steht im Startbefehl. Chat geht auf die
+//! Standardausgabe, Statusmeldungen auf die Standardfehlerausgabe, Eingabezeilen als Chat raus.
+//! Damit lässt er sich ohne Terminal betreiben und von einem Panel fernsteuern.
 //!
-//! Mehrere Bauformen aus derselben Quelle:
-//! * `cargo build --release` – der schlanke AFK-Client, ohne jede Bewegung.
-//! * `cargo build --release --features movement` – zusätzlich gesteuerte Bewegung
-//!   (`:go`, `:look`, `:home`, `:route`, `:stop`, `:pos`), siehe [`movement`].
-//! * `cargo build --release --features items` – Menüs und deren Gegenstände samt Lore.
-//! * `cargo build --release --features pov-client` – automatisch gestartete Live-Ansicht.
-//! * `cargo build --release --features premium` – Anzeigetafel, Menüs, Anti-AFK und Schleichen.
-//! * `cargo build --release --features ultra` – alle Rust-Zusatzfunktionen.
+//! Zwei Bauformen aus derselben Quelle:
+//! * `cargo build --release` – Standard (Chat, Befehle, Bewegung mit Physik, Tafel, Menüs).
+//! * `cargo build --release --features pov` – zusätzlich die Live-Ansicht.
 
-#[cfg(feature = "antiafk")]
 mod antiafk;
 mod auth;
-#[cfg(feature = "board")]
 mod board;
 mod buf;
 mod client;
 mod conn;
 mod console;
 mod dns;
-#[cfg(feature = "extras")]
 mod extras;
-#[cfg(feature = "items")]
 mod item_names;
-#[cfg(feature = "items")]
 mod items;
-#[cfg(feature = "menu")]
 mod menu;
-#[cfg(feature = "movement")]
 mod movement;
 mod nbt;
 mod options;
@@ -41,11 +28,8 @@ mod options;
 mod pov;
 // `web-menu` liest dieselben JAR-Ressourcen und startet denselben Browser-Server wie die volle
 // Live-Ansicht – nur ohne `pov` (Chunks, Weltspeicher, Raycaster).
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_assets;
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_resources;
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 mod pov_web;
 mod proto;
 mod proxy;
@@ -128,7 +112,6 @@ fn run(options: Options) {
         if line.is_empty() {
             continue;
         }
-        #[cfg(feature = "local")]
         if let Some(rest) = line.strip_prefix(':') {
             let mut parts = rest.splitn(2, char::is_whitespace);
             let verb = parts.next().unwrap_or("").to_lowercase();
@@ -144,43 +127,16 @@ fn run(options: Options) {
     }
 }
 
-/// Das Panel schickt allen Bauformen dieselben Argumente. Damit `--antiafk` im schlanken Build
-/// nicht still verpufft, wird hier einmal gesagt, was dieser Build nicht kann.
+/// Das Panel schickt beiden Bauformen dieselben Argumente. Was die Standard-Bauform davon nicht
+/// kann, wird einmal gesagt statt still übergangen.
 fn warn_about_unused_options(console: &Console, options: &Options) {
-    #[cfg(feature = "antiafk")]
-    let _ = options;
-    #[cfg(not(feature = "antiafk"))]
-    {
-        if options.antiafk_seconds > 0 {
-            console.warn("--antiafk braucht den Premium- oder Ultra-Client; wird ignoriert.");
-        }
-    }
-    #[cfg(not(feature = "state"))]
-    {
-        if options.sneak {
-            console.warn("--sneak braucht den Premium- oder Ultra-Client; wird ignoriert.");
-        }
-    }
-    // Kamera-Optionen: die gibt es nur mit vollem `pov` (Chunks/Raycaster). `web-menu` kennt
-    // Hotbar/Menü, aber kein Bild – deshalb bleiben `--pov-web`/`--pov-resources` hier aussen vor.
     #[cfg(not(feature = "pov"))]
     if options.pov_size.is_some() || options.pov_autostart.is_some() || options.pov_fps.is_some() {
-        console
-            .warn("--pov/--pov-size/--pov-fps brauchen die POV- oder Ultra-Datei; wird ignoriert.");
+        console.warn("--pov/--pov-size/--pov-fps brauchen die POV-Datei; wird ignoriert.");
     }
-    // `--pov-web`/`--pov-resources` brauchen mindestens `web-menu` (Hotbar/Menü im Browser).
-    #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-    if options.pov_web.is_some() || options.pov_resources.is_some() {
-        console.warn(
-            "--pov-web/--pov-resources brauchen die POV-, Ultra- oder Browser-Menü-Datei; wird ignoriert.",
-        );
-    }
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     if options.pov_resources != pov_resources::Source::Auto && options.pov_web.is_none() {
         console.warn("--pov-resources wird ohne --pov-web nicht geladen.");
     }
-    #[cfg(all(feature = "state", any(feature = "pov", feature = "web-menu")))]
-    let _ = console;
 }
 
 // ===================== Anmeldung =====================
@@ -314,70 +270,44 @@ fn print_usage() {
          \x20 -q, --quiet                 keine Statusmeldungen, nur Chat\n\
          \x20     --events                zusaetzlich '@event ...'-Zeilen zum Mitlesen\n\
          \x20 -h, --help                  diese Hilfe\n\
-         {}{}\n\
+         \n\
+         Spieler:\n\
+         \x20     --antiafk <sek>         alle <sek> eine kleine Bewegung (min. 15, 0 = aus)\n\
+         \x20     --sneak                 beim Beitritt geduckt bleiben\n\
+         {}\n\
          Beispiel:\n\
          \x20 afk mc.example.net --mc 26.1 -c 300:/afk --on death=/spawn\n\
          \n\
          Ausgabe: Chat auf der Standardausgabe, alles andere auf der Standardfehlerausgabe.\n\
          Eingabe: jede Zeile geht als Chat raus, mit '/' vorn als Serverbefehl.\n\
-         Konten:  {}{}",
+         Konten:  {}\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf.\n\
+         Bewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis.",
         env!("CARGO_PKG_VERSION"),
-        if cfg!(feature = "ultra") {
-            "Ultra-AFK-Client fuer Minecraft"
-        } else if cfg!(feature = "pov-client") {
-            "POV-AFK-Client fuer Minecraft"
-        } else if cfg!(feature = "web-menu") {
-            "AFK-Client mit Gegenstaenden und Browser-Menü"
-        } else if cfg!(feature = "items") && cfg!(feature = "premium") {
-            "Premium-AFK-Client mit Gegenstaenden"
-        } else if cfg!(feature = "premium") {
-            "Premium-AFK-Client fuer Minecraft"
-        } else if cfg!(feature = "items") {
-            "AFK-Client mit Gegenstaenden"
-        } else if cfg!(feature = "movement") {
-            "Minecraft-AFK-Client mit Bewegung"
+        if cfg!(feature = "pov") {
+            "Minecraft-AFK-Client mit Live-Ansicht"
         } else {
-            "schlanker Minecraft-AFK-Client"
+            "Minecraft-AFK-Client"
         },
         Protocol::names(),
         proto::DEFAULT.name,
         options::DEFAULT_VIEW_DISTANCE,
-        if cfg!(feature = "antiafk") {
-            "\nPremium:\n\
-             \x20     --antiafk <sek>         alle <sek> eine kleine Bewegung (min. 15, 0 = aus)\n\
-             \x20     --sneak                 beim Beitritt geduckt bleiben\n"
-        } else {
-            ""
-        },
         if cfg!(feature = "pov") {
             "\nLive-Ansicht:\n\
-             \x20     --pov an|aus            Ansicht beim Beitritt starten (POV an, Ultra aus)\n\
+             \x20     --pov an|aus            Ansicht beim Beitritt starten (Standard: an)\n\
              \x20     --pov-size <b>x<h>      Bildgroesse in Pixeln, z. B. 160x80 (Standard 64x32)\n\
              \x20     --pov-fps <1-20>        Bilder je Sekunde (Standard 8)\n\
              \x20     --pov-web <port|ip:port> texturierten Browser-Viewer starten\n\
              \x20     --pov-resources <jar|auto|aus>  Original-Client-JAR fuer echte Texturen.\n\
              \x20                             Standard 'auto': vorhandene Minecraft-Installation\n\
              \x20                             benutzen, sonst einmalig von Mojang laden.\n"
-        } else if cfg!(feature = "web-menu") {
+        } else {
             "\nBrowser-Menü:\n\
              \x20     --pov-web <port|ip:port> Hotbar und Menü/Inventar mit echten Texturen im\n\
-             \x20                             Browser zeigen (kein Kamerabild, keine Weltdaten)\n\
+             \x20                             Browser zeigen (kein Kamerabild)\n\
              \x20     --pov-resources <jar|auto|aus>  Original-Client-JAR fuer echte Texturen.\n\
              \x20                             Standard 'auto': vorhandene Minecraft-Installation\n\
              \x20                             benutzen, sonst einmalig von Mojang laden.\n"
-        } else {
-            ""
         },
-        options::dir().display(),
-        if cfg!(feature = "local") {
-            if cfg!(feature = "movement") {
-                "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf.\n\
-                 Bewegung (:go, :look, :home) merkt sich movement.json im selben Verzeichnis."
-            } else {
-                "\nOertliche Befehle beginnen mit ':' – ':help' listet sie alle auf."
-            }
-        } else {
-            ""
-        }
+        options::dir().display()
     );
 }

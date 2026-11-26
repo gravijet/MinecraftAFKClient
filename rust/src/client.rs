@@ -59,7 +59,6 @@ const WORLD_LOAD_GRACE: Duration = Duration::from_secs(3);
 /// So lange darf eine getippte Spielaktion auf das Ende der Ladephase warten – siehe
 /// [`Shared::await_gameplay`]. Bewusst etwas mehr als [`WORLD_LOAD_GRACE`]: dann greift in
 /// jedem Fall zuerst die Notbremse, und die Aktion geht doch noch raus.
-#[cfg(any(feature = "state", feature = "menu", feature = "movement"))]
 pub(crate) const GAMEPLAY_WAIT: Duration = Duration::from_secs(4);
 /// Der von Vanilla für die Client-Kennung definierte Payload-Kanal.
 const BRAND_CHANNEL: &str = "minecraft:brand";
@@ -197,28 +196,15 @@ pub struct Shared {
     started: Instant,
 
     /// Gesteuerte Bewegung (`:go`, `:look`, `:home`) – nur im Build mit `--features movement`.
-    #[cfg(feature = "movement")]
     pub(crate) mover: crate::movement::Mover,
 
     /// Optionale Zustände (Anzeigetafel, Menüs, Gegenstände, POV, Tastenzustand, Anti-AFK).
     ///
     /// `extras` allein ist nur der gemeinsame Unterbau (Paket-IDs, Verteilerstelle); erst eine
     /// der darauf aufbauenden Funktionen liest hier etwas heraus.
-    #[cfg(feature = "extras")]
-    #[cfg_attr(
-        not(any(
-            feature = "board",
-            feature = "menu",
-            feature = "pov",
-            feature = "state",
-            feature = "antiafk"
-        )),
-        allow(dead_code)
-    )]
     pub(crate) extras: crate::extras::Extras,
 
     /// Eigene Entitäts-Nummer aus dem Login-Paket. Das Schleich-Paket von 1.21.1 braucht sie.
-    #[cfg(feature = "state")]
     pub(crate) entity_id: std::sync::atomic::AtomicI32,
 
     pub(crate) in_game: AtomicBool,
@@ -272,11 +258,8 @@ impl Client {
             world_load_since: AtomicU64::new(0),
             last_position_sent: AtomicU64::new(0),
             started: Instant::now(),
-            #[cfg(feature = "movement")]
             mover: crate::movement::Mover::new(),
-            #[cfg(feature = "extras")]
             extras: crate::extras::Extras::new(&options),
-            #[cfg(feature = "state")]
             entity_id: std::sync::atomic::AtomicI32::new(0),
             options,
             in_game: AtomicBool::new(false),
@@ -300,7 +283,7 @@ impl Client {
         // Ablage (siehe [`crate::pov_assets::WebAssets`]). Ohne `Pov` gibt es keinen
         // `web_running`-Merker – dieser Zweig läuft aber wie der obige genau einmal, beim
         // Anlegen des Clients.
-        #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+        #[cfg(not(feature = "pov"))]
         {
             if let Some(address) = shared.options().pov_web {
                 if let Err(error) = crate::pov_web::start(&shared, address) {
@@ -355,11 +338,8 @@ impl Client {
 
     /// Örtlicher Befehl aus der Eingabeschleife (alles mit `:` vorn). Zusatzbefehle bekommen
     /// zuerst die Gelegenheit; alles Übrige geht an die Bewegung.
-    #[cfg(feature = "local")]
     pub fn local_command(&self, verb: &str, arg: &str) {
         // Ohne Zusatzteile und ohne Bewegung nimmt niemand das Argument entgegen.
-        #[cfg(not(any(feature = "extras", feature = "movement")))]
-        let _ = arg;
         if matches!(verb, "help" | "hilfe" | "?") {
             return self.local_help();
         }
@@ -375,21 +355,14 @@ impl Client {
                     .error("Position noch unbekannt (nicht im Spiel?)."),
             };
         }
-        #[cfg(feature = "extras")]
         if crate::extras::command(&self.shared, verb, arg) {
             return;
         }
-        #[cfg(feature = "movement")]
         crate::movement::command(&self.shared, verb, arg);
-        #[cfg(not(feature = "movement"))]
-        self.shared
-            .console
-            .error("Unbekannter örtlicher Befehl. :help zeigt die verfügbaren Befehle.");
     }
 
     /// `:help` liegt absichtlich hier statt im Bewegungsmodul: auch Items- und POV-Dateien haben
     /// örtliche Befehle, obwohl dort kein Byte Bewegungslogik einkompiliert ist.
-    #[cfg(feature = "local")]
     fn local_help(&self) {
         let console = &self.shared.console;
         console.print("");
@@ -397,7 +370,6 @@ impl Client {
             crate::console::BOLD,
             "  Befehle (alles mit ':' vorn, alles andere geht in den Chat)",
         ));
-        #[cfg(feature = "movement")]
         for line in [
             ":go vor|zurück|links|rechts [blöcke]   laufen (Richtung relativ zum Blick)",
             ":look <gier> [neigung] · nord|ost|…    Kopf drehen",
@@ -408,7 +380,6 @@ impl Client {
         ] {
             console.print(&format!("    {}", line));
         }
-        #[cfg(feature = "extras")]
         for line in crate::extras::help_lines() {
             console.print(&format!("    {}", line));
         }
@@ -486,7 +457,6 @@ impl Shared {
     }
 
     /// Startargumente – die Zusatzteile lesen daraus ihre eigenen Einstellungen.
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     pub(crate) fn options(&self) -> &Options {
         &self.options
     }
@@ -515,7 +485,6 @@ impl Shared {
     ///
     /// Nur Bauformen mit örtlichen Spielaktionen rufen das auf; der schlanke Client stellt seine
     /// Chat-Zeilen einfach in die Warteschlange, und die wartet ohnehin.
-    #[cfg(any(feature = "state", feature = "menu", feature = "movement"))]
     pub(crate) fn await_gameplay(&self, timeout: Duration) -> bool {
         if self.ready_for_gameplay() {
             return true;
@@ -617,7 +586,6 @@ impl Shared {
     /// Nur die Blickrichtung im lokalen Zustand ändern. Ein Rotationspaket trägt absichtlich
     /// keine Koordinaten; deshalb darf eine gleichzeitig laufende Bewegung hier nicht durch
     /// einen zuvor gelesenen Positions-Snapshot zurückgesetzt werden.
-    #[cfg(feature = "movement")]
     pub(crate) fn set_rotation(&self, yaw: f32, pitch: f32) -> bool {
         let mut position = self.position.lock().unwrap();
         let Some(current) = position.as_mut() else {
@@ -893,9 +861,7 @@ fn net_loop(shared: Arc<Shared>) {
         // Wartende Befehls-Planer erkennen an der neuen Generation, dass sie fertig sind.
         shared.wake();
         shared.rules.reset();
-        #[cfg(feature = "movement")]
         crate::movement::on_disconnect(&shared);
-        #[cfg(feature = "extras")]
         crate::extras::on_disconnect(&shared);
 
         let transferred = shared.intentional.swap(false, Ordering::SeqCst);
@@ -1338,7 +1304,6 @@ fn handle_config(
             // Ab 1.21.11: ohne Bestätigung lässt der Server niemanden ins Spiel.
             shared.send(Writer::packet(cfg::SB_ACCEPT_CODE_OF_CONDUCT));
         }
-        #[cfg(feature = "extras")]
         cfg::CB_REGISTRY_DATA => crate::extras::registry(shared, r),
         cfg::CB_RESOURCE_PACK_PUSH => {
             let pack = r.uuid().map_err(|e| e.to_string())?;
@@ -1399,9 +1364,7 @@ fn handle_game(
         In::Login => {
             // Erstes Feld ist die eigene Entitäts-Nummer. Der schlanke Client braucht sie nicht,
             // das Schleich-Paket von 1.21.1 und die POV-Ansicht dagegen schon.
-            #[cfg(any(feature = "state", feature = "pov"))]
             let own_entity = r.i32().ok();
-            #[cfg(feature = "state")]
             if let Some(entity) = own_entity {
                 shared
                     .entity_id
@@ -1510,11 +1473,7 @@ fn handle_game(
 
         // Alles Weitere gibt es nur in einer Zusatz-Bauform. Im schlanken Build existieren
         // diese Zweige gar nicht.
-        #[cfg(feature = "extras")]
         other => crate::extras::incoming(shared, other, r),
-
-        #[cfg(not(feature = "extras"))]
-        In::Ignored => {}
     }
     Ok(false)
 }
@@ -1557,9 +1516,7 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
 
     // Heimatposition nach JEDEM Beitritt – anders als bei den Befehlen zählt hier auch der
     // Unterserver-Wechsel, denn dort landen wir in einer anderen Welt an einer anderen Stelle.
-    #[cfg(feature = "movement")]
     crate::movement::on_join(shared);
-    #[cfg(feature = "extras")]
     crate::extras::on_join(shared);
 }
 
@@ -1685,7 +1642,6 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     // Die erste Position setzt uns nur in die Welt. Jeder spätere Teleport ist dagegen eine
     // autoritative Servervorgabe (Korrektur, Plugin-Teleport, Portal): eine laufende lokale
     // Bewegung darf danach nicht weiter ihre alte Absicht gegen den Server durchsetzen.
-    #[cfg(feature = "movement")]
     if previous_position.is_some() && shared.mover.stop() {
         shared
             .console
@@ -1735,7 +1691,6 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     // Mit der Startposition kann die Ladephase enden – in 1.21.1 sofort, ab 1.21.4, sobald auch
     // der erste Chunk-Stapel da ist (den kann der Server schon vorher geschickt haben).
     finish_world_load(shared);
-    #[cfg(feature = "extras")]
     crate::extras::on_position(shared, previous_position.is_none());
     Ok(())
 }
@@ -2468,18 +2423,15 @@ mod tests {
             ];
             // Zusatz-IDs müssen sich in dieselbe Menge einreihen: eine Überschneidung mit einem
             // der obigen Pakete würde still das falsche Paket verarbeiten.
-            #[cfg(feature = "extras")]
             {
                 let e = &p.extra;
                 let _ = e;
-                #[cfg(feature = "menu")]
                 ids.extend_from_slice(&[
                     e.cb_container_close,
                     e.cb_container_set_content,
                     e.cb_container_set_slot,
                     e.cb_open_screen,
                 ]);
-                #[cfg(feature = "board")]
                 ids.extend_from_slice(&[
                     e.cb_reset_score,
                     e.cb_set_display_objective,
@@ -2521,7 +2473,6 @@ mod tests {
             } else {
                 assert_eq!(game.sb_client_tick_end, -1);
             }
-            #[cfg(feature = "movement")]
             {
                 if protocol.legacy {
                     assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos + 1);

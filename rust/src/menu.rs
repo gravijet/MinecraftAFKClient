@@ -22,7 +22,6 @@ use crate::proto::{values, In};
 
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "items")]
 use crate::items::{self, Item};
 
 /// Mehr Felder hat kein Fenster (Doppelkiste 90, Spielerinventar 46).
@@ -31,7 +30,6 @@ const MAX_SLOTS: usize = 200;
 /// `minecraft:menu` ist in allen vier unterstuetzten offiziellen Server-Reports identisch. Die
 /// Reihenfolge wurde zusammen mit den Block-State-Tabellen geprueft; die Nummer aus OpenScreen
 /// wird dadurch im Browser nicht mehr als generische Kiste missverstanden.
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 const MENU_TYPES: [&str; 25] = [
     "generic_9x1",
     "generic_9x2",
@@ -60,7 +58,6 @@ const MENU_TYPES: [&str; 25] = [
     "stonecutter",
 ];
 
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 fn menu_type(kind: i32) -> &'static str {
     usize::try_from(kind)
         .ok()
@@ -69,7 +66,6 @@ fn menu_type(kind: i32) -> &'static str {
 }
 
 /// Alte Fenstertyp-Namen auf die internen modernen Namen abbilden, die der Browser bereits kennt.
-#[cfg(any(feature = "pov", feature = "web-menu"))]
 fn legacy_menu_type(kind: &str, slots: usize) -> i32 {
     match kind {
         "minecraft:chest" | "minecraft:container" => (slots / 9).clamp(1, 6) as i32 - 1,
@@ -92,7 +88,6 @@ struct Open {
     /// vorzeichenloses Byte dasselbe Byte ergeben (1.21.1 sendet ein Byte, ab 1.21.11 VarInt).
     id: i32,
     /// Vanilla-Menue-Typ aus `OpenScreen`; der Browser waehlt damit den passenden Hintergrund.
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     kind: i32,
     /// Überschrift als `§`-Text (siehe [`crate::nbt::Fmt::Legacy`]).
     title: String,
@@ -102,17 +97,14 @@ struct Open {
     /// Anzahl der Felder – zur Anzeige und zur Prüfung der Feldnummer.
     slots: usize,
     /// Inhalt je Feld.
-    #[cfg(feature = "items")]
     items: Vec<Option<Item>>,
     /// Ab diesem Feld war der Inhalt nicht mehr lesbar (siehe [`crate::items`]).
-    #[cfg(feature = "items")]
     unknown_from: usize,
 }
 
 pub struct Menu {
     open: Mutex<Option<Open>>,
     /// Eigenes Inventar (Fenster 0) – 9 Rüstungs-/Handwerksfelder, 27 Taschen, 9 Schnellleiste.
-    #[cfg(feature = "items")]
     inventory: Mutex<Vec<Option<Item>>>,
 }
 
@@ -120,14 +112,12 @@ impl Menu {
     pub fn new() -> Menu {
         Menu {
             open: Mutex::new(None),
-            #[cfg(feature = "items")]
             inventory: Mutex::new(Vec::new()),
         }
     }
 
     pub fn clear(&self) {
         *self.open.lock().unwrap() = None;
-        #[cfg(feature = "items")]
         self.inventory.lock().unwrap().clear();
     }
 }
@@ -145,14 +135,9 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             let (id, kind, title, announced_slots) = if shared.proto.legacy {
                 let id = r.u8()? as i32;
                 let old_kind = r.string()?;
-                #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-                let _ = &old_kind;
                 let title = nbt::render_json(&r.string()?, Fmt::Legacy);
                 let slots = r.u8()? as usize;
-                #[cfg(any(feature = "pov", feature = "web-menu"))]
                 let kind = legacy_menu_type(&old_kind, slots);
-                #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-                let kind = -1;
                 (id, kind, title, slots)
             } else {
                 (
@@ -162,21 +147,16 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                     0,
                 )
             };
-            #[cfg(not(any(feature = "pov", feature = "web-menu")))]
-            let _ = kind;
             // Erst den Zustand setzen, dann melden: Wer auf die Meldung wartet (etwa der
             // Browser-Server über `state.json`, oder ein Ablauftest über die Fehlerausgabe) muss
             // den neuen Zustand schon vorfinden, sobald die Meldung erscheint.
             *shared.extras.menu.open.lock().unwrap() = Some(Open {
                 id,
-                #[cfg(any(feature = "pov", feature = "web-menu"))]
                 kind,
                 title: title.clone(),
                 state: 0,
                 slots: announced_slots,
-                #[cfg(feature = "items")]
                 items: Vec::new(),
-                #[cfg(feature = "items")]
                 unknown_from: usize::MAX,
             });
             shared.console.info(&format!(
@@ -199,10 +179,8 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             } else {
                 (r.var_int()?.max(0) as usize).min(MAX_SLOTS)
             };
-            #[cfg(feature = "items")]
             let content = read_content(shared, r, slots);
 
-            #[cfg(feature = "items")]
             if id == 0 {
                 // Fenster 0 ist immer das eigene Inventar – auch wenn gerade ein Menü offen ist.
                 *shared.extras.menu.inventory.lock().unwrap() = content.0;
@@ -214,7 +192,6 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
                 if current.id == id {
                     current.state = state;
                     current.slots = slots;
-                    #[cfg(feature = "items")]
                     {
                         current.items = content.0;
                         current.unknown_from = content.1;
@@ -227,12 +204,9 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         In::ContainerSlot => {
             let id = read_container_id(shared, r)?;
             let state = if shared.proto.legacy { 0 } else { r.var_int()? };
-            #[cfg(feature = "items")]
             let slot = r.i16()?;
-            #[cfg(feature = "items")]
             let item = read_item_slot(shared, r).ok().and_then(|s| s.item);
 
-            #[cfg(feature = "items")]
             if id == 0 {
                 let mut inventory = shared.extras.menu.inventory.lock().unwrap();
                 if slot >= 0 && (slot as usize) < MAX_SLOTS {
@@ -249,7 +223,6 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
             if let Some(current) = open.as_mut() {
                 if current.id == id {
                     current.state = state;
-                    #[cfg(feature = "items")]
                     if slot >= 0 && (slot as usize) < current.items.len() {
                         let slot = slot as usize;
                         current.items[slot] = item;
@@ -262,7 +235,6 @@ fn read(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> std::io::Result<()> {
         }
 
         // Einzelnes Feld des eigenen Inventars (ab 1.21.11): Feldnummer, Gegenstand.
-        #[cfg(feature = "items")]
         In::PlayerInventory => {
             let slot = r.var_int()?.max(0) as usize;
             let item = read_item_slot(shared, r).ok().and_then(|s| s.item);
@@ -318,7 +290,6 @@ fn write_container_id(shared: &Shared, w: &mut Writer, id: i32) {
 
 /// Alle Felder eines Fensters lesen. Zurück kommt der Inhalt und die Nummer des ersten Feldes,
 /// ab dem nichts mehr gelesen werden konnte (`usize::MAX` = alles gelesen).
-#[cfg(feature = "items")]
 fn read_content(shared: &Arc<Shared>, r: &mut Reader, slots: usize) -> (Vec<Option<Item>>, usize) {
     let slots = slots.min(MAX_SLOTS);
     let mut items = Vec::with_capacity(slots);
@@ -349,14 +320,12 @@ fn read_content(shared: &Arc<Shared>, r: &mut Reader, slots: usize) -> (Vec<Opti
 /// eine eventuell vom Server synchronisierte Registry; der verlässliche Vanilla-Fallback kommt
 /// aus der zur Protokollversion gehörenden Mojang-Liste. Ein `custom_name`/`item_name` aus dem
 /// Paket hat immer Vorrang und behält seine Farbcodes.
-#[cfg(feature = "items")]
 fn read_item_slot(shared: &Arc<Shared>, r: &mut Reader) -> std::io::Result<items::Slot> {
     let names = shared.extras.item_names.lock().unwrap();
     read_item_slot_with(shared, r, &names)
 }
 
 /// Wie [`read_item_slot`], aber mit bereits geöffneter Namensliste – siehe [`read_content`].
-#[cfg(feature = "items")]
 fn read_item_slot_with(
     shared: &Shared,
     r: &mut Reader,
@@ -387,13 +356,10 @@ fn read_item_slot_with(
 /// Netz-Thread mit an – kein KeepAlive mehr, also `disconnect.timeout` wegen einer Anzeige.
 struct Snapshot {
     id: i32,
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     kind: i32,
     title: String,
     slots: usize,
-    #[cfg(feature = "items")]
     items: Vec<Option<Item>>,
-    #[cfg(feature = "items")]
     unknown_from: usize,
 }
 
@@ -402,20 +368,16 @@ fn snapshot(shared: &Arc<Shared>) -> Option<Snapshot> {
     let current = open.as_ref()?;
     Some(Snapshot {
         id: current.id,
-        #[cfg(any(feature = "pov", feature = "web-menu"))]
         kind: current.kind,
         title: current.title.clone(),
         slots: current.slots,
-        #[cfg(feature = "items")]
         items: current.items.clone(),
-        #[cfg(feature = "items")]
         unknown_from: current.unknown_from,
     })
 }
 
 /// JSON-Abzug fuer die Browser-POV. Unter der Menuesperre wird nur kopiert; PNG-Ausgabe und
 /// Socket-Schreiben passieren danach und koennen den Netzwerkthread daher nie festhalten.
-#[cfg(all(feature = "items", any(feature = "pov", feature = "web-menu")))]
 pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
     let open = snapshot(shared);
     let inventory = shared.extras.menu.inventory.lock().unwrap().clone();
@@ -448,23 +410,6 @@ pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
     }
 }
 
-#[cfg(all(not(feature = "items"), feature = "pov"))]
-pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
-    match snapshot(shared) {
-        Some(open) => serde_json::json!({
-            "open": true,
-            "id": open.id,
-            "kind": open.kind,
-            "type": menu_type(open.kind),
-            "title": crate::nbt::strip_legacy(&open.title),
-            "slots": open.slots,
-            "items": [],
-            "inventory": [],
-        }),
-        None => serde_json::json!({"open": false, "inventory": []}),
-    }
-}
-
 /// `:menu` – was gerade offen ist (mit `items` samt Inhalt).
 pub fn print(shared: &Arc<Shared>) {
     let console = &shared.console;
@@ -486,7 +431,6 @@ pub fn print(shared: &Arc<Shared>) {
         ),
     ));
 
-    #[cfg(feature = "items")]
     {
         print_items(shared, &current.items, current.unknown_from);
         console.print(&console.paint(
@@ -494,18 +438,9 @@ pub fn print(shared: &Arc<Shared>) {
             "    :slot <feld> zeigt Lore   ·   :click <feld> [rechts|shift]   ·   :close",
         ));
     }
-    #[cfg(not(feature = "items"))]
-    {
-        console.print(&console.paint(GRAY, "    :click <feld> [rechts|shift]   ·   :close"));
-        console.print(&console.paint(
-            GRAY,
-            "    Feldinhalte liest nur eine Bauform mit Gegenstandslesung (siehe FEATURES.md).",
-        ));
-    }
 }
 
 /// Belegte Felder auflisten – und dieselbe Liste als `@event slot`-Zeilen mit `§`-Farbcodes.
-#[cfg(feature = "items")]
 fn print_items(shared: &Arc<Shared>, items: &[Option<Item>], unknown_from: usize) {
     let console = &shared.console;
     let mut shown = 0;
@@ -542,7 +477,6 @@ fn print_items(shared: &Arc<Shared>, items: &[Option<Item>], unknown_from: usize
 }
 
 /// `:slot <feld>` – ein Feld ausführlich, mit Lore.
-#[cfg(feature = "items")]
 pub fn print_slot(shared: &Arc<Shared>, arg: &str) {
     let console = &shared.console;
     let Some(index) = arg
@@ -572,7 +506,6 @@ pub fn print_slot(shared: &Arc<Shared>, arg: &str) {
 }
 
 /// `:inv` – das eigene Inventar.
-#[cfg(feature = "items")]
 pub fn print_inventory(shared: &Arc<Shared>) {
     // Abschreiben, Sperre los, dann ausgeben – siehe [`Snapshot`].
     let inventory = shared.extras.menu.inventory.lock().unwrap().clone();
@@ -592,7 +525,6 @@ pub fn print_inventory(shared: &Arc<Shared>) {
     print_items(shared, &inventory, usize::MAX);
 }
 
-#[cfg(feature = "items")]
 fn print_item(shared: &Arc<Shared>, index: usize, item: &Item) {
     let console = &shared.console;
     console.print("");
@@ -745,7 +677,6 @@ pub fn close_command(shared: &Arc<Shared>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     use super::menu_type;
     use crate::proto::values;
 
@@ -770,7 +701,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "pov", feature = "web-menu"))]
     fn browser_fenstertypen_folgen_der_offiziellen_registry() {
         assert_eq!(menu_type(0), "generic_9x1");
         assert_eq!(menu_type(8), "anvil");

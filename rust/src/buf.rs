@@ -140,12 +140,10 @@ impl<'a> Reader<'a> {
     ///
     /// Nur die Bauformen, die wirklich Felder überspringen, kompilieren die beiden mit: eine
     /// reine Menü-Bauform liest keine Höhenkarten und keine Gegenstands-Komponenten.
-    #[cfg(any(feature = "board", feature = "items", feature = "pov"))]
     pub fn skip(&mut self, n: usize) -> io::Result<()> {
         self.bytes(n).map(|_| ())
     }
 
-    #[cfg(any(feature = "board", feature = "items", feature = "pov"))]
     pub fn skip_string(&mut self) -> io::Result<()> {
         let len = self.var_int()?;
         if !(0..=1024 * 1024).contains(&len) {
@@ -204,7 +202,6 @@ impl Writer {
         self.data.extend_from_slice(&v.to_be_bytes());
     }
 
-    #[cfg(feature = "extras")]
     pub fn i16(&mut self, v: i16) {
         self.data.extend_from_slice(&v.to_be_bytes());
     }

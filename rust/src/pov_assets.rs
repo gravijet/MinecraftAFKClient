@@ -12,9 +12,9 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Mutex;
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 use std::sync::{Arc, OnceLock};
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 use std::thread;
 use zip::ZipArchive;
 
@@ -200,9 +200,7 @@ pub(crate) struct Assets {
     states: Vec<u16>,
     materials: Vec<Material>,
     textures: Vec<Texture>,
-    #[cfg(feature = "items")]
     block_defaults: HashMap<String, u32>,
-    #[cfg(feature = "items")]
     item_icons: Mutex<HashMap<String, Vec<u8>>>,
     archive: Mutex<ZipArchive<File>>,
     missing_png: Vec<u8>,
@@ -283,9 +281,7 @@ impl Assets {
             states,
             materials: loader.materials,
             textures: loader.textures,
-            #[cfg(feature = "items")]
             block_defaults,
-            #[cfg(feature = "items")]
             item_icons: Mutex::new(HashMap::new()),
             archive: Mutex::new(loader.archive),
             missing_png,
@@ -461,7 +457,6 @@ impl Assets {
     /// verweist `items/<name>.json` bei dynamischen Gegenstaenden wie Uhr und Kompass auf
     /// nummerierte Modelltexturen; nur nach `textures/item/<name>.png` zu suchen liess diese
     /// Hotbarfelder dauerhaft lila-schwarz.
-    #[cfg(feature = "items")]
     pub(crate) fn item_png(&self, name: &str) -> Vec<u8> {
         if let Ok(cache) = self.item_icons.lock() {
             if let Some(bytes) = cache.get(name) {
@@ -492,7 +487,6 @@ impl Assets {
     /// Uhren. Er nimmt deshalb den ersten gueltigen Modellzweig, laedt aber *alle* Ebenen dieses
     /// Modells. Damit ist das Icon vollstaendig und stammt weiterhin ausschliesslich aus der
     /// ausgewaehlten Original-JAR.
-    #[cfg(feature = "items")]
     fn render_item_model(&self, name: &str) -> Option<Vec<u8>> {
         let (namespace, path) = resource_id(name);
         let mut archive = self.archive.lock().ok()?;
@@ -529,7 +523,6 @@ impl Assets {
     /// Vor 1.21.2 gab es noch keine `items/*.json`: Das Item verwies unmittelbar auf ein
     /// Modell unter `models/item`. Dessen `layer0`/`layer1` koennen weiterhin mit demselben
     /// Renderer zusammengesetzt werden; nur der Einstieg in die Modellkette ist ein anderer.
-    #[cfg(feature = "items")]
     fn render_legacy_item_model(&self, name: &str) -> Option<Vec<u8>> {
         let (namespace, path) = resource_id(name);
         let mut archive = self.archive.lock().ok()?;
@@ -563,7 +556,6 @@ impl Assets {
 
     /// Blockitems als kleines GUI-Modell statt als flach aufgeklebter Seitentextur. Die
     /// Elementgeometrie und alle Pixel stammen aus demselben Vanilla-Modell wie die Welt.
-    #[cfg(feature = "items")]
     fn render_block_icon(&self, state: u32) -> Option<Vec<u8>> {
         let material_id = *self.states.get(state as usize)?;
         let material = self.materials.get(material_id as usize)?;
@@ -644,7 +636,6 @@ impl Assets {
 /// Aus einem modernen `items/*.json` einen verwendbaren statischen Modellzweig waehlen.
 /// Bedingungen koennen ohne Item-Komponenten nicht ausgewertet werden; fuer die Hotbar ist der
 /// erste vom Pack angebotene Modellzweig die ehrliche, reproduzierbare Vorschau.
-#[cfg(feature = "items")]
 fn first_item_model(value: &Value, depth: usize) -> Option<&str> {
     if depth > 32 {
         return None;
@@ -676,7 +667,6 @@ fn first_item_model(value: &Value, depth: usize) -> Option<&str> {
     None
 }
 
-#[cfg(feature = "items")]
 fn resolved_model_textures(
     archive: &mut ZipArchive<File>,
     name: &str,
@@ -714,7 +704,6 @@ fn resolved_model_textures(
 
 /// PNG-Ebenen wie `layer0`/`layer1` von hinten nach vorne alpha-komponieren. Animierte Texturen
 /// liefern wie beim Welt-Renderer ihr erstes quadratisches Bild.
-#[cfg(feature = "items")]
 fn composite_item_layers(layers: &[Texture]) -> Option<Vec<u8>> {
     let first = layers.first()?;
     let (width, height) = (first.width, first.frame_height);
@@ -1262,12 +1251,10 @@ fn add_scaled(origin: [f64; 3], direction: [f64; 3], distance: f64) -> [f64; 3] 
     ]
 }
 
-#[cfg(any(feature = "items", test))]
 fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-#[cfg(feature = "items")]
 #[derive(Clone, Copy)]
 struct IconVertex {
     /// Bildschirm-X, Bildschirm-Y und Tiefe (groesser = naeher).
@@ -1275,7 +1262,6 @@ struct IconVertex {
     uv: (f64, f64),
 }
 
-#[cfg(feature = "items")]
 fn icon_project(point: [f64; 3]) -> [f64; 3] {
     let x = point[0] - 8.0;
     let y = point[1] - 8.0;
@@ -1287,7 +1273,6 @@ fn icon_project(point: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-#[cfg(feature = "items")]
 fn face_vertices(from: [f64; 3], to: [f64; 3], face: usize) -> [[f64; 3]; 4] {
     let (x0, y0, z0) = (from[0], from[1], from[2]);
     let (x1, y1, z1) = (to[0], to[1], to[2]);
@@ -1301,7 +1286,6 @@ fn face_vertices(from: [f64; 3], to: [f64; 3], face: usize) -> [[f64; 3]; 4] {
     }
 }
 
-#[cfg(feature = "items")]
 fn raster_triangle(
     assets: &Assets,
     face: Face,
@@ -1601,7 +1585,7 @@ pub(crate) fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Resul
 
 /// Ressourcen-Zustand für `--features web-menu`. Gleiches Muster wie `Assets_` in `pov.rs`, aber
 /// eigenständig: dieser Build hat kein `Pov` und keinen Weltspeicher.
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 #[derive(Default)]
 pub(crate) struct WebAssets {
     ready: OnceLock<Arc<Assets>>,
@@ -1610,7 +1594,7 @@ pub(crate) struct WebAssets {
     note: Mutex<Option<String>>,
 }
 
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 impl WebAssets {
     pub(crate) fn get(&self) -> Option<&Assets> {
         self.ready.get().map(|assets| assets.as_ref())
@@ -1630,7 +1614,7 @@ impl WebAssets {
 /// Wie [`crate::pov::start_assets`], aber ohne Weltbezug: schreibt in `shared.extras.web` statt
 /// `shared.extras.pov.assets` und rechnet keine Biomfarben nach (es gibt keine Welt, die sie
 /// braucht).
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
     if shared.options().pov_web.is_none() {
         return; // Ohne Browser-Ansicht liest niemand die Texturen.
@@ -1685,21 +1669,21 @@ pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
 }
 
 /// Wie [`crate::pov::web_asset`], aber für `shared.extras.web` statt `shared.extras.pov`.
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 pub(crate) fn web_asset(shared: &Arc<crate::client::Shared>, path: &str) -> Option<Vec<u8>> {
     shared.extras.web.get()?.raw(path)
 }
 
 /// Wie [`crate::pov::web_item`], aber für `shared.extras.web` statt `shared.extras.pov`.
 /// `web-menu` zieht `items` immer mit, ein eigenes Feature-Gate dafür ist deshalb unnötig.
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 pub(crate) fn web_item(shared: &Arc<crate::client::Shared>, id: i32) -> Option<Vec<u8>> {
     let name = crate::item_names::get(shared.proto.name, id)?;
     Some(shared.extras.web.get()?.item_png(name))
 }
 
 /// Wie [`crate::pov::web_missing`], aber für `shared.extras.web` statt `shared.extras.pov`.
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 pub(crate) fn web_missing(shared: &Arc<crate::client::Shared>) -> Option<Vec<u8>> {
     Some(shared.extras.web.get()?.missing_png().to_vec())
 }
@@ -1754,7 +1738,7 @@ mod tests {
     /// `WebAssets` ist der Ressourcen-Halter des `web-menu`-Builds – unabhängig von `Pov` und
     /// ohne Weltbezug. Hier nur der Zustandsautomat selbst, ohne eine echte JAR zu laden.
     #[test]
-    #[cfg(all(feature = "web-menu", not(feature = "pov")))]
+    #[cfg(not(feature = "pov"))]
     fn web_assets_meldet_ihren_eigenen_zustand() {
         let assets = WebAssets::default();
         assert!(assets.get().is_none(), "vor dem Laden gibt es nichts");
@@ -1772,7 +1756,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "items")]
     fn modernes_dynamisches_item_waehlt_einen_modellzweig() {
         let definition = serde_json::json!({
             "type": "minecraft:condition",
@@ -1890,7 +1873,6 @@ mod tests {
     /// `AFK_POV_RESOURCES=/pfad/26.2.jar cargo test --features pov-client -- --ignored originale_client_jar`
     #[test]
     #[ignore]
-    #[cfg(feature = "items")]
     fn originale_client_jar() {
         let path = std::env::var("AFK_POV_RESOURCES").expect("AFK_POV_RESOURCES fehlt");
         assert!(matches!(
@@ -1922,7 +1904,6 @@ mod tests {
     /// `AFK_POV_RESOURCES=/pfad/1.8.9.jar cargo test --features pov-client -- --ignored originale_client_jar_1_8_9`
     #[test]
     #[ignore]
-    #[cfg(feature = "items")]
     fn originale_client_jar_1_8_9() {
         let path = std::env::var("AFK_POV_RESOURCES").expect("AFK_POV_RESOURCES fehlt");
         let assets = Assets::load(Path::new(&path), "1.8.9").expect("1.8.9-Assets laden");

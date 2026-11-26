@@ -1204,14 +1204,14 @@ pub fn respawn(shared: &Arc<Shared>, r: &mut Reader) {
 
 pub fn on_join(shared: &Arc<Shared>) {
     shared.extras.pov.clear();
-    // Die eigene POV-Bauform startet von selbst, Ultra erst auf `:pov live` – `--pov an|aus`
-    // dreht beides um, ohne die Weltdaten abzuschalten.
+    // Ohne Browser-Viewer startet das Terminalbild von selbst; `--pov an|aus` entscheidet
+    // ausdrücklich, ohne die Weltdaten abzuschalten.
     let autostart = shared
         .options()
         .pov_autostart
         // Mit Browser-Viewer bleibt der teure ANSI-Dauerstrom standardmaessig aus. Wer beides
         // will, kann ihn weiterhin ausdruecklich mit `--pov an` oder `:pov live` einschalten.
-        .unwrap_or(cfg!(feature = "pov-client") && shared.options().pov_web.is_none());
+        .unwrap_or(shared.options().pov_web.is_none());
     if autostart {
         shared.extras.pov.live.store(true, Ordering::SeqCst);
         start_renderer(shared);
@@ -2213,7 +2213,6 @@ pub(crate) fn web_asset(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
     shared.extras.pov.assets()?.raw(path)
 }
 
-#[cfg(feature = "items")]
 pub(crate) fn web_item(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
     let name = crate::item_names::get(shared.proto.name, id)?;
     Some(shared.extras.pov.assets()?.item_png(name))

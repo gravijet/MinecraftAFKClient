@@ -37,7 +37,6 @@ pub struct Protocol {
     pub game: Game,
     /// Zusätzliche IDs der Ausbaustufen (Anzeigetafel, Menüs, Tastenzustand, Live-Ansicht).
     /// Im schlanken Build ist davon kein Byte einkompiliert.
-    #[cfg(feature = "extras")]
     pub extra: Extra,
 }
 
@@ -90,7 +89,6 @@ pub struct Game {
     pub sb_move_player_pos: i32,
     pub sb_move_player_pos_rot: i32,
     /// Blickrichtung ohne erneut behauptete Koordinaten.
-    #[cfg(feature = "movement")]
     pub sb_move_player_rot: i32,
     /// „Ladewelt geschlossen" (seit 1.21.4; in 1.21.1 `-1`).
     pub sb_player_loaded: i32,
@@ -105,7 +103,6 @@ pub struct Game {
 /// Die Tabelle ist für alle Ausbaustufen dieselbe (ein paar hundert Byte statischer Daten); der
 /// **Code** dazu steckt dagegen je Funktion in einem eigenen Cargo-Feature. Ein Build ohne
 /// Live-Ansicht liest also nie ein Chunk-Paket, auch wenn dessen ID in der Tabelle steht.
-#[cfg(feature = "extras")]
 #[allow(dead_code)] // je nach Bauform bleibt ein Teil der Tabelle ungenutzt
 pub struct Extra {
     // ---- Anzeigetafel ----
@@ -166,13 +163,11 @@ pub struct Extra {
     pub team_layout: TeamLayout,
 
     /// Gegenstands-Komponenten (nur mit `--features items`).
-    #[cfg(feature = "items")]
     pub components: Components,
 }
 
 /// Aufbau von `ClientboundSetPlayerTeamPacket` nach `name` und `action`, für die Aktionen
 /// „anlegen" und „ändern". Abgelesen aus den vier Codec-Jars.
-#[cfg(feature = "board")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TeamLayout {
     /// 1.8.9: alle sichtbaren Texte sind alte Zeichenketten; Präfix/Suffix stehen direkt hinter
@@ -187,20 +182,8 @@ pub enum TeamLayout {
     Reordered,
 }
 
-/// Ohne Anzeigetafel wird das Team-Paket nie gelesen; das Feld bleibt trotzdem in der Tabelle,
-/// damit die fünf Versionstabellen in jeder Bauform gleich aussehen.
-#[cfg(all(feature = "extras", not(feature = "board")))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TeamLayout {
-    V1_8,
-    Legacy,
-    VarIntRules,
-    Reordered,
-}
-
 /// Wo die Namen und die Lore eines Gegenstands stehen und wie sich die übrigen Komponenten
 /// überspringen lassen. Siehe [`crate::items`] – dort steht auch, was die Buchstaben bedeuten.
-#[cfg(feature = "items")]
 pub struct Components {
     /// Netz-ID von `minecraft:custom_name` (der vom Server gesetzte Anzeigename).
     pub custom_name: u8,
@@ -237,32 +220,22 @@ pub enum In {
 
     // ---- Anzeigetafel ----
     /// Ziel angelegt/geändert/entfernt.
-    #[cfg(feature = "board")]
     Objective,
     /// Punktzahl gesetzt.
-    #[cfg(feature = "board")]
     Score,
     /// Punktzahl entfernt.
-    #[cfg(feature = "board")]
     ResetScore,
     /// Welches Ziel in welchem Bereich (Seitenleiste ...) steht.
-    #[cfg(feature = "board")]
     DisplayObjective,
     /// Team (liefert Präfix/Suffix der Namen in der Seitenleiste).
-    #[cfg(feature = "board")]
     Team,
 
     // ---- Menüs ----
-    #[cfg(feature = "menu")]
     OpenScreen,
-    #[cfg(feature = "menu")]
     ContainerContent,
-    #[cfg(feature = "menu")]
     ContainerSlot,
-    #[cfg(feature = "menu")]
     ContainerClose,
     /// Einzelnes Feld des eigenen Inventars (nur wenn Feldinhalte gelesen werden).
-    #[cfg(feature = "items")]
     PlayerInventory,
 
     // ---- Live-Ansicht ----
@@ -364,15 +337,9 @@ impl Protocol {
         }
     }
 
-    #[cfg(not(feature = "extras"))]
-    fn incoming_extra(&self, _id: i32) -> In {
-        In::Ignored
-    }
-
     /// Die Pakete, die nur eine Ausbaustufe auswertet. Bewusst hinter den häufigen des schlanken
     /// Clients: ein Chunk-Paket läuft zwar durch die ganze Kette, das sind aber ein paar
     /// Zahlenvergleiche.
-    #[cfg(feature = "extras")]
     fn incoming_extra(&self, id: i32) -> In {
         // Eine Bauform, die nur Tastenzustände sendet (`--features state`), liest überhaupt kein
         // Zusatzpaket – dann bleiben beide hier ungenutzt.
@@ -410,7 +377,6 @@ impl Protocol {
             }
         }
 
-        #[cfg(feature = "board")]
         {
             if id == e.cb_set_score {
                 return In::Score;
@@ -425,7 +391,6 @@ impl Protocol {
             }
         }
 
-        #[cfg(feature = "menu")]
         {
             if id == e.cb_open_screen {
                 return In::OpenScreen;
@@ -436,7 +401,6 @@ impl Protocol {
             } else if id == e.cb_container_close {
                 return In::ContainerClose;
             }
-            #[cfg(feature = "items")]
             if id == e.cb_set_player_inventory {
                 return In::PlayerInventory;
             }
@@ -453,7 +417,6 @@ const P1_8_9: Protocol = Protocol {
     version: 47,
     legacy: true,
     modern: false,
-    #[cfg(feature = "extras")]
     extra: Extra {
         // Protokoll 47, Spielphase Server -> Client.
         cb_reset_score: -1, // Entfernen ist Aktion 1 im SetScore-Paket.
@@ -492,7 +455,6 @@ const P1_8_9: Protocol = Protocol {
 
         section_fluid_count: false,
         team_layout: TeamLayout::V1_8,
-        #[cfg(feature = "items")]
         components: Components {
             // 1.8.9 benutzt benanntes NBT statt Komponenten; diese Werte werden nie gelesen.
             custom_name: 0,
@@ -533,7 +495,6 @@ const P1_8_9: Protocol = Protocol {
         sb_keep_alive: 0x00,
         sb_move_player_pos: 0x04,
         sb_move_player_pos_rot: 0x06,
-        #[cfg(feature = "movement")]
         sb_move_player_rot: 0x05,
         sb_player_loaded: -1,
         sb_pong: -1,
@@ -546,7 +507,6 @@ const P1_21_1: Protocol = Protocol {
     version: 767,
     legacy: false,
     modern: false,
-    #[cfg(feature = "extras")]
     extra: Extra {
         cb_reset_score: 68,
         cb_set_display_objective: 87,
@@ -586,7 +546,6 @@ const P1_21_1: Protocol = Protocol {
 
         section_fluid_count: false,
         team_layout: TeamLayout::Legacy,
-        #[cfg(feature = "items")]
         components: Components {
             custom_name: 5,
             item_name: 6,
@@ -626,7 +585,6 @@ const P1_21_1: Protocol = Protocol {
         sb_keep_alive: 24,
         sb_move_player_pos: 26,
         sb_move_player_pos_rot: 27,
-        #[cfg(feature = "movement")]
         sb_move_player_rot: 28,
         sb_player_loaded: -1, // gibt es erst ab 1.21.4
         sb_pong: 39,
@@ -639,7 +597,6 @@ const P1_21_11: Protocol = Protocol {
     version: 774,
     legacy: false,
     modern: true,
-    #[cfg(feature = "extras")]
     extra: Extra {
         cb_reset_score: 77,
         cb_set_display_objective: 96,
@@ -677,7 +634,6 @@ const P1_21_11: Protocol = Protocol {
 
         section_fluid_count: false,
         team_layout: TeamLayout::VarIntRules,
-        #[cfg(feature = "items")]
         components: Components {
             custom_name: 6,
             item_name: 9,
@@ -717,7 +673,6 @@ const P1_21_11: Protocol = Protocol {
         sb_keep_alive: 27,
         sb_move_player_pos: 29,
         sb_move_player_pos_rot: 30,
-        #[cfg(feature = "movement")]
         sb_move_player_rot: 31,
         sb_player_loaded: 43,
         sb_pong: 44,
@@ -730,11 +685,9 @@ const P26_1: Protocol = Protocol {
     version: 775,
     legacy: false,
     modern: true,
-    #[cfg(feature = "extras")]
     extra: Extra {
         team_layout: TeamLayout::VarIntRules,
         player_entity_type: 155,
-        #[cfg(feature = "items")]
         components: Components {
             custom_name: 6,
             item_name: 9,
@@ -755,11 +708,9 @@ const P26_2: Protocol = Protocol {
     version: 776,
     legacy: false,
     modern: true,
-    #[cfg(feature = "extras")]
     extra: Extra {
         team_layout: TeamLayout::Reordered,
         player_entity_type: 156,
-        #[cfg(feature = "items")]
         components: Components {
             custom_name: 6,
             item_name: 9,
@@ -771,7 +722,6 @@ const P26_2: Protocol = Protocol {
     game: GAME_26,
 };
 
-#[cfg(feature = "extras")]
 const EXTRA_26: Extra = Extra {
     cb_reset_score: 79,
     cb_set_display_objective: 98,
@@ -812,7 +762,6 @@ const EXTRA_26: Extra = Extra {
     // sie sich. Die Werte stehen trotzdem hier, weil Rust eine vollständige Vorlage verlangt.
     player_entity_type: 155,
     team_layout: TeamLayout::VarIntRules,
-    #[cfg(feature = "items")]
     components: Components {
         custom_name: 6,
         item_name: 9,
@@ -853,7 +802,6 @@ const GAME_26: Game = Game {
     sb_keep_alive: 28,
     sb_move_player_pos: 30,
     sb_move_player_pos_rot: 31,
-    #[cfg(feature = "movement")]
     sb_move_player_rot: 32,
     sb_player_loaded: 44,
     sb_pong: 45,
@@ -874,7 +822,6 @@ const GAME_26: Game = Game {
 // Ein Punkt heißt nicht „geraten", sondern „Aufbau nicht nachgeschlagen": beim Lesen hört der
 // Client dort auf (siehe [`crate::items`]).
 
-#[cfg(feature = "items")]
 const SHAPES_1_21_1: &str = concat!(
     "NVVV", // 0: custom_data, max_stack_size, max_damage, damage
     "BCCL", // 4: unbreakable, custom_name, item_name, lore
@@ -893,7 +840,6 @@ const SHAPES_1_21_1: &str = concat!(
     "N",    // 56: container_loot
 );
 
-#[cfg(feature = "items")]
 const SHAPES_1_21_11: &str = concat!(
     "NVVV", // 0: custom_data, max_stack_size, max_damage, damage
     "U.CF", // 4: unbreakable, use_effects, custom_name, minimum_attack_charge
@@ -923,7 +869,6 @@ const SHAPES_1_21_11: &str = concat!(
     "VVVV", // 100: cat_variant, cat_collar, sheep_color, shulker_color
 );
 
-#[cfg(feature = "items")]
 const SHAPES_26_1: &str = concat!(
     "NVVV", // 0: custom_data, max_stack_size, max_damage, damage
     "U.CF", // 4: unbreakable, use_effects, custom_name, minimum_attack_charge
@@ -955,7 +900,6 @@ const SHAPES_26_1: &str = concat!(
     "VV",   // 108: sheep_color, shulker_color
 );
 
-#[cfg(feature = "items")]
 const SHAPES_26_2: &str = concat!(
     "NVVV", // 0: custom_data, max_stack_size, max_damage, damage
     "U.CF", // 4: unbreakable, use_effects, custom_name, minimum_attack_charge
@@ -1024,7 +968,6 @@ pub mod config {
     pub const CB_KEEP_ALIVE: i32 = 4;
     pub const CB_PING: i32 = 5;
     /// Registerdaten; Items holen daraus Registry-Namen, die Live-Ansicht die Welthöhe.
-    #[cfg(feature = "extras")]
     pub const CB_REGISTRY_DATA: i32 = 7;
     pub const CB_RESOURCE_PACK_PUSH: i32 = 9;
     pub const CB_STORE_COOKIE: i32 = 10;
@@ -1056,12 +999,10 @@ pub mod pack_status {
 
 /// Zahlenwerte in den Zusatzpaketen der Ausbaustufen. Alle aus denselben Klassen abgelesen wie
 /// die Paket-IDs (Aufzählungsreihenfolge = übertragener Wert).
-#[cfg(feature = "extras")]
 pub mod values {
     /// `PlayerState` in 1.21.1 – dort werden Schleichen und Sprinten noch als Spielerbefehl
     /// geschickt. Ab 1.21.11 gibt es diese vier Werte nicht mehr; dort trägt das Eingabepaket
     /// die Zustände (siehe [`input`]).
-    #[cfg(feature = "state")]
     pub mod player_state {
         pub const START_SNEAKING: i32 = 0;
         pub const STOP_SNEAKING: i32 = 1;
@@ -1070,14 +1011,12 @@ pub mod values {
     }
 
     /// Bits im Eingabepaket ab 1.21.11 (`ServerboundPlayerInputPacket`, ein Byte).
-    #[cfg(feature = "state")]
     pub mod input {
         pub const SNEAK: u8 = 0x20;
         pub const SPRINT: u8 = 0x40;
     }
 
     /// `ContainerActionType` – der Modus im Klick-Paket.
-    #[cfg(feature = "menu")]
     pub mod click {
         /// Normaler Klick (Knopf 0 = links, 1 = rechts).
         pub const NORMAL: u8 = 0;
@@ -1086,11 +1025,9 @@ pub mod values {
     }
 
     /// `ScoreboardPosition` – uns interessiert nur die Seitenleiste.
-    #[cfg(feature = "board")]
     pub const SIDEBAR: i32 = 1;
 
     /// `ObjectiveAction`
-    #[cfg(feature = "board")]
     pub mod objective {
         pub const ADD: u8 = 0;
         pub const REMOVE: u8 = 1;
@@ -1098,7 +1035,6 @@ pub mod values {
     }
 
     /// `TeamAction`
-    #[cfg(feature = "board")]
     pub mod team {
         pub const CREATE: u8 = 0;
         pub const REMOVE: u8 = 1;

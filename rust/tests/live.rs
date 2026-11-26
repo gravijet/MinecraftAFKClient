@@ -208,7 +208,6 @@ fn moderne_client_ticks_werden_abgeschlossen() {
 /// Lokale Aktionen dürfen während Login/Konfiguration keine Spielpakete senden. Die künstliche
 /// Pause hält den Server sicher vor der Spielphase, während die Eingabe bereits verarbeitet wird.
 #[test]
-#[cfg(feature = "state")]
 fn spielaktion_vor_dem_join_wird_nicht_gesendet() {
     let mut plan = plan_with_ground();
     plan.before_login_ms = 500;
@@ -236,7 +235,6 @@ fn spielaktion_vor_dem_join_wird_nicht_gesendet() {
 /// `--sneak` wird erst nach Bestätigung der autoritativen Startposition gesendet. Damit steht
 /// kein Spieler-Eingabepaket zwischen Teleport und dessen verpflichtender Antwort.
 #[test]
-#[cfg(feature = "state")]
 fn schleichen_startet_erst_nach_der_position() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--sneak"]);
@@ -262,7 +260,6 @@ fn schleichen_startet_erst_nach_der_position() {
 /// Reines Drehen verwendet Vanillas kurzes Rotationspaket. Ein PosRot-Paket würde unnötig alte
 /// Koordinaten wiederholen und könnte mit einer gleichzeitig laufenden Bewegung kollidieren.
 #[test]
-#[cfg(feature = "movement")]
 fn blickbewegung_sendet_keine_position() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
@@ -287,7 +284,6 @@ fn blickbewegung_sendet_keine_position() {
 /// Ändert sich nur die Position, verwendet Vanilla `MovePlayerPos` (3 Double + Flag) und nicht
 /// in jedem Tick das längere Paket mit unveränderten Blickwinkeln.
 #[test]
-#[cfg(feature = "movement")]
 fn laufbewegung_sendet_nur_die_position() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
@@ -962,7 +958,6 @@ fn cookies_ueberleben_den_transfer() {
 /// Auf fast jedem Server ist der Eintrag selbst ein unsichtbarer Platzhalter; der sichtbare Text
 /// steckt in Präfix und Suffix des Teams. Wird davon auch nur ein Feld falsch gelesen, steht in
 /// der Anzeige Müll – und zwar genau auf einer der vier Versionen.
-#[cfg(feature = "board")]
 #[test]
 fn seitenleiste_auf_allen_feldreihenfolgen() {
     for ids in [
@@ -1004,7 +999,6 @@ fn seitenleiste_auf_allen_feldreihenfolgen() {
 /// eine davon nicht kennt, findet auch die nächste nicht mehr. Die Tabelle dazu unterscheidet
 /// sich zwischen 1.21.1 und den neueren Versionen erheblich – ein Fehler darin fällt nur genau
 /// hier auf.
-#[cfg(feature = "items")]
 #[test]
 fn menue_inhalt_auf_beiden_komponententabellen() {
     for ids in [&common::MC_1_8_9, &common::MC_1_21_1, &common::MC_26_1] {
@@ -1178,7 +1172,6 @@ fn eingabe_geht_in_den_chat() {
 /// es nur aus Hand und Sequenznummer. Die zwei überzähligen Fließkommazahlen brachten dort den
 /// Paket-Decoder des Servers aus dem Tritt – und damit die ganze Verbindung. Geprüft wird
 /// deshalb am Socket, wie lang das Paket wirklich ankommt: zwei Byte gegen zehn.
-#[cfg(feature = "state")]
 #[test]
 fn use_item_paket_passt_zur_version() {
     for (ids, expected) in [(&common::MC_1_21_1, 2usize), (&common::MC_26_1, 10usize)] {
@@ -1214,7 +1207,6 @@ fn use_item_paket_passt_zur_version() {
 
 /// Mehrere Weltinteraktionen brauchen aufsteigende Sequenznummern. Mit dauerhaft `0` könnten
 /// Server-Acknowledgements nicht mehr eindeutig der auslösenden Aktion zugeordnet werden.
-#[cfg(feature = "state")]
 #[test]
 fn use_item_sequenz_steigt() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
@@ -1493,7 +1485,7 @@ fn browser_viewer_antwortet_nur_mit_token() {
 /// Menü/Inventar mit echten Texturen, aber ohne Kamerabild und ohne Weltdaten. Prüft genau die
 /// Abgrenzung, um die es bei dieser Bauform geht – `state.json` bleibt ohne `chunks`/`entities`,
 /// und `/api/frame.png` gibt es in dieser Bauform gar nicht erst.
-#[cfg(all(feature = "web-menu", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 #[test]
 fn browser_menue_ohne_pov_liefert_hotbar_aber_keine_weltdaten() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
@@ -1569,7 +1561,7 @@ fn browser_menue_ohne_pov_liefert_hotbar_aber_keine_weltdaten() {
 /// (`alle_oertlichen_befehle_ueberstehen_auch_unsinn`). Ohne diesen Test bliebe der HTTP-Pfad in
 /// `pov_web.rs` – Query-Parsing, Klickart-Übersetzung, Feature-Weiche – unbeobachtet, obwohl er
 /// der einzige Weg ist, den ein Browser tatsächlich benutzt.
-#[cfg(all(feature = "pov", feature = "menu", feature = "state"))]
+#[cfg(feature = "pov")]
 #[test]
 fn browser_steuerung_wirkt_auf_den_server() {
     let mut plan = plan_with_ground();
@@ -1852,8 +1844,8 @@ fn weit_entfernte_chunks_fallen_weg() {
     let _ = child.kill();
 }
 
-/// Die eigene POV-Datei startet die Ansicht ohne Zutun – und `--pov aus` schaltet genau das ab.
-#[cfg(feature = "pov-client")]
+/// Die POV-Datei startet die Ansicht ohne Zutun – und `--pov aus` schaltet genau das ab.
+#[cfg(feature = "pov")]
 #[test]
 fn povdatei_startet_von_selbst_und_laesst_sich_abschalten() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
@@ -2018,7 +2010,7 @@ fn browser_pov_liefert_seite_und_live_zustand() {
 
 /// Ultra wartet umgekehrt auf `:pov live` – `--pov an` muss die Ansicht trotzdem von Anfang an
 /// starten. Sonst hätte die Option in der Datei, die sie am ehesten braucht, keine Wirkung.
-#[cfg(all(feature = "pov", not(feature = "pov-client")))]
+#[cfg(feature = "pov")]
 #[test]
 fn ultra_wartet_ab_startet_aber_auf_wunsch() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
@@ -2111,7 +2103,6 @@ fn resident_memory(pid: u32) -> String {
 /// mit `panic = "abort"` den ganzen Prozess mit, und ein hängengebliebener Sperrvorgang kostet
 /// das nächste KeepAlive. Der Test schickt deshalb alles durch, inklusive der Eingaben, mit
 /// denen niemand rechnet.
-#[cfg(feature = "ultra")]
 #[test]
 fn alle_oertlichen_befehle_ueberstehen_auch_unsinn() {
     let mut plan = plan_with_ground();

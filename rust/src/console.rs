@@ -39,7 +39,6 @@ pub const YELLOW: &str = "\x1b[93m";
 pub const CYAN: &str = "\x1b[96m";
 /// Fett setzen nur die Ausbaustufen (Überschriften in `:help`, `:board`, `:menu`, `:pov`) –
 /// im schlanken Build ist die Konstante ungenutzt.
-#[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub const BOLD: &str = "\x1b[1m";
 
 /// So viele Zeilen dürfen je Strom höchstens auf das Schreiben warten.
@@ -184,7 +183,6 @@ impl Console {
     /// Einen im Speicher liegenden `§`-Text anzeigefertig machen. Anzeigetafel und
     /// Gegenstandsnamen werden als `§`-Text gehalten, damit sie unverändert an ein Programm
     /// davor weitergereicht werden können – eingefärbt wird erst hier.
-    #[cfg(any(feature = "board", feature = "items", feature = "menu"))]
     pub fn text(&self, legacy: &str) -> String {
         if self.is_color() {
             crate::nbt::legacy_to_ansi(legacy)

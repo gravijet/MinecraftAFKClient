@@ -166,11 +166,11 @@ fn missing_bytes(shared: &Arc<Shared>) -> Option<Vec<u8>> {
     crate::pov_assets::web_missing(shared)
 }
 
-#[cfg(all(feature = "items", feature = "pov"))]
+#[cfg(feature = "pov")]
 fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
     crate::pov::web_item(shared, id)
 }
-#[cfg(all(feature = "items", not(feature = "pov")))]
+#[cfg(not(feature = "pov"))]
 fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
     crate::pov_assets::web_item(shared, id)
 }
@@ -269,20 +269,11 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             #[cfg(not(feature = "pov"))]
             let mut value = menu_state(shared);
             if let Some(object) = value.as_object_mut() {
-                #[cfg(feature = "menu")]
                 object.insert("menu".to_string(), crate::menu::web_state(shared));
-                #[cfg(not(feature = "menu"))]
-                object.insert(
-                    "menu".to_string(),
-                    serde_json::json!({"open": false, "inventory": []}),
-                );
-                #[cfg(feature = "state")]
                 object.insert(
                     "selected_hotbar".to_string(),
                     shared.extras.selected_hotbar.load(Ordering::Relaxed).into(),
                 );
-                #[cfg(not(feature = "state"))]
-                object.insert("selected_hotbar".to_string(), 0.into());
                 // Die Seite wählt damit die Texturpfade: 1.8.9 hat noch keine HUD-Sprites.
                 object.insert("version".to_string(), shared.proto.name.into());
             }
@@ -309,7 +300,6 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
                 ),
             }
         }
-        #[cfg(feature = "items")]
         ("GET", "/api/item.png") => {
             let id = query_value(query, "id")
                 .and_then(|value| value.parse().ok())
@@ -324,7 +314,6 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             };
             immutable_response(&mut stream, 200, "image/png", &bytes);
         }
-        #[cfg(feature = "menu")]
         ("POST", "/api/click") => {
             let slot = query_value(query, "slot").unwrap_or("");
             let Some(action) = click_action(query) else {
@@ -342,7 +331,6 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             };
             response(&mut stream, status, "text/plain", b"");
         }
-        #[cfg(feature = "menu")]
         ("POST", "/api/close") => {
             let status = if crate::menu::close_command(shared) {
                 204
@@ -351,7 +339,6 @@ fn handle(mut stream: TcpStream, shared: &Arc<Shared>, token: &str) {
             };
             response(&mut stream, status, "text/plain", b"");
         }
-        #[cfg(feature = "state")]
         ("POST", "/api/hotbar") => {
             let slot = query_value(query, "slot").and_then(|value| value.parse::<usize>().ok());
             let status = match slot {
@@ -394,7 +381,6 @@ fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-#[cfg(feature = "menu")]
 fn click_action(query: &str) -> Option<&'static str> {
     match query_value(query, "action") {
         None | Some("left") => Some("links"),
@@ -474,7 +460,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "menu")]
     fn unbekannte_klickart_wird_nicht_als_linksklick_ausgefuehrt() {
         assert_eq!(click_action("slot=4&action=right"), Some("rechts"));
         assert_eq!(click_action("slot=4"), Some("links"));

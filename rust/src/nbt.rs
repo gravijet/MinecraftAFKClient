@@ -69,12 +69,10 @@ impl Nbt {
     }
 
     /// Textfeld eines Compounds – für `grass_color_modifier`.
-    #[cfg(any(feature = "items", feature = "pov"))]
     pub(crate) fn get_str<'a>(&'a self, key: &str) -> Option<&'a str> {
         self.get(key)?.as_str()
     }
 
-    #[cfg(feature = "items")]
     pub(crate) fn as_list(&self) -> Option<&[Nbt]> {
         match self {
             Nbt::List(values) => Some(values),
@@ -133,7 +131,6 @@ pub fn read_network(r: &mut Reader) -> io::Result<Nbt> {
 
 /// Altes Netzwerk-NBT (bis 1.20.2): Typ-Byte, Wurzelname, dann Nutzdaten. Gegenstands-Slots in
 /// 1.8.9 benutzen dieses Format; Typ 0 bedeutet dort „kein NBT".
-#[cfg(feature = "items")]
 pub fn read_named(r: &mut Reader) -> io::Result<Nbt> {
     let tag = r.u8()?;
     if tag == 0 {
@@ -623,7 +620,6 @@ fn push_legacy(out: &mut String, style: &Style) {
 
 /// Den NBT-Stil eines Minecraft-`StyledFormat` als `§`-Präfix ausgeben. Scoreboards verwenden
 /// dafür ein reines Style-Compound statt einer Text-Komponente.
-#[cfg(feature = "board")]
 pub(crate) fn style_legacy(tag: &Nbt) -> String {
     let mut out = String::new();
     push_legacy(&mut out, &merge(&Style::default(), tag));
