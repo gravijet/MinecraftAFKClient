@@ -2123,7 +2123,7 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
 /// Spieleinstellungen wie ein echter Client (manche Server erwarten das vor dem Spielbeitritt).
 ///
 /// Die gemeldete Sichtweite ist der wirksamste Sparhebel des ganzen Clients: ohne Live-Ansicht
-/// wird kein einziger Chunk gelesen, der Server schickt sie aber trotzdem – und jedes Byte davon
+/// braucht der Client nur die Chunks um sich herum, der Server schickt aber alle – und jedes Byte davon
 /// muss entschlüsselt und entpackt werden. Mit der kleinsten erlaubten Sichtweite (2) fällt der
 /// allergrößte Teil dieses Verkehrs einfach weg. Siehe [`crate::options::DEFAULT_VIEW_DISTANCE`].
 fn client_information(shared: &Shared, packet_id: i32) -> Writer {

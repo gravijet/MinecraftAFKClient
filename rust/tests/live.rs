@@ -1803,7 +1803,7 @@ fn gemischte_palette_stuerzt_nicht_ab() {
     let _ = child.kill();
 }
 
-/// Weit entfernte Chunks kann die Ansicht nie sehen (sie reicht 72 Blöcke = 4,5 Chunks weit).
+/// Chunks außerhalb von Sichtweite plus Rand braucht die Ansicht nie.
 /// Sie müssen deshalb wieder wegfallen – sonst wächst der Speicher auf Servern, die nie ein
 /// `ForgetChunk` schicken, unbegrenzt.
 #[cfg(feature = "pov")]
@@ -1825,9 +1825,9 @@ fn weit_entfernte_chunks_fallen_weg() {
     assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
 
     // Erst fragen, wenn alle 441 Chunks durch sind – sonst zählt die Auskunft einen Zwischenstand.
-    // Nach dem Aufräumen bleiben genau 169 übrig, also darauf warten.
-    let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "169 Chunks");
-    assert!(found, "keine Auskunft über 169 Chunks. Ausgabe:\n{}", log);
+    // Nach dem Aufräumen bleiben genau 81 übrig (Sichtweite 3 plus Rand), also darauf warten.
+    let (found, log) = common::poll_command(&mut stdin, &err, TIMEOUT, ":pov info", "81 Chunks");
+    assert!(found, "keine Auskunft über 81 Chunks. Ausgabe:\n{}", log);
     // Die *letzte* Auskunft zählt: durch das Nachfragen stehen frühere Zwischenstände mit im Log.
     let line = log
         .lines()
@@ -1839,8 +1839,8 @@ fn weit_entfernte_chunks_fallen_weg() {
         .find(|(_, next)| *next == "Chunks")
         .and_then(|(value, _)| value.parse().ok())
         .expect("Chunkzahl");
-    // 13x13 um den eigenen Chunk herum bleiben übrig, nicht alle 441.
-    assert_eq!(chunks, 169, "Aufräumen greift nicht: {}", line);
+    // 9x9 um den eigenen Chunk herum bleiben übrig, nicht alle 441.
+    assert_eq!(chunks, 81, "Aufräumen greift nicht: {}", line);
     let _ = child.kill();
 }
 
@@ -2197,12 +2197,12 @@ fn alle_oertlichen_befehle_ueberstehen_auch_unsinn() {
 }
 
 /// Die gemeldete Sichtweite entscheidet, wie viele Chunkdaten der Server überhaupt schickt.
-/// Ohne Live-Ansicht liest der Client keinen einzigen Chunk – dann muss dort das Minimum stehen.
+/// Ohne Live-Ansicht reicht das Minimum, die Live-Ansicht holt einen Chunk mehr.
 #[test]
 fn sichtweite_passt_zur_bauform() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
-    let expected: u8 = if cfg!(feature = "pov") { 5 } else { 2 };
+    let expected: u8 = if cfg!(feature = "pov") { 3 } else { 2 };
     let ok = common::wait_note(
         &server.notes,
         TIMEOUT,

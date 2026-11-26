@@ -212,12 +212,11 @@ pub struct Options {
     pub reconnect: Option<Reconnect>,
 }
 
-/// Sichtweite, die der jeweilige Build sinnvollerweise anfordert. Ohne Live-Ansicht liest der
-/// Client keinen einzigen Chunk – dann ist das Minimum genau richtig. Mit Live-Ansicht reicht
-/// etwas mehr als die 72 Blöcke, die die Ansicht überhaupt weit sieht.
-/// Standard: 2 Chunks reichen für Physik und Befehle. POV: 5 – die Ansicht reicht 72 Blöcke,
-/// also gut viereinhalb Chunks weit.
-pub const DEFAULT_VIEW_DISTANCE: u8 = if cfg!(feature = "pov") { 5 } else { 2 };
+/// Sichtweite, die der jeweilige Build anfordert. Standard: 2 Chunks (das Minimum) reichen für
+/// Physik und Befehle. POV: 3 – der Server schickt einen Ring mehr, das sind 48 bis 64 Blöcke;
+/// jeder Chunk kostet die Live-Ansicht rund 50 kB (Zustände, Licht), bei 5 wären es 13 statt
+/// 9 MB. `--view-distance` holt mehr, wo der Speicher da ist.
+pub const DEFAULT_VIEW_DISTANCE: u8 = if cfg!(feature = "pov") { 3 } else { 2 };
 
 impl Default for Options {
     fn default() -> Self {
