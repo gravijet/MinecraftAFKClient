@@ -215,7 +215,9 @@ pub struct Options {
 /// Sichtweite, die der jeweilige Build sinnvollerweise anfordert. Ohne Live-Ansicht liest der
 /// Client keinen einzigen Chunk – dann ist das Minimum genau richtig. Mit Live-Ansicht reicht
 /// etwas mehr als die 72 Blöcke, die die Ansicht überhaupt weit sieht.
-pub const DEFAULT_VIEW_DISTANCE: u8 = if cfg!(feature = "pov") { 6 } else { 2 };
+/// Standard: 2 Chunks reichen für Physik und Befehle. POV: 5 – die Ansicht reicht 72 Blöcke,
+/// also gut viereinhalb Chunks weit.
+pub const DEFAULT_VIEW_DISTANCE: u8 = if cfg!(feature = "pov") { 5 } else { 2 };
 
 impl Default for Options {
     fn default() -> Self {

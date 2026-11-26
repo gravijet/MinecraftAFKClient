@@ -13,7 +13,6 @@
 //! [`crate::options`].
 
 use crate::client::Shared;
-use crate::protocol::buf::Writer;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

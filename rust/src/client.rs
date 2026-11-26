@@ -46,9 +46,6 @@ const MAX_COMMAND_CHARS: usize = 32_500;
 const DEFAULT_PORT: u16 = 25565;
 /// Moderne Vanilla-Clients schließen jeden 50-ms-Client-Tick mit einem leeren Paket ab.
 const CLIENT_TICK: Duration = Duration::from_millis(50);
-/// Auch wer stillsteht, meldet dem Server alle 20 Ticks erneut seine Position – siehe
-/// [`position_heartbeat`].
-const POSITION_REMINDER: Duration = Duration::from_millis(1000);
 /// Wie lange nach der Startposition höchstens auf den ersten Chunk-Stapel gewartet wird, bevor
 /// die Welt trotzdem als geladen gilt.
 ///
@@ -187,15 +184,15 @@ pub struct Shared {
     /// Beginn der laufenden Weltladephase (ms seit [`Shared::started`]); daran hängt die
     /// Notbremse [`WORLD_LOAD_GRACE`].
     world_load_since: AtomicU64,
-    /// Wann zuletzt ein Positionspaket hinausging (ms seit [`Shared::started`]). Der Vanilla-Client
-    /// zählt dafür Ticks („positionReminder"); eine Uhr trifft dasselbe und übersteht einen
-    /// Standby des Rechners besser.
-    last_position_sent: AtomicU64,
     /// Bezugspunkt aller Millisekundenstempel oben. Ein `Instant` ist monoton – anders als die
     /// Systemuhr kann er nicht rückwärts springen.
     started: Instant,
 
-    /// Gesteuerte Bewegung (`:go`, `:look`, `:home`) – nur im Build mit `--features movement`.
+    /// Die geladene Welt: Chunks und Blöcke – für die Physik, in der POV-Bauform auch fürs Bild.
+    pub(crate) world: Mutex<crate::world::World>,
+    /// Spielerphysik: Position, Geschwindigkeit, gedrückte Tasten.
+    pub(crate) driver: crate::physics::driver::Driver,
+    /// Gesteuerte Bewegung (`:go`, `:look`, `:home`).
     pub(crate) mover: crate::movement::Mover,
 
     /// Optionale Zustände (Anzeigetafel, Menüs, Gegenstände, POV, Tastenzustand, Anti-AFK).
@@ -256,8 +253,9 @@ impl Client {
             chunk_batch_done: AtomicBool::new(false),
             player_loaded_sent: AtomicBool::new(false),
             world_load_since: AtomicU64::new(0),
-            last_position_sent: AtomicU64::new(0),
             started: Instant::now(),
+            world: Mutex::new(crate::world::World::new(proto.name, options.view_distance)),
+            driver: crate::physics::driver::Driver::new(proto.legacy),
             mover: crate::movement::Mover::new(),
             extras: crate::extras::Extras::new(&options),
             entity_id: std::sync::atomic::AtomicI32::new(0),
@@ -355,6 +353,17 @@ impl Client {
                     .error("Position noch unbekannt (nicht im Spiel?)."),
             };
         }
+        if matches!(verb, "world" | "welt") {
+            let (chunks, sections, bytes) = self.shared.world.lock().unwrap().footprint();
+            let dimension = self.shared.world.lock().unwrap().dimension.name.clone();
+            return self.shared.console.info(&format!(
+                "Welt {}: {} Chunks, {} gefüllte Abschnitte, {} kB",
+                dimension,
+                chunks,
+                sections,
+                bytes / 1024
+            ));
+        }
         if crate::extras::command(&self.shared, verb, arg) {
             return;
         }
@@ -384,6 +393,7 @@ impl Client {
             console.print(&format!("    {}", line));
         }
         console.print("    :pos                                   Position anzeigen");
+        console.print("    :world                                 geladene Welt und ihr Speicher");
         console.print(&console.paint(
             crate::console::GRAY,
             "    /befehl geht als Serverbefehl raus, alles andere als Chat.",
@@ -567,33 +577,6 @@ impl Shared {
     fn world_load_overdue(&self) -> bool {
         let since = self.world_load_since.load(Ordering::SeqCst);
         self.elapsed_ms().saturating_sub(since) >= WORLD_LOAD_GRACE.as_millis() as u64
-    }
-
-    /// Ein Positionspaket ist hinausgegangen – der Erinnerungstakt beginnt von vorn.
-    /// Wird auch von [`crate::movement`] aufgerufen, damit eine laufende Bewegung und der
-    /// Erinnerungstakt nicht abwechselnd dasselbe senden.
-    pub(crate) fn mark_position_sent(&self) {
-        self.last_position_sent
-            .store(self.elapsed_ms(), Ordering::Relaxed);
-    }
-
-    /// Ist der Erinnerungstakt fällig? `false`, solange gerade erst etwas gesendet wurde.
-    fn position_reminder_due(&self) -> bool {
-        let last = self.last_position_sent.load(Ordering::Relaxed);
-        self.elapsed_ms().saturating_sub(last) >= POSITION_REMINDER.as_millis() as u64
-    }
-
-    /// Nur die Blickrichtung im lokalen Zustand ändern. Ein Rotationspaket trägt absichtlich
-    /// keine Koordinaten; deshalb darf eine gleichzeitig laufende Bewegung hier nicht durch
-    /// einen zuvor gelesenen Positions-Snapshot zurückgesetzt werden.
-    pub(crate) fn set_rotation(&self, yaw: f32, pitch: f32) -> bool {
-        let mut position = self.position.lock().unwrap();
-        let Some(current) = position.as_mut() else {
-            return false;
-        };
-        current.3 = yaw;
-        current.4 = pitch;
-        true
     }
 
     /// Chat-/Serverzeile anzeigen – und, falls es Chat-Regeln gibt, gegen sie halten.
@@ -865,6 +848,8 @@ fn net_loop(shared: Arc<Shared>) {
         shared.wake();
         shared.rules.reset();
         crate::movement::on_disconnect(&shared);
+        shared.driver.reset();
+        shared.world.lock().unwrap().clear();
         crate::extras::on_disconnect(&shared);
 
         let transferred = shared.intentional.swap(false, Ordering::SeqCst);
@@ -1144,38 +1129,10 @@ fn client_tick(shared: &Arc<Shared>) {
     if !shared.ready_for_gameplay() {
         return;
     }
-    position_heartbeat(shared);
+    crate::physics::driver::tick(shared);
     if shared.proto.ids.sb_client_tick_end >= 0 {
         shared.send_empty(shared.proto.ids.sb_client_tick_end);
     }
-}
-
-/// Die Positionsmeldung eines stillstehenden Spielers.
-///
-/// `LocalPlayer.sendPosition()` prüft in jedem Tick, ob sich Position oder Blickrichtung geändert
-/// haben – und sendet spätestens alle 20 Ticks trotzdem, auch wenn sich nichts geändert hat. Ein
-/// Client, der nach dem Beitritt **überhaupt kein** Positionspaket mehr schickt, sieht auf dem
-/// Server anders aus als jeder echte Spieler; manche Anticheats stören sich daran, und der
-/// Leerlaufzähler des Servers sieht ihn ebenfalls nie.
-///
-/// Läuft gerade eine ausdrückliche Bewegung (`:go`, `:home`), hält der Takt sich heraus: die
-/// sendet ihre eigenen Pakete und meldet das über [`Shared::mark_position_sent`].
-fn position_heartbeat(shared: &Arc<Shared>) {
-    if !shared.position_reminder_due() {
-        return;
-    }
-    let Some((x, y, z, _, _)) = shared.position() else {
-        return;
-    };
-    // Genau wie im Original: unveränderte Blickrichtung heißt das kurze Pos-Paket, nicht PosRot.
-    let mut w = Writer::packet(shared.proto.ids.sb_move_player_pos);
-    w.f64(x);
-    w.f64(y);
-    w.f64(z);
-    // In 1.21.1 ein Bool, ab 1.21.4 ein Flag-Byte – 0x01 heißt in beiden „am Boden".
-    w.u8(0x01);
-    shared.send(w);
-    shared.mark_position_sent();
 }
 
 struct Session {
@@ -1533,8 +1490,9 @@ fn handle_game(
             }
             #[cfg(feature = "pov")]
             if let Some(entity) = own_entity {
-                crate::pov::login(shared, entity, r);
+                crate::pov::login(shared, entity);
             }
+            crate::world::login(shared, r);
             let first_join = !session.joined;
             session.joined = true;
             on_join(shared, session, first_join);
@@ -1543,8 +1501,9 @@ fn handle_game(
         // unterscheiden wir am eigenen Zustand statt am Paketinhalt: dessen Aufbau ist in jeder
         // Version ein anderer, `session.dead` dagegen ist eindeutig – und kostet nichts.
         In::Respawn => {
+            crate::world::respawn(shared, r);
             #[cfg(feature = "pov")]
-            crate::pov::respawn(shared, r);
+            crate::pov::respawn(shared);
             // Ein Respawn setzt die Welt neu auf – der Server schickt gleich einen neuen
             // Chunk-Stapel. Der Vanilla-Client durchläuft die Ladephase deshalb ein zweites Mal
             // und meldet danach erneut `PlayerLoaded`. Die bestätigte Position bleibt dabei
@@ -1615,6 +1574,7 @@ fn handle_game(
             }
         }
         In::StartConfiguration => {
+            shared.driver.reset();
             // Der Server holt uns zurück in die Konfigurationsphase (z. B. Ressourcen-Neuladen).
             shared.in_game.store(false, Ordering::SeqCst);
             shared.restart_world_load(true);
@@ -1631,6 +1591,25 @@ fn handle_game(
         }
         In::Transfer => return transfer(shared, r),
         In::Disconnect => return Err(disconnect_reason(shared, r)),
+        In::EntityMotion => entity_motion(shared, r).map_err(|e| e.to_string())?,
+        In::Explode => explosion(shared, r).map_err(|e| e.to_string())?,
+        In::Abilities => {
+            let flags = r.u8().map_err(|e| e.to_string())?;
+            let fly_speed = r.f32().map_err(|e| e.to_string())?;
+            let _fov_speed = r.f32().map_err(|e| e.to_string())?;
+            // Bit 2: fliegt gerade, Bit 4: darf fliegen (`ClientboundPlayerAbilitiesPacket`).
+            shared
+                .driver
+                .abilities(flags & 2 != 0, flags & 4 != 0, fly_speed, 0.1);
+        }
+        In::GameEvent => {
+            let event = r.u8().map_err(|e| e.to_string())?;
+            let value = r.f32().map_err(|e| e.to_string())?;
+            // Ereignis 3 = Spielmodus geändert; 3.0 = Zuschauer.
+            if event == 3 {
+                shared.driver.spectator(value == 3.0);
+            }
+        }
 
         // Alles Weitere gibt es nur in einer Zusatz-Bauform. Im schlanken Build existieren
         // diese Zweige gar nicht.
@@ -1771,6 +1750,9 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     shared.position_ready.store(false, Ordering::SeqCst);
     let err = |e: io::Error| e.to_string();
 
+    // Ab 1.21.2 bringt der Teleport eine Geschwindigkeit mit; davor bleibt sie auf relativen
+    // Achsen erhalten und wird auf absoluten genullt.
+    let mut motion = [0.0f64; 3];
     let (id, x, y, z, yaw, pitch, flags) = if shared.proto.modern {
         let id = r.var_int().map_err(err)?;
         let (x, y, z) = (
@@ -1778,10 +1760,11 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
             r.f64().map_err(err)?,
             r.f64().map_err(err)?,
         );
-        // Bewegungsvektor interessiert uns nicht, muss aber übersprungen werden.
-        for _ in 0..3 {
-            r.f64().map_err(err)?;
-        }
+        motion = [
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+            r.f64().map_err(err)?,
+        ];
         let yaw = r.f32().map_err(err)?;
         let pitch = r.f32().map_err(err)?;
         (id, x, y, z, yaw, pitch, r.i32().map_err(err)?)
@@ -1834,6 +1817,25 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         previous,
     );
     shared.set_position(new);
+    let current = shared.driver.velocity();
+    let velocity: [f64; 3] = std::array::from_fn(|axis| {
+        let relative_position = flags & (1 << axis) != 0;
+        if shared.proto.modern {
+            // Bits 5–7: Geschwindigkeit relativ (`Relative.DELTA_*`).
+            if flags & (1 << (axis + 5)) != 0 {
+                current[axis] + motion[axis]
+            } else {
+                motion[axis]
+            }
+        } else if relative_position {
+            current[axis]
+        } else {
+            0.0
+        }
+    });
+    shared
+        .driver
+        .teleport([new.0, new.1, new.2], Some(velocity), new.3, new.4);
 
     // Teleport bestätigen (Pflicht, sonst Rubberband/Kick). Ab 26.3 trägt die Bestätigung die
     // übernommene Position selbst; davor spiegelt der Vanilla-Client sie mit einem eigenen
@@ -1863,7 +1865,6 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         echo.u8(0);
         shared.send(echo);
     }
-    shared.mark_position_sent();
     shared.position_ready.store(true, Ordering::SeqCst);
     shared.wake();
     // Mit der Startposition kann die Ladephase enden – in 1.21.1 sofort, ab 1.21.4, sobald auch
@@ -2273,6 +2274,68 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// `SetEntityMotion`: Rückstoß für uns selbst. Ab 1.21.9 als „LpVec3“, davor drei Shorts in
+/// 1/8000 Block je Tick.
+fn entity_motion(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
+    let id = r.var_int()?;
+    if id != shared.entity_id.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let velocity = if shared.proto.modern {
+        read_lp_vec3(r)?
+    } else {
+        let mut v = [0.0; 3];
+        for axis in &mut v {
+            *axis = r.i16()? as f64 / 8000.0;
+        }
+        v
+    };
+    shared.driver.push(velocity, false);
+    Ok(())
+}
+
+/// `LpVec3.read` aus dem 26.x-Client.
+fn read_lp_vec3(r: &mut Reader) -> io::Result<[f64; 3]> {
+    let lowest = r.u8()? as u64;
+    if lowest == 0 {
+        return Ok([0.0; 3]);
+    }
+    let middle = r.u8()? as u64;
+    let highest = r.i32()? as u32 as u64;
+    let buffer = highest << 16 | middle << 8 | lowest;
+    let mut scale = lowest & 3;
+    if lowest & 4 != 0 {
+        scale |= (r.var_int()? as u32 as u64) << 2;
+    }
+    let unpack = |value: u64| ((value & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
+    let scale = scale as f64;
+    Ok([
+        unpack(buffer >> 3) * scale,
+        unpack(buffer >> 18) * scale,
+        unpack(buffer >> 33) * scale,
+    ])
+}
+
+/// Explosionsrückstoß steht bis 26.3 im Explosionspaket selbst (`playerKnockback`); 26.4 schickt
+/// ihn als eigenes `SetEntityMotion`.
+fn explosion(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
+    // shortcut: nur 26.2/26.3 sind gegen den Codec geprüft; ältere Explosionsformate lassen den
+    // Rückstoß aus (der Server korrigiert dann per Teleport).
+    if !matches!(shared.proto.name, "26.2" | "26.3") {
+        return Ok(());
+    }
+    for _ in 0..3 {
+        r.f64()?;
+    }
+    r.f32()?;
+    r.i32()?;
+    if r.bool()? {
+        let knockback = [r.f64()?, r.f64()?, r.f64()?];
+        shared.driver.push(knockback, true);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

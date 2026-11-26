@@ -791,6 +791,13 @@ fn serve(conn: &mut Conn, out: Arc<Mutex<Wire>>, ids: &Ids, plan: &Plan, tx: &No
                 let _locale = c.string();
                 let _ = tx.send(Note::ViewDistance(c.u8()));
             }
+            if id == 2 {
+                // Moderne Clients melden ihre Kennung in der Konfigurationsphase.
+                let mut c = Cursor::new(&payload);
+                if c.string() == "minecraft:brand" {
+                    let _ = tx.send(Note::Brand(c.string()));
+                }
+            }
             if id == 3 {
                 break; // SB_FINISH -> Spielphase
             }

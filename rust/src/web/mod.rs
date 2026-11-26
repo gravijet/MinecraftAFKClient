@@ -6,6 +6,7 @@
 //! fremder Webseiten-Tab kann nicht blind das lokale Menue anklicken.
 
 pub mod assets;
+pub mod jar;
 pub mod resources;
 
 use crate::client::Shared;

@@ -70,8 +70,7 @@ impl<'a> Reader<'a> {
         Ok(f64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
-    /// VarLong – nur die Live-Ansicht braucht ihn (Sammel-Blockänderungen).
-    #[cfg(feature = "pov")]
+    /// VarLong (Sammel-Blockänderungen).
     pub fn var_long(&mut self) -> io::Result<i64> {
         let mut value: i64 = 0;
         let mut shift = 0;

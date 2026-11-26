@@ -1,28 +1,16 @@
-//! Bewegung: Kopf drehen, laufen, Heimatposition.
+//! Bewegung auf Zuruf: laufen, springen, Kopf drehen, Heimatposition, Routen.
 //!
-//! **Nur im Build mit `--features movement`** einkompiliert – der schlanke Standard-Client
-//! enthält davon kein einziges Byte und bleibt wie bisher komplett bewegungslos.
+//! Die Befehle drücken nur Tasten (`:go vor 3` hält „vorwärts“, bis drei Blöcke geschafft sind)
+//! und drehen den Kopf. Gerechnet wird in der echten Spielerphysik ([`crate::physics`]): Der Bot
+//! fällt, steigt Stufen hinauf, schwimmt und bleibt an Wänden hängen wie ein Spieler. Steht etwas
+//! im Weg, springt er; kommt er trotzdem nicht weiter, bricht der Lauf mit einer Meldung ab.
 //!
-//! Kosten im Leerlauf: **null**. Es läuft kein Timer und kein Thread; erst ein Befehl (oder ein
-//! Beitritt mit aktiver Heimatposition) startet einen kurzlebigen Thread, der 20-mal pro Sekunde
-//! eine Position sendet – genau der Takt eines echten Clients – und sich danach beendet.
-//!
-//! Bewusste Grenze: Der Client liest **keine** Weltdaten (keine Chunks). Er weiß also nicht, wo
-//! Blöcke stehen. Gelaufen wird daher geradlinig auf gleicher Höhe; korrigiert der Server die
-//! Position, übernehmen wir seine Vorgabe und brechen die laufende Bewegung ab.
-//!
-//! Gegen Hindernisse gibt es trotzdem zwei Mittel, beide ohne jede Kenntnis der Welt:
-//! * **Route** – einmal aufgezeichnete Wegpunkte (`:route rec` … `:route stop`). Ecken, Türen und
-//!   Treppen kennt der Nutzer; der Client läuft sie nur nach.
-//! * **Blindes Ausweichen** – bleibt ein Abschnitt hängen, wird erst gesprungen (das löst jede
-//!   Stufe von einem Block) und danach seitwärts am Hindernis vorbei, abwechselnd links und
-//!   rechts und mit jedem Versuch einen Block weiter. Erst wenn auch das nicht hilft, bricht der
-//!   Lauf mit einer Meldung ab, statt gegen die Wand zu rennen.
+//! Kosten im Leerlauf: null. Ein Befehl startet einen kurzlebigen Thread, der die Tasten hält,
+//! bis das Ziel erreicht ist.
 
-use crate::client::{Position, Shared, WORLD_LIMIT};
+use crate::client::{Shared, WORLD_LIMIT};
 use crate::console::{Console, BOLD, CYAN, GRAY};
 use crate::options;
-use crate::protocol::buf::Writer;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -33,26 +21,17 @@ use std::time::{Duration, Instant};
 
 /// Ein Server-Tick. Genau so oft schickt auch ein echter Client seine Position.
 const TICK: Duration = Duration::from_millis(50);
-/// Als „angekommen" gilt, wer dem Ziel so nah ist (Blöcke).
-const ARRIVED: f64 = 0.05;
-/// So lange ohne Fortschritt = etwas steht im Weg (wir kennen die Welt nicht) -> ausweichen.
+/// Als „angekommen" gilt, wer dem Ziel so nah ist (Blöcke). Laufen hat Schwung: Wer erst
+/// loslässt, wenn er genau am Ziel steht, rutscht ein Stück darüber hinaus.
+const ARRIVED: f64 = 0.3;
+/// So lange ohne Fortschritt (trotz Springen) = etwas steht im Weg.
 const STUCK_AFTER: Duration = Duration::from_secs(3);
-/// So oft wird ausgewichen, bevor ein Abschnitt aufgibt.
-const MAX_ESCAPES: u32 = 6;
 /// Obergrenze für eine einzelne Laufanweisung (Blöcke) – gegen Tippfehler wie `:go vor 10000`.
 const MAX_BLOCKS: f64 = 512.0;
 /// Obergrenze für die Wegpunkte einer Route – hält Datei und Speicher winzig.
 const MAX_ROUTE: usize = 64;
 /// Nach dem Beitritt kommt die Position erst mit dem ersten Teleport; so lange warten wir darauf.
 const POSITION_TIMEOUT: Duration = Duration::from_secs(20);
-
-// Vanilla-Sprungphysik. Startgeschwindigkeit 0,42 Blöcke/Tick, danach je Tick Schwerkraft und
-// Luftwiderstand – der Scheitel liegt bei gut 1,25 Blöcken. Genug für eine Stufe, zu wenig für zwei.
-const JUMP_SPEED: f64 = 0.42;
-const GRAVITY: f64 = 0.08;
-const DRAG: f64 = 0.98;
-/// Notbremse für eine vollständige Sprungkurve.
-const MAX_JUMP_TICKS: u32 = 20;
 
 // ===================== Einstellungen (movement.json) =====================
 
@@ -130,8 +109,8 @@ struct Settings {
     home: Option<Spot>,
     /// Wegpunkte auf dem Weg dorthin, in Reihenfolge. Leer = geradeaus laufen.
     route: Vec<Spot>,
-    /// Blöcke pro Sekunde. Höchstens normales Vanilla-Gehen; Sprinten würde zusätzlich einen
-    /// konsistenten Eingabe- und Sprintzustand erfordern.
+    /// Blöcke pro Sekunde als Wahl der Gangart: unter 2 schleichen, über 4,4 sprinten, sonst
+    /// gehen. Das Tempo selbst ergibt sich aus der Physik.
     walk_speed: f64,
     /// Grad je Tick beim Drehen. Ein Ruck um 180° in einem Tick fällt jedem Anticheat auf.
     turn_speed: f64,
@@ -155,7 +134,7 @@ impl Default for Settings {
 
 impl Settings {
     fn normalize(&mut self) {
-        self.walk_speed = self.walk_speed.clamp(0.5, 4.317);
+        self.walk_speed = self.walk_speed.clamp(0.5, 5.612);
         self.turn_speed = self.turn_speed.clamp(5.0, 90.0);
         self.max_walk_seconds = self.max_walk_seconds.clamp(5, 600);
         self.home_delay_seconds = self.home_delay_seconds.min(3600);
@@ -166,11 +145,6 @@ impl Settings {
         if let Some(home) = &mut self.home {
             home.normalize();
         }
-    }
-
-    /// Strecke je Tick in Blöcken.
-    fn step(&self) -> f64 {
-        self.walk_speed * TICK.as_secs_f64()
     }
 }
 
@@ -338,7 +312,13 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
             );
         }
         Task::Jump { dx, dz } => {
-            report(shared, jump(shared, job, &settings, dx, dz), "Sprung");
+            let keys = match (dx, dz, shared.position()) {
+                (dx, dz, Some((_, _, _, yaw, _))) if dx != 0.0 || dz != 0.0 => {
+                    keys_for(yaw_towards(dx, dz) - yaw)
+                }
+                _ => (false, false, false, false),
+            };
+            report(shared, jump(shared, job, keys), "Sprung");
         }
         Task::WalkTo {
             x,
@@ -346,7 +326,7 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
             record,
             label,
         } => {
-            let outcome = walk_to(shared, job, &settings, x, z, None);
+            let outcome = walk_to(shared, job, &settings, x, z, false);
             if record && matches!(outcome, Outcome::Arrived) {
                 record_point(shared);
             }
@@ -374,14 +354,14 @@ fn run(shared: &Arc<Shared>, job: Job, task: Task) {
             let mut label = String::from("Heimatposition");
             for (index, point) in waypoints.iter().enumerate() {
                 // Wegpunkte kennen ihre Höhe – damit geht es Treppen hinauf und hinunter.
-                outcome = walk_to(shared, job, &settings, point.x, point.z, Some(point.y));
+                outcome = walk_to(shared, job, &settings, point.x, point.z, true);
                 if !matches!(outcome, Outcome::Arrived) {
                     label = format!("Route (Wegpunkt {}/{})", index + 1, waypoints.len());
                     break;
                 }
             }
             if matches!(outcome, Outcome::Arrived) {
-                outcome = walk_to(shared, job, &settings, target.x, target.z, Some(target.y));
+                outcome = walk_to(shared, job, &settings, target.x, target.z, true);
             }
             if matches!(outcome, Outcome::Arrived) {
                 outcome = turn_to(shared, job, &settings, target.yaw, target.pitch);
@@ -422,7 +402,7 @@ fn report(shared: &Arc<Shared>, outcome: Outcome, label: &str) {
     match outcome {
         Outcome::Arrived => shared.console.ok(&format!("{}: fertig.", label)),
         Outcome::Stuck => shared.console.warn(&format!(
-            "{}: komme trotz Ausweichen nicht weiter – abgebrochen.",
+            "{}: komme trotz Springen nicht weiter – abgebrochen.",
             label
         )),
         Outcome::Timeout => shared
@@ -436,352 +416,224 @@ fn report(shared: &Arc<Shared>, outcome: Outcome, label: &str) {
 }
 
 // ===================== Laufen und Drehen =====================
+//
+// Alles hier drückt nur Tasten und dreht den Kopf. Wohin der Bot dabei wirklich kommt, rechnet
+// die Physik (siehe [`crate::physics`]): Er fällt Kanten hinunter, steigt Stufen hinauf, bleibt
+// an Wänden hängen und springt – wie ein Spieler, der dieselben Tasten drückt.
 
-/// Geradlinig zum Punkt (x|z) laufen, Höhe unverändert.
+/// Ein Physik-Tick abwarten.
+fn sleep_tick(next: Instant) -> Instant {
+    let now = Instant::now();
+    if next > now {
+        thread::sleep(next - now);
+    }
+    next.max(now) + TICK
+}
+
+/// Tasten loslassen – am Ende jeder Bewegung, auch bei Abbruch. Schleichen und Sprinten gehen
+/// auf das zurück, was `:sneak`/`:sprint` eingestellt haben.
+fn release(shared: &Shared) {
+    let sneaking = shared.extras.sneaking();
+    let sprinting = shared.extras.sprinting();
+    shared.driver.set_keys(|keys| {
+        keys.forward = false;
+        keys.backward = false;
+        keys.left = false;
+        keys.right = false;
+        keys.jump = false;
+        keys.shift = sneaking;
+        keys.sprint = sprinting;
+    });
+}
+
+/// Blickrichtung zu einem Punkt (Minecraft-Winkel: 0 = Süden, 90 = Westen).
+fn yaw_towards(dx: f64, dz: f64) -> f32 {
+    (-dx).atan2(dz).to_degrees() as f32
+}
+
+/// Die Tastenkombination, deren Laufrichtung relativ zum Blick `relative` Grad am nächsten
+/// kommt. Wie ein Spieler mit WASD: vorwärts, seitwärts, schräg, rückwärts.
+fn keys_for(relative: f32) -> (bool, bool, bool, bool) {
+    // (vor, zurück, links, rechts) je 45°-Sektor, beginnend bei 0° = vorwärts.
+    const SECTORS: [(bool, bool, bool, bool); 8] = [
+        (true, false, false, false), // 0
+        (true, false, false, true),  // 45: vorne rechts
+        (false, false, false, true), // 90: rechts
+        (false, true, false, true),  // 135
+        (false, true, false, false), // 180
+        (false, true, true, false),  // -135
+        (false, false, true, false), // -90: links
+        (true, false, true, false),  // -45
+    ];
+    let index = ((wrap_degrees(relative) + 360.0 + 22.5) / 45.0) as usize % 8;
+    SECTORS[index]
+}
+
+/// Zum Punkt (x|z) laufen.
 ///
-/// Gerechnet wird in jedem Tick neu aus der **aktuellen** Position. Eine autoritative
-/// Serverkorrektur beendet die Aufgabe im Netz-Thread, statt die alte Bewegungsabsicht danach
-/// erneut durchzusetzen. Bleibt der Fortschritt ohne Teleport aus, wird begrenzt ausgewichen.
-/// `ty` ist die Zielhöhe, sofern bekannt (Wegpunkte einer Route haben eine). Dann wird die Höhe
-/// gleichmäßig mitgezogen – so geht es Treppen hinauf und hinunter, ohne die Welt zu kennen.
+/// `face`: zum Ziel drehen und vorwärts laufen (Heimweg, Route). Sonst bleibt der Blick, und es
+/// wird mit den passenden Tasten seitwärts oder rückwärts gegangen (`:go links 3`).
+/// Steht etwas im Weg, wird gesprungen (eine Stufe von einem Block schafft jeder Sprung); hilft
+/// auch das nicht, endet der Lauf mit [`Outcome::Stuck`].
 fn walk_to(
     shared: &Arc<Shared>,
     job: Job,
     settings: &Settings,
     tx: f64,
     tz: f64,
-    ty: Option<f64>,
+    face: bool,
 ) -> Outcome {
-    let step = settings.step();
     let limit = Duration::from_secs(settings.max_walk_seconds);
     let started = Instant::now();
     let mut closest = f64::MAX;
     let mut closest_at = Instant::now();
     let mut next = Instant::now();
-    let mut escapes = 0;
-
-    loop {
+    // Kurze Strecken (`:go vor 0.2`) brauchen eine feinere Schwelle als lange.
+    let arrived = match shared.position() {
+        Some((x, _, z, _, _)) => ARRIVED.min(((tx - x).powi(2) + (tz - z).powi(2)).sqrt() / 2.0),
+        None => ARRIVED,
+    };
+    let outcome = loop {
         if !job.alive(shared) {
-            return Outcome::Cancelled;
+            break Outcome::Cancelled;
         }
-        let Some((x, y, z, yaw, pitch)) = shared.position() else {
-            return Outcome::Unknown;
+        let Some((x, _, z, yaw, pitch)) = shared.position() else {
+            break Outcome::Unknown;
         };
-
         let (dx, dz) = (tx - x, tz - z);
         let distance = (dx * dx + dz * dz).sqrt();
-        if distance <= ARRIVED {
-            send_move(shared, (tx, ty.unwrap_or(y), tz, yaw, pitch));
-            return Outcome::Arrived;
+        if distance <= arrived {
+            break Outcome::Arrived;
         }
         if started.elapsed() > limit {
-            return Outcome::Timeout;
+            break Outcome::Timeout;
         }
-        if distance < closest - ARRIVED {
+        if distance < closest - 0.05 {
             closest = distance;
             closest_at = Instant::now();
         } else if closest_at.elapsed() > STUCK_AFTER {
-            escapes += 1;
-            if escapes > MAX_ESCAPES {
-                return Outcome::Stuck;
-            }
-            match escape(shared, job, settings, escapes, tx, tz) {
-                Outcome::Arrived => {}
-                other => return other,
-            }
-            // Nach dem Ausweichen stehen wir woanders – der Fortschritt zählt von vorn.
-            closest = f64::MAX;
-            closest_at = Instant::now();
-            next = Instant::now();
-            continue;
+            break Outcome::Stuck;
         }
 
-        let travel = step.min(distance);
-        // Höhe: bekannt -> gleichmäßig darauf zu (immer von der aktuellen Höhe aus gerechnet,
-        // damit eine Korrektur des Servers einfach übernommen wird). Unbekannt -> unverändert.
-        let ny = match ty {
-            Some(ty) => y + (ty - y) * (travel / distance),
-            None => y,
+        let target = yaw_towards(dx, dz);
+        let mut yaw = yaw;
+        if face {
+            let step = settings.turn_speed as f32;
+            yaw += wrap_degrees(target - yaw).clamp(-step, step);
+            shared.driver.look(yaw, pitch);
+        }
+        let relative = target - yaw;
+        let (forward, backward, left, right) = if face && wrap_degrees(relative).abs() > 60.0 {
+            (false, false, false, false) // erst drehen, dann laufen
+        } else {
+            keys_for(relative)
         };
-        send_move(
-            shared,
-            (
-                x + dx / distance * travel,
-                ny,
-                z + dz / distance * travel,
-                yaw,
-                pitch,
-            ),
-        );
+        // Wie die automatische Sprunghilfe des Spiels: an einer Wand am Boden springen.
+        let jump = shared.driver.horizontal_collision() && shared.driver.on_ground();
+        shared.driver.set_keys(|keys| {
+            keys.forward = forward;
+            keys.backward = backward;
+            keys.left = left;
+            keys.right = right;
+            keys.jump = jump;
+            // Langsames Gehen bedeutet hier Schleichen – das ist das einzige echte Langsam.
+            keys.shift = settings.walk_speed < 2.0 || shared.extras.sneaking();
+            keys.sprint = settings.walk_speed > 4.4 || shared.extras.sprinting();
+        });
         next = sleep_tick(next);
-    }
+    };
+    release(shared);
+    // Ausrollen lassen: Die Physik bremst ab, die Position ist danach die echte.
+    nap(shared, job, Duration::from_millis(250));
+    outcome
 }
 
-/// Blindes Ausweichen – ohne jede Kenntnis der Welt, genau wie ein Mensch im Dunkeln.
-///
-/// Immer zuerst ein Sprung: das löst Stufen, Zäune und Teppichkanten, also den mit Abstand
-/// häufigsten Fall. Ab dem zweiten Versuch geht es zusätzlich seitwärts am Hindernis vorbei –
-/// abwechselnd links und rechts und mit jeder Runde einen Block weiter. Danach setzt der Lauf
-/// neu an; findet er einen freien Weg, merkt er es an der wieder sinkenden Entfernung.
-fn escape(
-    shared: &Arc<Shared>,
-    job: Job,
-    settings: &Settings,
-    attempt: u32,
-    tx: f64,
-    tz: f64,
-) -> Outcome {
-    let Some((x, _, z, _, _)) = shared.position() else {
-        return Outcome::Unknown;
-    };
-    let (dx, dz) = (tx - x, tz - z);
-    let length = (dx * dx + dz * dz).sqrt();
-    if length < 1e-6 {
-        return Outcome::Arrived;
-    }
-    let (dx, dz) = (dx / length, dz / length);
-
-    if attempt == 1 {
-        shared.console.info("Etwas im Weg – springe ...");
-        return jump(shared, job, settings, dx, dz);
-    }
-
-    // Abwechselnd links/rechts, je Runde einen Block weiter: 1,5 – 1,5 – 2,5 – 2,5 – 3,5 …
-    let left = attempt.is_multiple_of(2);
-    let blocks = 1.5 + ((attempt - 2) / 2) as f64;
-    shared.console.info(&format!(
-        "Immer noch blockiert – weiche {:.1} Blöcke nach {} aus ...",
-        blocks,
-        if left { "links" } else { "rechts" }
-    ));
-    match jump(shared, job, settings, dx, dz) {
-        Outcome::Arrived => {}
-        other => return other,
-    }
-    // 90° zur Laufrichtung (Minecraft-Konvention: rechts von (fx|fz) ist (−fz|fx)).
-    let (sx, sz) = if left { (dz, -dx) } else { (-dz, dx) };
-    strafe(shared, job, settings, sx, sz, blocks)
-}
-
-/// Ein Sprung nach Vanilla-Physik, dabei weiter in Laufrichtung. Während der Flugkurve melden wir
-/// `onGround = false`; gelandet wird wieder auf der bekannten Ausgangshöhe. Ohne Chunk- und
-/// Kollisionsdaten werden keine tieferen Testpositionen erzeugt.
-fn jump(shared: &Arc<Shared>, job: Job, settings: &Settings, dx: f64, dz: f64) -> Outcome {
-    let Some((_, start_y, _, _, _)) = shared.position() else {
-        return Outcome::Unknown;
-    };
-    let step = settings.step();
-    let mut vy = JUMP_SPEED;
+/// Springen – auf der Stelle oder mit einer Laufrichtung.
+fn jump(shared: &Arc<Shared>, job: Job, keys: (bool, bool, bool, bool)) -> Outcome {
     let mut next = Instant::now();
-
-    for _ in 0..MAX_JUMP_TICKS {
+    let (forward, backward, left, right) = keys;
+    shared.driver.set_keys(|k| {
+        k.jump = true;
+        k.forward = forward;
+        k.backward = backward;
+        k.left = left;
+        k.right = right;
+    });
+    // Abheben abwarten, dann die Landung.
+    let mut left_ground = false;
+    for _ in 0..40 {
         if !job.alive(shared) {
+            release(shared);
             return Outcome::Cancelled;
         }
-        let Some((x, y, z, yaw, pitch)) = shared.position() else {
-            return Outcome::Unknown;
-        };
-        let next_y = y + vy;
-        if next_y <= start_y {
-            send_move_ground(
-                shared,
-                (x + dx * step, start_y, z + dz * step, yaw, pitch),
-                true,
-            );
-            return Outcome::Arrived;
-        }
-        send_move_ground(
-            shared,
-            (x + dx * step, next_y, z + dz * step, yaw, pitch),
-            false,
-        );
-        vy = (vy - GRAVITY) * DRAG;
         next = sleep_tick(next);
-    }
-    Outcome::Timeout
-}
-
-/// Ein Stück quer zur Laufrichtung gehen, ohne dabei auf das Ziel zu achten.
-fn strafe(
-    shared: &Arc<Shared>,
-    job: Job,
-    settings: &Settings,
-    sx: f64,
-    sz: f64,
-    blocks: f64,
-) -> Outcome {
-    let step = settings.step();
-    let ticks = (blocks / step).ceil() as u32;
-    let mut next = Instant::now();
-    for _ in 0..ticks {
-        if !job.alive(shared) {
-            return Outcome::Cancelled;
+        let grounded = shared.driver.on_ground();
+        if !grounded {
+            left_ground = true;
+            shared.driver.set_keys(|k| k.jump = false);
+        } else if left_ground {
+            break;
         }
-        let Some((x, y, z, yaw, pitch)) = shared.position() else {
-            return Outcome::Unknown;
-        };
-        send_move(shared, (x + sx * step, y, z + sz * step, yaw, pitch));
-        next = sleep_tick(next);
     }
+    release(shared);
     Outcome::Arrived
 }
 
-/// Kopf über mehrere Ticks auf die Zielrichtung drehen (nicht ruckartig in einem Tick).
-///
-/// Mit derselben Notbremse wie beim Laufen: Ein Server, der unsere Blickrichtung laufend
-/// zurücksetzt (Anticheat, Fahrzeug, Fesselung), hätte diese Schleife sonst **endlos** mit
-/// zwanzig Paketen je Sekunde am Leben gehalten – ohne Meldung und ohne dass `:look` je
-/// zurückkäme.
-fn turn_to(
-    shared: &Arc<Shared>,
-    job: Job,
-    settings: &Settings,
-    target_yaw: f32,
-    target_pitch: f32,
-) -> Outcome {
-    let target_yaw = wrap_degrees(target_yaw);
-    let target_pitch = target_pitch.clamp(-90.0, 90.0);
-    let step = settings.turn_speed as f32;
-    let limit = Duration::from_secs(settings.max_walk_seconds);
-    let started = Instant::now();
+/// Kopf gleichmäßig drehen.
+fn turn_to(shared: &Arc<Shared>, job: Job, settings: &Settings, yaw: f32, pitch: f32) -> Outcome {
     let mut next = Instant::now();
-
+    let step = settings.turn_speed as f32;
     loop {
         if !job.alive(shared) {
             return Outcome::Cancelled;
         }
-        let Some((_, _, _, yaw, pitch)) = shared.position() else {
+        let Some((_, _, _, now_yaw, now_pitch)) = shared.position() else {
             return Outcome::Unknown;
         };
-
-        // Immer den kürzeren Weg herum drehen.
-        let dyaw = wrap_degrees(target_yaw - yaw);
-        let dpitch = target_pitch - pitch;
-        if dyaw.abs() < 0.01 && dpitch.abs() < 0.01 {
+        let dy = wrap_degrees(yaw - now_yaw);
+        let dp = pitch - now_pitch;
+        if dy.abs() < 0.5 && dp.abs() < 0.5 {
+            shared.driver.look(now_yaw + dy, pitch);
             return Outcome::Arrived;
         }
-        if started.elapsed() > limit {
-            return Outcome::Timeout;
-        }
-        send_rotation(
-            shared,
-            wrap_degrees(yaw + dyaw.clamp(-step, step)),
-            (pitch + dpitch.clamp(-step, step)).clamp(-90.0, 90.0),
+        shared.driver.look(
+            now_yaw + dy.clamp(-step, step),
+            now_pitch + dp.clamp(-step, step),
         );
         next = sleep_tick(next);
     }
 }
 
-/// Nur den Kopf drehen. Vanilla verwendet dafür das kurze Rotationspaket; ein vollständiges
-/// Positionspaket würde dieselben, zuvor gelesenen Koordinaten erneut behaupten und könnte eine
-/// gleichzeitig laufende Bewegung auf einen alten Snapshot zurücksetzen.
+/// Blickrichtung sofort setzen (Anti-AFK); geht mit dem nächsten Tick hinaus.
 pub(crate) fn send_rotation(shared: &Shared, yaw: f32, pitch: f32) {
-    let yaw = if yaw.is_finite() {
-        wrap_degrees(yaw)
-    } else {
-        return;
-    };
-    let pitch = if pitch.is_finite() {
-        pitch.clamp(-90.0, 90.0)
-    } else {
-        return;
-    };
-    if !shared.set_rotation(yaw, pitch) {
-        return;
-    }
-    let mut w = Writer::packet(shared.proto.ids.sb_move_player_rot);
-    w.f32(yaw);
-    w.f32(pitch);
-    // In 1.21.1 ist das ein Bool, danach ein Flag-Byte. 0x01 bedeutet in beiden `onGround`.
-    w.u8(0x01);
-    shared.send(w);
+    shared.driver.look(yaw, pitch);
 }
 
-/// Position senden **und** den eigenen Zustand mitziehen – der Server rechnet ab jetzt mit ihr.
-pub(crate) fn send_move(shared: &Shared, position: Position) {
-    send_move_ground(shared, position, true);
-}
-
-fn send_move_ground(shared: &Shared, position: Position, on_ground: bool) {
-    let Some(position) = checked_position(position) else {
-        return;
-    };
-    shared.set_position(position);
-    let (x, y, z, _, _) = position;
-    // Die Blickrichtung ändert sich hier nicht. Vanilla sendet deshalb das kürzere Pos-Paket
-    // und behauptet nicht in jedem Tick dieselben Winkel erneut.
-    let mut w = Writer::packet(shared.proto.ids.sb_move_player_pos);
-    w.f64(x);
-    w.f64(y);
-    w.f64(z);
-    w.u8(if on_ground { 0x01 } else { 0x00 });
-    shared.send(w);
-    // Der Erinnerungstakt des Client-Ticks beginnt von vorn – sonst schöben Bewegung und Takt
-    // abwechselnd dieselbe Position hinaus.
-    shared.mark_position_sent();
-}
-
-/// Nur Werte aufs Kabel lassen, die auch eine Vanilla-Spielerposition darstellen können.
-fn checked_position(position: Position) -> Option<Position> {
-    let (x, y, z, yaw, pitch) = position;
-    if ![x, y, z]
-        .into_iter()
-        .all(|value| value.is_finite() && (-WORLD_LIMIT..=WORLD_LIMIT).contains(&value))
-        || !yaw.is_finite()
-        || !pitch.is_finite()
-        || !(-90.0..=90.0).contains(&pitch)
-    {
-        return None;
-    }
-    Some((x, y, z, wrap_degrees(yaw), pitch))
-}
-
-/// Bis zum nächsten Tick schlafen und den nächsten Termin zurückgeben. Hinken wir hinterher
-/// (Standby, ausgelastetes System), wird der Takt neu aufgesetzt statt aufzuholen.
-fn sleep_tick(next: Instant) -> Instant {
-    let target = next + TICK;
-    let now = Instant::now();
-    match target.checked_duration_since(now) {
-        Some(wait) => {
-            thread::sleep(wait);
-            target
-        }
-        None => now,
-    }
-}
-
-/// Kurzschlaf in Scheiben, damit `:stop` und eine Trennung sofort wirken.
+/// Unterbrechbar warten.
 fn nap(shared: &Arc<Shared>, job: Job, duration: Duration) -> bool {
     let until = Instant::now() + duration;
-    loop {
-        // `saturating_duration_since` statt `until - now`: die Subtraktion zweier Instants
-        // paniert, sobald der Termin zwischen Prüfung und Rechnung verstrichen ist.
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return job.alive(shared);
-        }
+    while Instant::now() < until {
         if !job.connection_alive(shared) {
             return false;
         }
-        thread::sleep(left.min(Duration::from_millis(100)));
-    }
-}
-
-fn wait_for_position(shared: &Arc<Shared>, job: Job) -> bool {
-    let until = Instant::now() + POSITION_TIMEOUT;
-    while !shared.ready_for_gameplay() {
-        if !job.connection_alive(shared) {
-            return false;
-        }
-        if Instant::now() >= until {
-            shared
-                .console
-                .error("Heimatposition: Der Server hat keine Position geschickt.");
-            return false;
-        }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(TICK.min(until.saturating_duration_since(Instant::now())));
     }
     true
+}
+
+/// Nach dem Beitritt kommt die Position erst mit dem ersten Teleport.
+fn wait_for_position(shared: &Arc<Shared>, job: Job) -> bool {
+    let until = Instant::now() + POSITION_TIMEOUT;
+    while Instant::now() < until {
+        if !job.connection_alive(shared) {
+            return false;
+        }
+        if shared.ready_for_gameplay() && shared.position().is_some() {
+            return true;
+        }
+        thread::sleep(TICK);
+    }
+    false
 }
 
 // ===================== Haken aus dem Client =====================
@@ -953,11 +805,11 @@ fn jump_command(shared: &Arc<Shared>, arg: &str) {
     spawn(shared, Task::Jump { dx, dz });
 }
 
-/// Ohne Welt- und Kollisionsdaten kann ein Fall nicht korrekt simuliert werden.
+/// Fallen passiert von selbst – die Physik zieht den Bot nach unten, sobald nichts trägt.
 fn fall_command(shared: &Arc<Shared>) {
-    shared.console.error(
-        ":fall ist ohne bekannte Weltkollision deaktiviert; es werden keine Testpositionen nach unten gesendet.",
-    );
+    shared
+        .console
+        .info("Fallen passiert von selbst: Steht nichts unter dem Bot, fällt er wie ein Spieler.");
 }
 
 fn look(shared: &Arc<Shared>, arg: &str) {
@@ -1446,108 +1298,6 @@ mod tests {
         assert_eq!(compass(270.0), "Ost");
     }
 
-    /// Zu schnell laufen meldet der Server als „moved too quickly".
-    #[test]
-    fn geschwindigkeit_bleibt_plausibel() {
-        let mut settings = Settings {
-            walk_speed: 40.0,
-            ..Settings::default()
-        };
-        settings.normalize();
-        assert_eq!(settings.walk_speed, 4.317);
-        // Schritt je Tick bei Vanilla-Gehen: gut 0,2 Blöcke.
-        assert!((Settings::default().step() - 0.21585).abs() < 1e-6);
-    }
-
-    #[test]
-    fn nur_gueltige_positionen_gehen_aufs_kabel() {
-        assert_eq!(
-            checked_position((1.0, 64.0, -2.0, 450.0, 30.0)),
-            Some((1.0, 64.0, -2.0, 90.0, 30.0))
-        );
-        assert!(checked_position((f64::NAN, 64.0, 0.0, 0.0, 0.0)).is_none());
-        assert!(checked_position((WORLD_LIMIT + 1.0, 64.0, 0.0, 0.0, 0.0)).is_none());
-        assert!(checked_position((0.0, 64.0, 0.0, f32::INFINITY, 0.0)).is_none());
-        assert!(checked_position((0.0, 64.0, 0.0, 0.0, 90.1)).is_none());
-    }
-
-    /// Der Sprung muss über eine Stufe (1 Block) tragen, aber nicht über zwei – sonst wäre es
-    /// kein Sprung mehr, sondern Fliegen, und genau das fällt jedem Server auf.
-    #[test]
-    fn sprung_schafft_genau_eine_stufe() {
-        let mut vy = JUMP_SPEED;
-        let mut height = 0.0;
-        while vy > 0.0 {
-            height += vy;
-            vy = (vy - GRAVITY) * DRAG;
-        }
-        assert!(height > 1.0, "Sprunghöhe {} < 1 Block", height);
-        assert!(height < 2.0, "Sprunghöhe {} >= 2 Blöcke", height);
-    }
-
-    /// Ausweichen heißt: erst springen, dann abwechselnd zur Seite und mit jeder Runde weiter.
-    #[test]
-    fn ausweichen_wechselt_die_seite_und_wird_weiter() {
-        let plan = |attempt: u32| (attempt.is_multiple_of(2), 1.5 + ((attempt - 2) / 2) as f64);
-        assert_eq!(plan(2), (true, 1.5)); // links
-        assert_eq!(plan(3), (false, 1.5)); // rechts
-        assert_eq!(plan(4), (true, 2.5));
-        assert_eq!(plan(5), (false, 2.5));
-        assert_eq!(plan(6), (true, 3.5));
-    }
-
-    /// Quer zur Laufrichtung heißt 90° – und die Seiten dürfen nicht vertauscht sein.
-    #[test]
-    fn seitwaerts_steht_senkrecht_zur_laufrichtung() {
-        let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{} != {}", a, b);
-        // Blick nach Süden: vorwärts = (0|1), rechts = (−1|0) – dieselbe Konvention wie :go rechts.
-        let (dx, dz) = Direction::Forward.vector(0.0);
-        let (rx, rz) = (-dz, dx);
-        let (lx, lz) = (dz, -dx);
-        let (ex, ez) = Direction::Right.vector(0.0);
-        close(rx, ex);
-        close(rz, ez);
-        // Senkrecht: Skalarprodukt 0, und links ist genau die Gegenrichtung von rechts.
-        close(dx * rx + dz * rz, 0.0);
-        close(lx, -rx);
-        close(lz, -rz);
-    }
-
-    /// Die Höhe wird von der **aktuellen** Position aus aufs Ziel zugezogen: nach der Hälfte der
-    /// Strecke die halbe Höhendifferenz. So folgt der Lauf einer Treppe, und eine Korrektur des
-    /// Servers wird einfach übernommen, statt gegen sie anzurechnen.
-    #[test]
-    fn hoehe_folgt_der_strecke() {
-        let interpolate =
-            |y: f64, ty: f64, travel: f64, distance: f64| y + (ty - y) * (travel / distance);
-        // 8 Blöcke Strecke, 4 Blöcke tiefer: nach der halben Strecke die halbe Höhe.
-        let mut y = 68.0;
-        let mut left = 8.0;
-        while left > 4.0 {
-            y = interpolate(y, 64.0, 1.0, left);
-            left -= 1.0;
-        }
-        assert!((y - 66.0).abs() < 1e-9, "nach halber Strecke: {}", y);
-        // Und am Ende genau auf der Zielhöhe.
-        while left > 0.0 {
-            y = interpolate(y, 64.0, 1.0, left);
-            left -= 1.0;
-        }
-        assert!((y - 64.0).abs() < 1e-9, "am Ziel: {}", y);
-    }
-
-    /// Der erste Tasttick darf nur ein winziges Stück nach unten gehen – sonst rutscht der Client
-    /// bei festem Boden sichtbar in ihn hinein, bevor der Server ihn zurückholt.
-    #[test]
-    fn erster_abwaertsschritt_des_sprungs_ist_klein() {
-        let first = (0.0 - GRAVITY) * DRAG;
-        assert!(first < 0.0);
-        assert!(first.abs() < 0.1, "erster Fallschritt {} zu groß", first);
-        // Und ein Sturz beschleunigt: der zweite Schritt ist größer als der erste.
-        let second = (first - GRAVITY) * DRAG;
-        assert!(second.abs() > first.abs());
-    }
-
     /// `movement.json` ist eine gewöhnliche Textdatei – darin kann auch `1e400` stehen, und
     /// JSON macht daraus eine Unendlichkeit. Ungeprüft war der Abstand zum Ziel danach unendlich
     /// und die Schrittweite null: `:home go` lief bis ins Zeitlimit, ohne sich zu bewegen.
@@ -1592,6 +1342,20 @@ mod tests {
     }
 
     /// Eine zu lange Route würde die Datei und den Heimlauf sinnlos aufblähen.
+    /// WASD wie im Spiel: Die Taste, deren Laufrichtung dem Ziel am nächsten kommt.
+    #[test]
+    fn tasten_folgen_der_zielrichtung() {
+        assert_eq!(keys_for(0.0), (true, false, false, false));
+        assert_eq!(keys_for(-90.0), (false, false, true, false));
+        assert_eq!(keys_for(90.0), (false, false, false, true));
+        assert_eq!(keys_for(180.0), (false, true, false, false));
+        assert_eq!(keys_for(-180.0), (false, true, false, false));
+        assert_eq!(keys_for(44.0), (true, false, false, true));
+        // Süden = Gierwinkel 0, Osten (+x) = -90.
+        assert!((yaw_towards(0.0, 1.0) - 0.0).abs() < 1e-4);
+        assert!((yaw_towards(1.0, 0.0) + 90.0).abs() < 1e-4);
+    }
+
     #[test]
     fn route_bleibt_begrenzt() {
         let mut settings = Settings {

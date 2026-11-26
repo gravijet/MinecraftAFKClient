@@ -535,13 +535,6 @@ const SHAPES_26_2: &str = concat!(
     "VVV",  // 108: cat_collar, sheep_color, shulker_color
 );
 
-// ===================== versionsunabhängige IDs =====================
-//
-// Handshake und die grundlegenden Login-IDs sind versionsunabhaengig. 1.8.9 springt danach
-// unmittelbar ins Spiel; die vier modernen Versionen verwenden zusaetzlich die Konfigurationsphase.
-
-/// Handshake (nur ein Paket).
-
 /// Aus den 26.2-Formen nach Komponentenname übernommen; neu hinzugekommene Komponenten
 /// bleiben unbekannt (`.`), dann endet das Lesen dieses Gegenstands ehrlich dort.
 const SHAPES_26_3: &str = concat!(
@@ -614,6 +607,7 @@ const SHAPES_26_4: &str = concat!(
     "...",  // 120: sign_text_back, waxed, cushion/color
 );
 
+/// Handshake (nur ein Paket, in allen Versionen gleich).
 pub mod handshake {
     pub const SB_INTENTION: i32 = 0;
     /// intent-Feld: 1=Status, 2=Login, 3=Transfer
@@ -641,12 +635,6 @@ pub mod values {
         pub const STOP_SNEAKING: i32 = 1;
         pub const START_SPRINTING: i32 = 3;
         pub const STOP_SPRINTING: i32 = 4;
-    }
-
-    /// Bits im Eingabepaket ab 1.21.11 (`ServerboundPlayerInputPacket`, ein Byte).
-    pub mod input {
-        pub const SNEAK: u8 = 0x20;
-        pub const SPRINT: u8 = 0x40;
     }
 
     /// `ContainerActionType` – der Modus im Klick-Paket.

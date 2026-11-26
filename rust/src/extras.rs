@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::protocol::buf::Writer;
-use crate::protocol::values;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +61,14 @@ pub struct Extras {
 }
 
 impl Extras {
+    pub(crate) fn sneaking(&self) -> bool {
+        self.sneaking.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn sprinting(&self) -> bool {
+        self.sprinting.load(Ordering::Relaxed)
+    }
+
     pub fn new(options: &Options) -> Extras {
         let _ = options;
         Extras {
@@ -87,44 +94,24 @@ impl Extras {
 /// die eine aktive Bauform wirklich benötigt; ein Paket ist bereits längenbegrenzt, deshalb darf
 /// der Rest aller anderen Register ungelesen verworfen werden.
 pub fn registry(shared: &Arc<Shared>, r: &mut Reader) {
-    registry_used(shared, r);
-    // Bauformen ohne Gegenstände und ohne Live-Ansicht brauchen aus der Registry nichts.
-}
-
-fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
     let Ok(registry) = r.string() else { return };
-    let wants_items = true && registry == "minecraft:item";
-    let wants_dimensions = cfg!(feature = "pov") && registry == "minecraft:dimension_type";
+    let wants_items = registry == "minecraft:item";
+    // Welthöhe je Dimension: braucht die Physik (Standard) wie das Bild (POV).
+    let wants_dimensions = registry == "minecraft:dimension_type";
     // Aus den Biomen kommt die Einfärbung von Gras, Laub und Wasser. Ihre Reihenfolge hier ist
     // genau die, die die Chunk-Paletten als Nummer nennen.
     let wants_biomes = cfg!(feature = "pov") && registry == "minecraft:worldgen/biome";
     if !wants_items && !wants_dimensions && !wants_biomes {
         return;
     }
-
     let Ok(count) = r.var_int() else { return };
     if !(0..=65_536).contains(&count) {
         return;
     }
-
-    // Nur der wirklich gesuchte Vektor bekommt Platz. `minecraft:item` hat gut anderthalbtausend
-    // Einträge – dafür in einer POV-Bauform, die die Liste gar nicht will, Speicher anzufordern,
-    // wäre reine Verschwendung.
-    let mut item_names = match wants_items {
-        true => Vec::with_capacity(count as usize),
-        false => Vec::new(),
-    };
+    let mut item_names = Vec::new();
+    let mut dimensions = Vec::new();
     #[cfg(feature = "pov")]
-    let mut dimensions = match wants_dimensions {
-        true => Vec::with_capacity(count as usize),
-        false => Vec::new(),
-    };
-    #[cfg(feature = "pov")]
-    let mut biomes = match wants_biomes {
-        true => Vec::with_capacity(count as usize),
-        false => Vec::new(),
-    };
-
+    let mut biomes = Vec::new();
     for _ in 0..count {
         let Ok(name) = r.string() else { return };
         let Ok(has_data) = r.bool() else { return };
@@ -136,33 +123,20 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         } else {
             None
         };
-        #[cfg(not(feature = "pov"))]
-        let _ = &data;
-
-        // Beides zugleich kann nicht sein – es ist ein Register je Paket. Das `continue` spart
-        // deshalb nur die Kopie des Namens: `minecraft:item` hat gut anderthalbtausend Einträge,
-        // und die wurden bisher alle doppelt angelegt.
         if wants_items {
             item_names.push(name);
-            continue;
-        }
-        #[cfg(feature = "pov")]
-        if wants_biomes {
+        } else if wants_dimensions {
+            dimensions.push(crate::world::Dimension::from_registry(name, data.as_ref()));
+        } else {
+            #[cfg(feature = "pov")]
             biomes.push(crate::pov::BiomeParams::from_registry(data.as_ref()));
-            continue;
-        }
-        #[cfg(feature = "pov")]
-        if wants_dimensions {
-            dimensions.push(crate::pov::Dimension::from_registry(name, data.as_ref()));
         }
     }
-
     if wants_items {
         *shared.extras.item_names.lock().unwrap() = item_names;
     }
-    #[cfg(feature = "pov")]
     if wants_dimensions {
-        shared.extras.pov.set_dimensions(dimensions);
+        shared.world.lock().unwrap().set_dimensions(dimensions);
     }
     #[cfg(feature = "pov")]
     if wants_biomes {
@@ -187,13 +161,16 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
         }
         In::PlayerInventory => crate::menu::incoming(shared, kind, r),
 
-        #[cfg(feature = "pov")]
         In::LevelChunk
         | In::LevelChunkBulk
         | In::ForgetChunk
         | In::BlockUpdate
-        | In::SectionBlocks
-        | In::AddEntity
+        | In::SectionBlocks => crate::world::incoming(shared, kind, r),
+        #[cfg(feature = "pov")]
+        In::LightUpdate => crate::world::incoming(shared, kind, r),
+
+        #[cfg(feature = "pov")]
+        In::AddEntity
         | In::RemoveEntities
         | In::MoveEntityPos
         | In::MoveEntityPosRot
@@ -397,51 +374,17 @@ fn toggle(
 
 // ===================== Tastenzustand =====================
 
+/// Schleichen und Sprinten sind Tasten: Die Physik bewegt sich danach, und der Treiber meldet
+/// sie dem Server so wie der Vanilla-Client (Eingabepaket ab 1.21.11, sonst Spielerbefehl;
+/// Sprint immer zusätzlich als Spielerbefehl – nur daran erkennt der Server ihn).
 pub(crate) fn set_sneak(shared: &Arc<Shared>, on: bool) {
     shared.extras.sneaking.store(on, Ordering::Relaxed);
-    send_state(
-        shared,
-        on,
-        values::player_state::START_SNEAKING,
-        values::player_state::STOP_SNEAKING,
-    );
+    shared.driver.set_keys(|keys| keys.shift = on);
 }
 
 pub(crate) fn set_sprint(shared: &Arc<Shared>, on: bool) {
     shared.extras.sprinting.store(on, Ordering::Relaxed);
-    send_state(
-        shared,
-        on,
-        values::player_state::START_SPRINTING,
-        values::player_state::STOP_SPRINTING,
-    );
-}
-
-/// Der Weg zum Server ist versionsabhängig:
-///
-/// * **1.21.1** kennt für Schleichen und Sprinten je ein eigenes „Spielerbefehl"-Paket; dort wird
-///   nur die *Änderung* gemeldet.
-/// * **ab 1.21.11** gibt es stattdessen ein Eingabepaket mit einem Bitfeld aller Tasten. Es
-///   beschreibt den *Gesamtzustand*, deshalb müssen beide Bits jedes Mal mit hinein.
-fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
-    if shared.proto.modern {
-        let mut bits = 0u8;
-        if shared.extras.sneaking.load(Ordering::Relaxed) {
-            bits |= values::input::SNEAK;
-        }
-        if shared.extras.sprinting.load(Ordering::Relaxed) {
-            bits |= values::input::SPRINT;
-        }
-        let mut w = Writer::packet(shared.proto.ids.sb_player_input);
-        w.u8(bits);
-        return shared.send(w);
-    }
-
-    let mut w = Writer::packet(shared.proto.ids.sb_player_command);
-    w.var_int(shared.entity_id.load(Ordering::Relaxed));
-    w.var_int(if on { start } else { stop });
-    w.var_int(0); // Zusatzwert (nur beim Reiten benutzt)
-    shared.send(w);
+    shared.driver.set_keys(|keys| keys.sprint = on);
 }
 
 /// Rechtsklick mit dem Gegenstand in der Hand („Gegenstand benutzen").
@@ -536,17 +479,6 @@ pub(crate) fn swing_arm(shared: &Shared) {
 #[cfg(test)]
 mod tests {
     use crate::protocol::PROTOCOLS;
-
-    /// Das Bitfeld ab 1.21.11 beschreibt den Gesamtzustand: beide Tasten müssen sich unabhängig
-    /// setzen lassen, ohne einander zu überschreiben.
-    #[test]
-    fn eingabebits_stoeren_sich_nicht() {
-        use crate::protocol::values;
-        let bits = values::input::SNEAK | values::input::SPRINT;
-        assert_eq!(bits & values::input::SNEAK, values::input::SNEAK);
-        assert_eq!(bits & values::input::SPRINT, values::input::SPRINT);
-        assert_ne!(values::input::SNEAK, values::input::SPRINT);
-    }
 
     /// Die Zusatz-IDs müssen in jeder Version gesetzt sein – eine vergessene 0 würde ein
     /// völlig anderes Paket senden. Ausnahme sind die beiden Pakete, die es in 1.21.1 noch

@@ -4,6 +4,7 @@
 /// Packet ids of one protocol version; `-1` = the version has no such packet.
 /// The last four fields are registry ids (entity type, item components).
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // manche IDs liest nur eine der beiden Bauformen
 pub struct Ids {
     pub login_cb_disconnect: i32,
     pub login_cb_hello: i32,

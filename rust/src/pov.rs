@@ -36,6 +36,7 @@ use crate::protocol::nbt::Nbt;
 use crate::protocol::In;
 use crate::web::assets::Assets;
 use crate::web::assets::BiomeTint;
+use crate::world::{local_index, Chunk, Section};
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -46,23 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SECTION_BLOCKS: usize = 16 * 16 * 16;
-const SECTION_BIOMES: usize = 4 * 4 * 4;
 const MAX_ENTITIES: usize = 4096;
-const MAX_SECTIONS: usize = 256;
-/// Weiter entfernte Chunks kann die Ansicht nie sehen: [`MAX_DISTANCE`] sind 72 Blöcke, ein Strahl
-/// erreicht damit höchstens den fünften Chunk in jede Richtung. Alles darüber wird verworfen,
-/// sobald ein neuer Chunk ankommt – ohne das lassen Server, die nie ein `ForgetChunk` schicken,
-/// den Speicher unbegrenzt wachsen.
-const KEEP_CHUNK_RADIUS: i32 = 6;
-/// Notbremse für die Zeit, in der noch nicht aufgeräumt werden kann (der Server schickt Chunks,
-/// bevor er die erste Position schickt).
-///
-/// Abgeleitet aus [`KEEP_CHUNK_RADIUS`] statt frei gegriffen: Aufgeräumt wird auf 13x13 Chunks,
-/// mehr als zwei Chunks Anlauf darüber hinaus kann keine Ansicht je brauchen. Vorher stand hier
-/// eine glatte 1024 – rund das Sechsfache, und ein Chunk mit den üblichen acht gefüllten
-/// Abschnitten wiegt gut 35 KB. Aus höchstens 40 MB werden damit höchstens 11.
-const MAX_CHUNKS: usize = (2 * (KEEP_CHUNK_RADIUS as usize + 2) + 1).pow(2);
 const HORIZONTAL_FOV: f64 = 90.0;
 const MAX_DISTANCE: f64 = 72.0;
 const DEFAULT_WIDTH: usize = 64;
@@ -81,349 +66,6 @@ const REPEAT_UNCHANGED: Duration = Duration::from_secs(2);
 /// Der normale Viewer fragt nur alle 200 ms ab; 150 ms Cachezeit veraendern dessen Takt daher
 /// nicht, verhindern aber, dass mehrere Tabs denselben Weltstand parallel neu zeichnen.
 const WEB_FRAME_CACHE: Duration = Duration::from_millis(150);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Dimension {
-    name: String,
-    min_y: i32,
-    height: i32,
-}
-
-impl Dimension {
-    fn legacy(id: i32) -> Dimension {
-        Dimension {
-            name: match id {
-                -1 => "minecraft:the_nether",
-                1 => "minecraft:the_end",
-                _ => "minecraft:overworld",
-            }
-            .to_string(),
-            min_y: 0,
-            height: 256,
-        }
-    }
-
-    pub(crate) fn from_registry(name: String, data: Option<&Nbt>) -> Dimension {
-        let fallback = Dimension::for_world(&name);
-        let min_y = data
-            .and_then(|tag| tag.get_i32("min_y"))
-            .unwrap_or(fallback.min_y);
-        let height = data
-            .and_then(|tag| tag.get_i32("height"))
-            .unwrap_or(fallback.height);
-        Dimension {
-            name,
-            min_y: min_y.clamp(-4096, 4096).div_euclid(16) * 16,
-            height: height.clamp(16, 4096).div_euclid(16) * 16,
-        }
-    }
-
-    fn for_world(name: &str) -> Dimension {
-        // Vanilla-Fallback, falls ein ungewöhnlicher Proxy die Registry nicht weiterreicht.
-        let overworld = name.ends_with("overworld") || name == "minecraft:dimension_type";
-        Dimension {
-            name: name.to_string(),
-            min_y: if overworld { -64 } else { 0 },
-            height: if overworld { 384 } else { 256 },
-        }
-    }
-
-    fn section_count(&self) -> usize {
-        (self.height / 16).clamp(1, MAX_SECTIONS as i32) as usize
-    }
-}
-
-// ===================== Abschnitte =====================
-
-/// Ein Index je Block. Fast jeder Abschnitt kommt mit höchstens 256 verschiedenen Zuständen aus –
-/// dann kostet er 4 KB statt 8 KB.
-#[derive(Clone)]
-enum Indices {
-    Small(Box<[u8]>),
-    Large(Box<[u16]>),
-}
-
-impl Indices {
-    /// Aus den rohen Paletten-Steckplätzen einen Abschnitt bauen und dabei gleich umnummerieren.
-    ///
-    /// Bewusst in einem Durchgang: vorher entstand erst ein voller Zwischenvektor mit 4096
-    /// `u16`-Einträgen und daraus dann der endgültige. Das waren je Chunk-Abschnitt 8 KB, die
-    /// unmittelbar wieder weggeworfen wurden – beim Beitritt mit gut 170 Chunks also mehrere
-    /// Dutzend Megabyte reine Verwaltungsarbeit.
-    fn remapped(slots: &[u16], remap: &[u16], palette_len: usize) -> Indices {
-        if palette_len <= u8::MAX as usize + 1 {
-            Indices::Small(slots.iter().map(|s| remap[*s as usize] as u8).collect())
-        } else {
-            Indices::Large(slots.iter().map(|s| remap[*s as usize]).collect())
-        }
-    }
-
-    fn get(&self, index: usize) -> u16 {
-        match self {
-            Indices::Small(data) => data[index] as u16,
-            Indices::Large(data) => data[index],
-        }
-    }
-
-    fn set(&mut self, index: usize, value: u16) {
-        match self {
-            Indices::Small(data) => data[index] = value as u8,
-            Indices::Large(data) => data[index] = value,
-        }
-    }
-
-    /// Auf die breite Darstellung umstellen, sobald die Palette über 256 Einträge wächst.
-    fn widen(&mut self) {
-        if let Indices::Small(data) = self {
-            *self = Indices::Large(data.iter().map(|v| *v as u16).collect());
-        }
-    }
-}
-
-/// Ein Chunk-Abschnitt: Palette plus ein Index je Block. Eintrag 0 ist immer Luft, damit die
-/// Sichtprüfung ein einziger Vergleich ist.
-#[derive(Clone)]
-struct Section {
-    palette: Vec<u32>,
-    indices: Indices,
-    /// Biom je 4x4x4-Zelle – daraus kommt die Einfärbung von Gras, Laub und Wasser.
-    biomes: Biomes,
-}
-
-impl Section {
-    fn state(&self, index: usize) -> u32 {
-        let slot = self.indices.get(index) as usize;
-        self.palette.get(slot).copied().unwrap_or(0)
-    }
-
-    fn is_air(&self, index: usize) -> bool {
-        self.indices.get(index) == 0
-    }
-
-    fn set(&mut self, index: usize, state: u32) {
-        if state == 0 {
-            return self.indices.set(index, 0);
-        }
-        let slot = match self.palette.iter().position(|value| *value == state) {
-            Some(slot) => slot,
-            None => {
-                if self.palette.len() >= u16::MAX as usize {
-                    return; // absurd bunter Abschnitt: der letzte Zustand bleibt eben stehen
-                }
-                self.palette.push(state);
-                if self.palette.len() > u8::MAX as usize + 1 {
-                    self.indices.widen();
-                }
-                self.palette.len() - 1
-            }
-        };
-        self.indices.set(index, slot as u16);
-    }
-
-    fn empty() -> Section {
-        Section {
-            palette: vec![0],
-            indices: Indices::Small(vec![0u8; SECTION_BLOCKS].into_boxed_slice()),
-            // Ein Abschnitt, der erst durch eine Blockänderung entsteht, war vorher reine Luft –
-            // und für die hat der Server nie eine Biompalette mitgeschickt. Er bleibt deshalb
-            // ohne Biom, statt eines zu erfinden.
-            biomes: Biomes::Single(0),
-        }
-    }
-}
-
-// ===================== Chunks =====================
-
-/// Welche Spielart des Abschnittsformats der Server spricht. Wird einmal ermittelt und dann
-/// behalten – siehe [`Format::probe`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Format {
-    /// Palettendaten ohne Längenangabe (ab 1.21.11).
-    modern_palette: bool,
-    /// Zusätzlicher Flüssigkeitszähler je Abschnitt (ab 26.1).
-    fluid_count: bool,
-}
-
-impl Format {
-    fn code(self) -> u32 {
-        (self.modern_palette as u32) | ((self.fluid_count as u32) << 1)
-    }
-
-    fn from_code(code: u32) -> Format {
-        Format {
-            modern_palette: code & 1 != 0,
-            fluid_count: code & 2 != 0,
-        }
-    }
-
-    /// Alle vier Spielarten, die bevorzugte zuerst. Danach die, die sich in genau einem Merkmal
-    /// unterscheiden – ein Protokollupdate dreht erfahrungsgemäß nur eines von beiden.
-    fn candidates(preferred: Format) -> [Format; 4] {
-        [
-            preferred,
-            Format {
-                modern_palette: !preferred.modern_palette,
-                ..preferred
-            },
-            Format {
-                fluid_count: !preferred.fluid_count,
-                ..preferred
-            },
-            Format {
-                modern_palette: !preferred.modern_palette,
-                fluid_count: !preferred.fluid_count,
-            },
-        ]
-    }
-
-    /// Chunk lesen und dabei die passende Spielart bestimmen. Bevorzugt wird die, die den Puffer
-    /// restlos aufgeht **und** die erwartete Zahl Abschnitte liefert.
-    fn probe(preferred: Format, dimension: &Dimension, data: &[u8]) -> io::Result<(Chunk, Format)> {
-        let mut first_error = None;
-        let mut fallback: Option<(Chunk, Format)> = None;
-        for format in Format::candidates(preferred) {
-            match Chunk::decode(format, dimension, data) {
-                Ok(chunk) => {
-                    if chunk.sections.len() == dimension.section_count() {
-                        return Ok((chunk, format));
-                    }
-                    fallback.get_or_insert((chunk, format));
-                }
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        fallback.ok_or_else(|| {
-            first_error.unwrap_or_else(|| crate::protocol::buf::err("POV: Chunk nicht lesbar"))
-        })
-    }
-}
-
-/// Ein Chunk ist billig zu klonen: die Abschnitte hängen einzeln an einem `Arc`, eine
-/// Blockänderung kopiert deshalb nur den einen betroffenen Abschnitt.
-#[derive(Clone)]
-struct Chunk {
-    min_section: i32,
-    /// `None` = reine Luft; solche Abschnitte belegen keinen Speicher.
-    sections: Vec<Option<Arc<Section>>>,
-    /// Himmels- und Blocklicht, sofern der Server sie mitgeschickt hat. `None` heißt: keine
-    /// Angabe – dann bleibt es bei der geschätzten Flächenhelligkeit von früher.
-    ///
-    /// Hinter einem eigenen `Arc`, damit eine Blockänderung (die das Licht nicht anfasst) beim
-    /// Kopieren des Chunks nur einen Zähler erhöht statt das ganze Lichtfeld mitzunehmen.
-    light: Option<Arc<Light>>,
-}
-
-impl Chunk {
-    /// Abschnitte lesen, bis der Puffer leer ist. Bewusst nicht „genau `section_count` Stück":
-    /// meldet ein Server eine andere Welthöhe, als seine Registry sagt, folgt die Ansicht dem,
-    /// was wirklich im Paket steht, statt jeden Chunk zu verwerfen.
-    fn decode(format: Format, dimension: &Dimension, data: &[u8]) -> io::Result<Chunk> {
-        let mut r = Reader::new(data);
-        let mut sections = Vec::with_capacity(dimension.section_count());
-        while r.remaining() > 0 {
-            if sections.len() >= MAX_SECTIONS {
-                return Err(crate::protocol::buf::err("POV: zu viele Chunk-Abschnitte"));
-            }
-            sections.push(read_section(&mut r, format)?);
-        }
-        if sections.is_empty() {
-            return Err(crate::protocol::buf::err("POV: Chunk ohne Abschnitte"));
-        }
-        Ok(Chunk {
-            min_section: dimension.min_y.div_euclid(16),
-            sections,
-            light: None,
-        })
-    }
-
-    fn section_index(&self, y: i32) -> Option<usize> {
-        usize::try_from(y.div_euclid(16) - self.min_section)
-            .ok()
-            .filter(|index| *index < self.sections.len())
-    }
-
-    /// Der Abschnitt zu dieser Höhe – `None` heißt „außerhalb der Welt oder reine Luft".
-    fn section(&self, y: i32) -> Option<&Section> {
-        self.sections[self.section_index(y)?].as_deref()
-    }
-
-    /// Direkter Blockzugriff ohne jeden Merker. Im laufenden Betrieb geht alles über [`Cursor`];
-    /// diese beiden Wege bleiben als **Vergleichsmaßstab** für die Tests stehen – nur so lässt
-    /// sich zeigen, dass der Merker wirklich nichts am Ergebnis ändert.
-    #[cfg(test)]
-    fn block(&self, x: i32, y: i32, z: i32) -> u32 {
-        match self.section(y) {
-            Some(section) => section.state(local_index(x, y, z)),
-            None => 0,
-        }
-    }
-
-    /// `true`, wenn an der Stelle etwas Sichtbares steht. Billiger als [`Chunk::block`], weil die
-    /// Palette dafür gar nicht angefasst werden muss.
-    #[cfg(test)]
-    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
-        self.section(y)
-            .is_some_and(|section| !section.is_air(local_index(x, y, z)))
-    }
-
-    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
-        let Some(index) = self.section_index(y) else {
-            return;
-        };
-        if self.sections[index].is_none() {
-            if state == 0 {
-                return;
-            }
-            self.sections[index] = Some(Arc::new(Section::empty()));
-        }
-        // `make_mut` kopiert höchstens diesen einen Abschnitt – nicht den ganzen Chunk.
-        let section = Arc::make_mut(self.sections[index].as_mut().unwrap());
-        section.set(local_index(x, y, z), state);
-    }
-}
-
-/// Reihenfolge des Protokolls: `(y << 8) | (z << 4) | x`.
-fn local_index(x: i32, y: i32, z: i32) -> usize {
-    ((y.rem_euclid(16) as usize) << 8)
-        | ((z.rem_euclid(16) as usize) << 4)
-        | x.rem_euclid(16) as usize
-}
-
-/// Einen Abschnitt lesen. `None` = reine Luft.
-fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section>>> {
-    let block_count = r.i16()?;
-    if !(0..=SECTION_BLOCKS as i16).contains(&block_count) {
-        return Err(crate::protocol::buf::err("POV: Blockzaehler unplausibel"));
-    }
-    if format.fluid_count {
-        let fluid = r.i16()?;
-        if !(0..=SECTION_BLOCKS as i16).contains(&fluid) {
-            return Err(crate::protocol::buf::err("POV: Fluidzaehler unplausibel"));
-        }
-    }
-
-    // Ein Abschnitt ohne einen einzigen Nicht-Luft-Block wird ohnehin verworfen – dann braucht
-    // seine Palette gar nicht erst ausgepackt zu werden, sie muss nur exakt übersprungen werden.
-    // In einer gewachsenen Überwelt sind das zwei Drittel aller Abschnitte, und jeder von ihnen
-    // hat bisher 4096 Indizes ausgepackt und sofort wieder weggeworfen.
-    if block_count == 0 {
-        skip_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
-        skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
-        return Ok(None);
-    }
-
-    let palette = read_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
-    // Biome stehen im selben Abschnitt, nur gröber aufgelöst: eine Nummer je 4x4x4 Zelle.
-    // Aus ihr kommt die Einfärbung von Gras, Laub und Wasser (siehe [`crate::web::assets`]).
-    let biomes = read_biomes(r, format.modern_palette)?;
-
-    Ok(compact(palette, block_count as usize).map(|mut section| {
-        section.biomes = biomes;
-        Arc::new(section)
-    }))
-}
 
 /// Was ein Biom zur Einfärbung beisteuert – genau die Felder, die der Server in seiner Registry
 /// mitschickt.
@@ -487,288 +129,6 @@ impl BiomeParams {
     }
 }
 
-/// Die Biom-Nummern eines Abschnitts: 4x4x4 Zellen, Reihenfolge wie bei den Blöcken `y, z, x`.
-#[derive(Clone)]
-enum Biomes {
-    /// Der ganze Abschnitt liegt in einem Biom. Das ist weit weg von jeder Biomgrenze der
-    /// Normalfall – und dann kostet er zwei Byte statt 128.
-    Single(u16),
-    Cells(Box<[u16; SECTION_BIOMES]>),
-}
-
-impl Biomes {
-    #[inline]
-    fn get(&self, x: i32, y: i32, z: i32) -> u16 {
-        match self {
-            Biomes::Single(id) => *id,
-            Biomes::Cells(cells) => cells[biome_index(x, y, z)],
-        }
-    }
-}
-
-/// Zellenindex innerhalb eines Abschnitts: je vier Blöcke eine Zelle, Reihenfolge `y, z, x`.
-#[inline]
-fn biome_index(x: i32, y: i32, z: i32) -> usize {
-    ((y.rem_euclid(16) as usize / 4) << 4)
-        | ((z.rem_euclid(16) as usize / 4) << 2)
-        | (x.rem_euclid(16) as usize / 4)
-}
-
-fn read_biomes(r: &mut Reader, modern: bool) -> io::Result<Biomes> {
-    let raw = read_palette(r, SECTION_BIOMES, 3, modern)?;
-    // Eine einwertige Palette ist der Normalfall; sie hier zusammenzufassen spart den Kasten.
-    if raw.values.len() == 1 {
-        return Ok(Biomes::Single(clamp_biome(raw.values[0])));
-    }
-    let mut cells = [0u16; SECTION_BIOMES];
-    for (cell, slot) in cells.iter_mut().zip(raw.indices) {
-        *cell = clamp_biome(raw.values.get(slot as usize).copied().unwrap_or(0));
-    }
-    Ok(Biomes::Cells(Box::new(cells)))
-}
-
-/// Biom-Nummern sind Registry-Indizes; mehr als 65 535 Biome hat keine Registry. Ein größerer
-/// Wert wäre ohnehin in keiner Tabelle zu finden und wird deshalb zu „unbekannt" (0).
-#[inline]
-fn clamp_biome(value: u32) -> u16 {
-    u16::try_from(value).unwrap_or(0)
-}
-
-// ===================== Licht =====================
-
-/// 4096 Blöcke zu je einem Nibble – zwei Blöcke teilen sich ein Byte.
-const LIGHT_BYTES: usize = SECTION_BLOCKS / 2;
-/// So viele Longs fasst ein Bitfeld über alle Lichtabschnitte (zwei mehr als Weltabschnitte).
-const MASK_LONGS: usize = (MAX_SECTIONS + 2).div_ceil(64);
-
-/// Das Licht **eines** Chunk-Abschnitts.
-#[derive(Clone)]
-enum LightSection {
-    /// Überall derselbe Wert. Das ist nicht der Sonderfall, sondern der Normalfall: Über Tage
-    /// steht der Himmel durchgehend auf 15, tief unten ist alles 0. Ein eingelesenes Feld wird
-    /// deshalb zusammengefasst, sobald alle 4096 Nibbles gleich sind – das spart je Abschnitt
-    /// 2 KiB und beim Nachschlagen den Speicherzugriff gleich mit.
-    Uniform(u8),
-    Nibbles(Arc<[u8; LIGHT_BYTES]>),
-}
-
-impl LightSection {
-    #[inline]
-    fn get(&self, index: usize) -> u8 {
-        match self {
-            LightSection::Uniform(value) => *value,
-            // Zwei Blöcke je Byte: der gerade im unteren, der ungerade im oberen Nibble.
-            LightSection::Nibbles(data) => (data[index >> 1] >> ((index & 1) * 4)) & 0xF,
-        }
-    }
-}
-
-/// Himmels- und Blocklicht eines Chunks, wie der Server sie im selben Paket wie die Blöcke
-/// mitschickt.
-///
-/// Die Lichtabschnitte reichen je einen Abschnitt **unter** und **über** die Welt hinaus – daher
-/// zwei mehr als Weltabschnitte.
-#[derive(Clone)]
-struct Light {
-    /// Unterster Lichtabschnitt in Abschnittskoordinaten (ein Abschnitt unter der Welt).
-    min_section: i32,
-    sky: Box<[LightSection]>,
-    block: Box<[LightSection]>,
-}
-
-impl Light {
-    /// Himmels- und Blocklicht an dieser Stelle, jeweils 0..15.
-    #[inline]
-    fn get(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
-        let section = y.div_euclid(16) - self.min_section;
-        if section < 0 {
-            return (0, 0); // unter der Welt: kein Licht
-        }
-        let index = section as usize;
-        if index >= self.sky.len() {
-            // Über der Welt steht nichts mehr im Weg – dort ist voller Himmel.
-            return (15, 0);
-        }
-        let local = local_index(x, y, z);
-        (self.sky[index].get(local), self.block[index].get(local))
-    }
-}
-
-/// Bitfeld über die Lichtabschnitte. Fest dimensioniert: 258 Bits passen in fünf Longs, und
-/// damit kostet das Einlesen eines Chunks hier keine einzige Allokation.
-#[derive(Default, Clone, Copy)]
-struct SectionMask([u64; MASK_LONGS]);
-
-impl SectionMask {
-    #[inline]
-    fn has(&self, index: usize) -> bool {
-        self.0
-            .get(index >> 6)
-            .is_some_and(|word| (word >> (index & 63)) & 1 == 1)
-    }
-}
-
-fn read_mask(r: &mut Reader) -> io::Result<SectionMask> {
-    let longs = r.var_int()?;
-    if !(0..=MASK_LONGS as i32).contains(&longs) {
-        return Err(crate::protocol::buf::err("POV: Lichtmaske unplausibel"));
-    }
-    let mut mask = SectionMask::default();
-    for slot in mask.0.iter_mut().take(longs as usize) {
-        *slot = r.i64()? as u64;
-    }
-    Ok(mask)
-}
-
-/// Ein Lichtfeld übernehmen – zusammengefasst, wenn alle 4096 Nibbles gleich sind.
-///
-/// Das Zusammenfassen ist hier keine Kosmetik, sondern der Grund, warum Licht überhaupt bezahlbar
-/// ist. Nachgemessen mit `speicherbedarf_der_live_ansicht` (169 Chunks, 845 Abschnitte):
-///
-/// ```text
-///   ohne Licht                       7984 kB
-///   mit Licht, zusammengefasst       8256 kB   (+272 kB)
-///   mit Licht, jedes Feld einzeln   15208 kB   (+7224 kB)
-/// ```
-///
-/// Der Grund ist die Beschaffenheit der Daten und nicht ein Trick: Über Tage steht der Himmel
-/// durchgehend auf 15, unter dem Boden durchgehend auf 0. Nur die paar Abschnitte an der
-/// Geländekante sind wirklich uneinheitlich – und genau die behalten ihr volles Feld.
-fn compact_light(data: &[u8]) -> LightSection {
-    let first = data[0];
-    // „Alle gleich" heißt: jedes Byte gleich *und* die beiden Nibbles darin gleich.
-    if first >> 4 == first & 0xF && data.iter().all(|byte| *byte == first) {
-        return LightSection::Uniform(first & 0xF);
-    }
-    let mut array = [0u8; LIGHT_BYTES];
-    array.copy_from_slice(data);
-    LightSection::Nibbles(Arc::new(array))
-}
-
-/// Die Felder einer Lichtrichtung einlesen und den Abschnitten zuordnen.
-///
-/// Sie kommen in der Reihenfolge der gesetzten Bits der Maske. Ein Abschnitt ohne Feld ist
-/// entweder ausdrücklich als dunkel gemeldet (`empty`) oder gar nicht erwähnt – für die Ansicht
-/// ist beides dasselbe, und geraten wird in keinem der beiden Fälle.
-fn read_light_arrays(
-    r: &mut Reader,
-    count: usize,
-    present: &SectionMask,
-    empty: &SectionMask,
-    previous: Option<&[LightSection]>,
-) -> io::Result<Box<[LightSection]>> {
-    let sent = r.var_int()?;
-    if !(0..=count as i32).contains(&sent) {
-        return Err(crate::protocol::buf::err("POV: Lichtfelder unplausibel"));
-    }
-    let mut arrays = Vec::with_capacity(sent as usize);
-    for _ in 0..sent {
-        let data = r.byte_slice()?;
-        if data.len() != LIGHT_BYTES {
-            return Err(crate::protocol::buf::err(
-                "POV: Lichtfeld hat die falsche Groesse",
-            ));
-        }
-        arrays.push(compact_light(data));
-    }
-
-    let mut out = Vec::with_capacity(count);
-    let mut next = 0usize;
-    for index in 0..count {
-        if present.has(index) && empty.has(index) {
-            return Err(crate::protocol::buf::err(
-                "POV: Lichtabschnitt zugleich vorhanden und leer",
-            ));
-        }
-        out.push(if present.has(index) {
-            let section = arrays
-                .get(next)
-                .cloned()
-                .unwrap_or(LightSection::Uniform(0));
-            next += 1;
-            section
-        } else if empty.has(index) {
-            LightSection::Uniform(0)
-        } else {
-            // Im Chunk-Paket gibt es noch keinen alten Stand; dort bedeutet ein nicht genanntes
-            // Feld dunkel. Ein LightUpdate ist dagegen ein *Patch*: Nicht genannte Abschnitte
-            // bleiben unveraendert. Die alte Fassung ersetzte sie alle durch Null und machte so
-            // nach dem ersten kleinen Lichtupdate fast die ganze Live-POV schwarz.
-            previous
-                .and_then(|sections| sections.get(index))
-                .cloned()
-                .unwrap_or(LightSection::Uniform(0))
-        });
-    }
-    if next != arrays.len() {
-        return Err(crate::protocol::buf::err(
-            "POV: Lichtmaske und Felder passen nicht",
-        ));
-    }
-    Ok(out.into_boxed_slice())
-}
-
-/// Die Lichtdaten am Ende eines Chunk-Pakets und im `LightUpdate`-Paket.
-///
-/// Aufbau: vier Bitfelder (welche Abschnitte ein Feld mitbringen und welche bekanntermaßen ganz
-/// dunkel sind), danach die Felder selbst.
-fn read_light(
-    r: &mut Reader,
-    min_section: i32,
-    sections: usize,
-    previous: Option<&Light>,
-) -> io::Result<Light> {
-    let count = sections + 2;
-    let sky_mask = read_mask(r)?;
-    let block_mask = read_mask(r)?;
-    let empty_sky = read_mask(r)?;
-    let empty_block = read_mask(r)?;
-    let previous = previous.filter(|light| {
-        light.min_section == min_section - 1
-            && light.sky.len() == count
-            && light.block.len() == count
-    });
-    let sky = read_light_arrays(
-        r,
-        count,
-        &sky_mask,
-        &empty_sky,
-        previous.map(|light| light.sky.as_ref()),
-    )?;
-    let block = read_light_arrays(
-        r,
-        count,
-        &block_mask,
-        &empty_block,
-        previous.map(|light| light.block.as_ref()),
-    )?;
-    Ok(Light {
-        min_section: min_section - 1,
-        sky,
-        block,
-    })
-}
-
-/// Die Blockentitäten zwischen Chunkdaten und Licht überspringen.
-///
-/// Gelesen wird davon nichts – die Ansicht zeichnet keine Truhenmodelle und keine Schilder. Der
-/// Lesezeiger muss aber exakt hinter ihnen stehen, sonst beginnt das Licht an der falschen Stelle.
-fn skip_block_entities(r: &mut Reader) -> io::Result<()> {
-    let count = r.var_int()?;
-    if !(0..=(SECTION_BLOCKS * MAX_SECTIONS) as i32).contains(&count) {
-        return Err(crate::protocol::buf::err(
-            "POV: Blockentitaeten unplausibel",
-        ));
-    }
-    for _ in 0..count {
-        r.u8()?; // x und z, je vier Bit
-        r.i16()?; // y
-        r.var_int()?; // Typ
-        crate::protocol::nbt::read_network(r)?;
-    }
-    Ok(())
-}
-
 // ===================== Welt =====================
 
 #[derive(Clone, Copy)]
@@ -779,64 +139,17 @@ struct Entity {
     player: bool,
 }
 
-struct World {
-    dimension: Dimension,
-    chunks: HashMap<(i32, i32), Arc<Chunk>>,
-    entities: HashMap<i32, Entity>,
-    own_entity: i32,
-    /// Zuletzt bekannter eigener Chunk – daran hängt das Verwerfen weit entfernter Chunks.
-    center: (i32, i32),
-    /// Zählt jede Änderung an [`World::chunks`]. Der Zeichner vergleicht sie mit seinem Stand und
-    /// kopiert die Chunk-Tabelle nur, wenn sich wirklich etwas geändert hat – siehe
-    /// [`Pov::fill_scene`].
-    revision: u64,
+/// Die sichtbaren Entitäten. Die Welt selbst (Chunks, Blöcke) liegt in [`crate::world`].
+struct Entities {
+    map: HashMap<i32, Entity>,
+    own: i32,
 }
 
-impl Default for World {
+impl Default for Entities {
     fn default() -> Self {
-        World {
-            dimension: Dimension::for_world("minecraft:overworld"),
-            chunks: HashMap::new(),
-            entities: HashMap::new(),
-            own_entity: -1,
-            center: (0, 0),
-            // Nicht 0: der Zeichner beginnt bei 0 und muss beim ersten Bild kopieren.
-            revision: 1,
-        }
-    }
-}
-
-impl World {
-    /// Nach jeder Änderung an den Chunks aufrufen.
-    fn touch(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
-    }
-
-    fn clear_visible(&mut self) {
-        self.chunks.clear();
-        self.chunks.shrink_to_fit();
-        self.entities.clear();
-        self.entities.shrink_to_fit();
-        self.touch();
-    }
-
-    fn set_block(&mut self, x: i32, y: i32, z: i32, state: u32) {
-        let key = (x.div_euclid(16), z.div_euclid(16));
-        if let Some(chunk) = self.chunks.get_mut(&key) {
-            Arc::make_mut(chunk).set_block(x, y, z, state);
-            self.touch();
-        }
-    }
-
-    /// Alles wegwerfen, was die Ansicht ohnehin nie erreicht.
-    fn prune(&mut self) {
-        let (cx, cz) = self.center;
-        let before = self.chunks.len();
-        self.chunks.retain(|(x, z), _| {
-            (x - cx).abs() <= KEEP_CHUNK_RADIUS && (z - cz).abs() <= KEEP_CHUNK_RADIUS
-        });
-        if self.chunks.len() != before {
-            self.touch();
+        Entities {
+            map: HashMap::new(),
+            own: -1,
         }
     }
 }
@@ -967,8 +280,7 @@ impl<'a> Cursor<'a> {
 }
 
 pub struct Pov {
-    world: Mutex<World>,
-    dimensions: Mutex<Vec<Dimension>>,
+    entities: Mutex<Entities>,
     /// Die Biome des Servers in Registry-Reihenfolge – die Chunk-Paletten nennen genau diese
     /// Nummern. Daraus und aus den Farbkarten der Original-JAR entsteht [`Pov::biome_tints`].
     biomes: Mutex<Vec<BiomeParams>>,
@@ -982,8 +294,6 @@ pub struct Pov {
     /// Bilder je Sekunde.
     fps: AtomicUsize,
     parse_errors: AtomicU32,
-    /// Zuletzt erkannte Spielart des Abschnittsformats (siehe [`Format`]).
-    format: AtomicU32,
     /// Prüfsumme des zuletzt geschriebenen Bildes – unveränderte Bilder werden ausgelassen.
     last_frame: AtomicU64,
     /// Wann das letzte Bild geschrieben wurde (ms seit `started`).
@@ -1031,8 +341,7 @@ impl Pov {
     pub fn new(options: &Options) -> Pov {
         let (width, height) = options.pov_size.unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT));
         Pov {
-            world: Mutex::new(World::default()),
-            dimensions: Mutex::new(Vec::new()),
+            entities: Mutex::new(Entities::default()),
             biomes: Mutex::new(Vec::new()),
             biome_tints: Mutex::new(Arc::from(Vec::new())),
             live: AtomicBool::new(false),
@@ -1041,7 +350,6 @@ impl Pov {
             height: AtomicUsize::new(height.clamp(MIN_HEIGHT, MAX_HEIGHT)),
             fps: AtomicUsize::new(options.pov_fps.unwrap_or(DEFAULT_FPS).clamp(1, 20)),
             parse_errors: AtomicU32::new(0),
-            format: AtomicU32::new(u32::MAX),
             last_frame: AtomicU64::new(0),
             last_frame_ms: AtomicU64::new(0),
             started: Instant::now(),
@@ -1058,10 +366,6 @@ impl Pov {
     /// Was gerade mit den Ressourcen ist – oder `None`, wenn sie einsatzbereit sind.
     pub(crate) fn asset_note(&self) -> Option<String> {
         self.assets.note()
-    }
-
-    pub(crate) fn set_dimensions(&self, dimensions: Vec<Dimension>) {
-        *self.dimensions.lock().unwrap() = dimensions;
     }
 
     /// Die Biom-Registry des Servers übernehmen und die Farbtöne daraus neu ausrechnen.
@@ -1087,19 +391,8 @@ impl Pov {
     }
 
     pub fn clear(&self) {
-        self.world.lock().unwrap().clear_visible();
+        self.entities.lock().unwrap().map = HashMap::new();
         self.last_frame.store(0, Ordering::Relaxed);
-    }
-
-    /// Bevorzugte Formatspielart: die zuletzt erfolgreiche, sonst die der Protokollversion.
-    fn preferred_format(&self, shared: &Shared) -> Format {
-        match self.format.load(Ordering::Relaxed) {
-            u32::MAX => Format {
-                modern_palette: shared.proto.modern,
-                fluid_count: shared.proto.section_fluid_count,
-            },
-            code => Format::from_code(code),
-        }
     }
 
     /// Den aktuellen Weltstand in eine bereits vorhandene Szene übertragen.
@@ -1108,104 +401,52 @@ impl Pov {
     /// Vektor behalten so ihren Speicher über alle Bilder hinweg. Gezeichnet wird anschließend
     /// **ohne** die Weltsperre – der Netz-Thread darf während der paar Millisekunden weiter
     /// Chunks einlesen.
-    fn fill_scene(&self, scene: &mut Scene) {
-        let world = self.world.lock().unwrap();
+    fn fill_scene(&self, shared: &Shared, scene: &mut Scene) {
+        let world = shared.world.lock().unwrap();
         // Die Chunk-Tabelle nur kopieren, wenn sich seit dem letzten Bild wirklich etwas geändert
         // hat. Ein stillstehender Bot bekommt minutenlang keinen neuen Chunk; die Tabelle mit
         // ihren gut 170 Einträgen trotzdem achtmal je Sekunde neu aufzubauen (mit einem
         // Arc-Zähler je Eintrag) war der teuerste Posten des Zeichners im Leerlauf.
-        if scene.chunk_revision != world.revision {
+        let changed = scene.chunk_revision != world.revision;
+        if changed {
             scene.chunks.clone_from(&world.chunks);
             scene.chunk_revision = world.revision;
         }
-        scene.entities.clear();
-        scene.entities.extend(world.entities.values().copied());
         drop(world);
+        scene.entities.clear();
+        scene
+            .entities
+            .extend(self.entities.lock().unwrap().map.values().copied());
+        if changed {
+            // Nur die Blockzustände laden, die in den Paletten der sichtbaren Chunks stehen.
+            if let Some(assets) = self.assets() {
+                assets.ensure_states(scene.chunks.values().flat_map(|chunk| {
+                    chunk
+                        .sections
+                        .iter()
+                        .flatten()
+                        .flat_map(|section| section.palette.iter().copied())
+                }));
+            }
+        }
         // Nur ein Zählerinkrement je Bild: Die Tabelle selbst entsteht beim Eintreffen der
         // Registry, nicht hier.
         scene.biome_tints = Arc::clone(&self.biome_tints.lock().unwrap());
-    }
-
-    fn select_dimension(&self, id: i32, world_name: Option<&str>) {
-        let dimensions = self.dimensions.lock().unwrap();
-        let dimension = usize::try_from(id)
-            .ok()
-            .and_then(|index| dimensions.get(index).cloned())
-            .unwrap_or_else(|| Dimension::for_world(world_name.unwrap_or("minecraft:overworld")));
-        drop(dimensions);
-        let mut world = self.world.lock().unwrap();
-        world.dimension = dimension;
-        world.clear_visible();
     }
 }
 
 // ===================== Lebenszyklus und Registry-Auswahl =====================
 
-/// Login-Paket ab direkt hinter der eigenen Entity-ID. Der erste Wert im eingebetteten
-/// `PlayerSpawnInfo` ist die Dimension-Type-ID.
-pub fn login(shared: &Arc<Shared>, own_entity: i32, r: &mut Reader) {
-    if shared.proto.legacy {
-        let dimension = r.u8().and_then(|_| r.i8()).map(|value| value as i32);
-        let mut world = shared.extras.pov.world.lock().unwrap();
-        world.own_entity = own_entity;
-        if let Ok(dimension) = dimension {
-            world.dimension = Dimension::legacy(dimension);
-            world.clear_visible();
-        }
-        return;
-    }
-    let dimension = (|| -> io::Result<(i32, String)> {
-        r.bool()?;
-        let worlds = r.var_int()?;
-        if !(0..=1024).contains(&worlds) {
-            return Err(crate::protocol::buf::err("POV: Weltliste unplausibel"));
-        }
-        for _ in 0..worlds {
-            r.skip_string()?;
-        }
-        for _ in 0..3 {
-            r.var_int()?;
-        }
-        for _ in 0..3 {
-            r.bool()?;
-        }
-        let dimension = r.var_int()?;
-        let world = r.string()?;
-        Ok((dimension, world))
-    })();
-
-    let mut world = shared.extras.pov.world.lock().unwrap();
-    world.own_entity = own_entity;
-    drop(world);
-    if let Ok((dimension, world_name)) = dimension {
-        shared
-            .extras
-            .pov
-            .select_dimension(dimension, Some(&world_name));
-    }
+/// Beitritt: eigene Entität merken, fremde vergessen (die Welt wählt [`crate::world::login`]).
+pub fn login(shared: &Arc<Shared>, own_entity: i32) {
+    let mut entities = shared.extras.pov.entities.lock().unwrap();
+    entities.own = own_entity;
+    entities.map = HashMap::new();
 }
 
-/// Respawn beginnt direkt mit demselben `PlayerSpawnInfo`.
-pub fn respawn(shared: &Arc<Shared>, r: &mut Reader) {
-    if shared.proto.legacy {
-        match r.i32() {
-            Ok(dimension) => {
-                let mut world = shared.extras.pov.world.lock().unwrap();
-                world.dimension = Dimension::legacy(dimension);
-                world.clear_visible();
-            }
-            Err(_) => shared.extras.pov.clear(),
-        }
-        return;
-    }
-    if let (Ok(dimension), Ok(world_name)) = (r.var_int(), r.string()) {
-        shared
-            .extras
-            .pov
-            .select_dimension(dimension, Some(&world_name));
-    } else {
-        shared.extras.pov.clear();
-    }
+/// Weltwechsel: Die Entitäten der alten Welt gelten nicht mehr.
+pub fn respawn(shared: &Arc<Shared>) {
+    shared.extras.pov.entities.lock().unwrap().map = HashMap::new();
 }
 
 pub fn on_join(shared: &Arc<Shared>) {
@@ -1243,46 +484,15 @@ pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
 
 fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<()> {
     match kind {
-        In::LevelChunk => read_chunk(shared, r),
-        In::LevelChunkBulk => read_chunk_bulk(shared, r),
-        In::ForgetChunk => {
-            // ChunkPos ist ein Long: x in den unteren, z in den oberen 32 Bit. Zwei
-            // nacheinander gelesene i32 wären durch die Netzwerk-Bytefolge genau vertauscht.
-            let key = unpack_chunk_pos(r.i64()?);
-            let mut world = shared.extras.pov.world.lock().unwrap();
-            if world.chunks.remove(&key).is_some() {
-                world.touch();
-            }
-            Ok(())
-        }
-        In::BlockUpdate => {
-            let packed = r.i64()?;
-            let (x, y, z) = if shared.proto.legacy {
-                unpack_legacy_block_pos(packed)
-            } else {
-                unpack_block_pos(packed)
-            };
-            let state = r.var_int()? as u32;
-            shared
-                .extras
-                .pov
-                .world
-                .lock()
-                .unwrap()
-                .set_block(x, y, z, state);
-            Ok(())
-        }
-        In::LightUpdate => read_light_update(shared, r),
-        In::SectionBlocks => read_section_blocks(shared, r),
         In::AddEntity => read_add_entity(shared, r),
         In::RemoveEntities => {
             let count = r.var_int()?;
             if !(0..=MAX_ENTITIES as i32).contains(&count) {
                 return Err(crate::protocol::buf::err("POV: Entity-Liste unplausibel"));
             }
-            let mut world = shared.extras.pov.world.lock().unwrap();
+            let mut entities = shared.extras.pov.entities.lock().unwrap();
             for _ in 0..count {
-                world.entities.remove(&r.var_int()?);
+                entities.map.remove(&r.var_int()?);
             }
             Ok(())
         }
@@ -1291,314 +501,6 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
         In::EntityPositionSync => read_entity_sync(shared, r),
         _ => Ok(()),
     }
-}
-
-fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
-    let x = r.i32()?;
-    let z = r.i32()?;
-    if shared.proto.legacy {
-        let ground_up = r.bool()?;
-        let mask = r.u16()?;
-        let data = r.byte_slice()?;
-        if ground_up && mask == 0 {
-            let mut world = shared.extras.pov.world.lock().unwrap();
-            if world.chunks.remove(&(x, z)).is_some() {
-                world.touch();
-            }
-            return Ok(());
-        }
-        let chunk = decode_legacy_chunk(mask, data, ground_up, None)?;
-        return store_chunk(shared, x, z, chunk);
-    }
-    if shared.proto.modern {
-        let maps = r.var_int()?;
-        if !(0..=64).contains(&maps) {
-            return Err(crate::protocol::buf::err("POV: Hoehenkarten unplausibel"));
-        }
-        for _ in 0..maps {
-            r.var_int()?;
-            let longs = r.var_int()?;
-            if !(0..=4096).contains(&longs) {
-                return Err(crate::protocol::buf::err("POV: Hoehenkarte zu gross"));
-            }
-            r.skip(longs as usize * 8)?;
-        }
-    } else {
-        crate::protocol::nbt::read_network(r)?;
-    }
-    // Ohne Kopie: die Chunkdaten werden unmittelbar aus dem Paketpuffer gelesen. Beim Beitritt
-    // kommen gut 170 solche Pakete, und jede dieser Kopien lebte nur bis zum Ende dieser Funktion.
-    let data = r.byte_slice()?;
-
-    let pov = &shared.extras.pov;
-    let dimension = pov.world.lock().unwrap().dimension.clone();
-    let preferred = pov.preferred_format(shared);
-    let (mut chunk, format) = Format::probe(preferred, &dimension, data)?;
-
-    // Hinter den Blöcken stehen erst die Blockentitäten, dann das Licht. Beides ist eine Zugabe:
-    // Misslingt es, behält der Chunk seine Blöcke und die Ansicht rechnet wie früher mit
-    // geschätzter Flächenhelligkeit weiter. Ein Lesefehler darf hier weder den Chunk noch – über
-    // die Fehlerkette – die Verbindung kosten.
-    chunk.light = skip_block_entities(r)
-        .and_then(|()| read_light(r, chunk.min_section, chunk.sections.len(), None))
-        .ok()
-        .map(Arc::new);
-    if pov.format.swap(format.code(), Ordering::Relaxed) != format.code() {
-        // Nur beim Wechsel melden – sonst stünde es bei jedem Chunk in der Ausgabe.
-        if format != preferred {
-            shared.console.info(&format!(
-                "POV: Chunk-Format erkannt ({} Abschnitte, {}Fluidzaehler).",
-                chunk.sections.len(),
-                if format.fluid_count { "mit " } else { "ohne " }
-            ));
-        }
-    }
-
-    // Der eigene Chunk ist der Bezugspunkt fürs Verwerfen. Er wird hier gesetzt und nicht im
-    // Renderer: sonst würde bei gestoppter Ansicht um den Nullpunkt herum aufgeräumt.
-    let center = shared.position().map(|(x, _, z, _, _)| {
-        (
-            (x.floor() as i32).div_euclid(16),
-            (z.floor() as i32).div_euclid(16),
-        )
-    });
-
-    let mut world = pov.world.lock().unwrap();
-    if let Some(center) = center {
-        world.center = center;
-    }
-    if world.chunks.len() < MAX_CHUNKS || world.chunks.contains_key(&(x, z)) {
-        world.chunks.insert((x, z), Arc::new(chunk));
-        world.touch();
-    }
-    if center.is_some() {
-        world.prune();
-    }
-    Ok(())
-}
-
-/// 1.8.9-Sammelpaket: Metadaten aller Spalten stehen vorn, ihre rohen Daten lückenlos dahinter.
-fn read_chunk_bulk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
-    if !shared.proto.legacy {
-        return Ok(());
-    }
-    let sky_light = r.bool()?;
-    let count = r.var_int()?;
-    if !(0..=MAX_CHUNKS as i32).contains(&count) {
-        return Err(crate::protocol::buf::err(
-            "POV: Chunk-Sammelpaket unplausibel",
-        ));
-    }
-    let mut columns = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        columns.push((r.i32()?, r.i32()?, r.u16()?));
-    }
-    for (x, z, mask) in columns {
-        let sections = mask.count_ones() as usize;
-        let size = sections
-            * (SECTION_BLOCKS * 2 + LIGHT_BYTES + if sky_light { LIGHT_BYTES } else { 0 })
-            + 256;
-        let data = r.bytes(size)?;
-        let chunk = decode_legacy_chunk(mask, data, true, Some(sky_light))?;
-        store_chunk(shared, x, z, chunk)?;
-    }
-    Ok(())
-}
-
-/// Einen alten Chunk in dieselbe kompakte interne Darstellung wie moderne Paletten überführen.
-fn decode_legacy_chunk(
-    mask: u16,
-    data: &[u8],
-    ground_up: bool,
-    sky_hint: Option<bool>,
-) -> io::Result<Chunk> {
-    let included = mask.count_ones() as usize;
-    let block_bytes = included * SECTION_BLOCKS * 2;
-    let light_bytes = included * LIGHT_BYTES;
-    let biome_bytes = if ground_up { 256 } else { 0 };
-    let without_sky = block_bytes + light_bytes + biome_bytes;
-    let with_sky = without_sky + light_bytes;
-    let has_sky = sky_hint.unwrap_or(data.len() == with_sky);
-    let expected = if has_sky { with_sky } else { without_sky };
-    if data.len() != expected {
-        return Err(crate::protocol::buf::err(
-            "POV: alte Chunkdaten haben falsche Länge",
-        ));
-    }
-
-    let mut sections: Vec<Option<Arc<Section>>> = vec![None; 16];
-    let mut raw_offset = 0usize;
-    let mut included_indices = Vec::with_capacity(included);
-    for (section_index, section) in sections.iter_mut().enumerate() {
-        if mask & (1 << section_index) == 0 {
-            continue;
-        }
-        included_indices.push(section_index);
-        let raw = &data[raw_offset..raw_offset + SECTION_BLOCKS * 2];
-        raw_offset += SECTION_BLOCKS * 2;
-        *section = legacy_section(raw).map(Arc::new);
-    }
-
-    let block_start = block_bytes;
-    let sky_start = block_start + light_bytes;
-    let biome_start = sky_start + if has_sky { light_bytes } else { 0 };
-    if ground_up {
-        let biomes = &data[biome_start..biome_start + 256];
-        for section in sections.iter_mut().flatten() {
-            let section = Arc::make_mut(section);
-            let mut cells = [0u16; SECTION_BIOMES];
-            for cell_y in 0..4usize {
-                for cell_z in 0..4usize {
-                    for cell_x in 0..4usize {
-                        let column = (cell_z * 4 * 16) + cell_x * 4;
-                        cells[(cell_y << 4) | (cell_z << 2) | cell_x] = biomes[column] as u16;
-                    }
-                }
-            }
-            section.biomes = Biomes::Cells(Box::new(cells));
-        }
-    }
-
-    let mut block_light = vec![LightSection::Uniform(0); 16];
-    let mut sky_light = vec![LightSection::Uniform(if has_sky { 15 } else { 0 }); 16];
-    for (slot, section_index) in included_indices.into_iter().enumerate() {
-        let at = block_start + slot * LIGHT_BYTES;
-        block_light[section_index] = compact_light(&data[at..at + LIGHT_BYTES]);
-        if has_sky {
-            let at = sky_start + slot * LIGHT_BYTES;
-            sky_light[section_index] = compact_light(&data[at..at + LIGHT_BYTES]);
-        }
-    }
-    Ok(Chunk {
-        min_section: 0,
-        sections,
-        light: Some(Arc::new(Light {
-            min_section: 0,
-            sky: sky_light.into_boxed_slice(),
-            block: block_light.into_boxed_slice(),
-        })),
-    })
-}
-
-fn legacy_section(raw: &[u8]) -> Option<Section> {
-    let mut palette = vec![0u32];
-    let mut by_state = HashMap::new();
-    by_state.insert(0u32, 0u16);
-    let mut indices = Vec::with_capacity(SECTION_BLOCKS);
-    for bytes in raw.as_chunks::<2>().0 {
-        let state = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
-        let slot = match by_state.get(&state) {
-            Some(slot) => *slot,
-            None => {
-                let slot = palette.len() as u16;
-                palette.push(state);
-                by_state.insert(state, slot);
-                slot
-            }
-        };
-        indices.push(slot);
-    }
-    if palette.len() == 1 {
-        return None;
-    }
-    let remap: Vec<u16> = (0..palette.len() as u16).collect();
-    Some(Section {
-        indices: Indices::remapped(&indices, &remap, palette.len()),
-        palette,
-        biomes: Biomes::Single(0),
-    })
-}
-
-fn store_chunk(shared: &Arc<Shared>, x: i32, z: i32, chunk: Chunk) -> io::Result<()> {
-    let center = shared.position().map(|(x, _, z, _, _)| {
-        (
-            (x.floor() as i32).div_euclid(16),
-            (z.floor() as i32).div_euclid(16),
-        )
-    });
-    let mut world = shared.extras.pov.world.lock().unwrap();
-    if let Some(center) = center {
-        world.center = center;
-    }
-    if world.chunks.len() < MAX_CHUNKS || world.chunks.contains_key(&(x, z)) {
-        world.chunks.insert((x, z), Arc::new(chunk));
-        world.touch();
-    }
-    if center.is_some() {
-        world.prune();
-    }
-    Ok(())
-}
-
-/// Nachgereichtes Licht zu einem Chunk, den wir schon haben.
-///
-/// Der Server schickt das, sobald sich die Beleuchtung ändert – eine gesetzte Fackel, ein
-/// abgebauter Block, oder schlicht, weil die Lichtberechnung beim Beitritt noch nicht fertig war.
-/// Ohne dieses Paket bliebe die Ansicht auf dem Stand des Chunk-Pakets stehen.
-fn read_light_update(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
-    let x = r.var_int()?;
-    let z = r.var_int()?;
-    let mut world = shared.extras.pov.world.lock().unwrap();
-    // Nur für bereits bekannte Chunks: Die Abschnittszahl steht im Chunk, nicht im Lichtpaket.
-    let Some(chunk) = world.chunks.get(&(x, z)) else {
-        return Ok(());
-    };
-    let (min_section, sections, previous) = (
-        chunk.min_section,
-        chunk.sections.len(),
-        chunk.light.as_ref().map(Arc::clone),
-    );
-    let light = Arc::new(read_light(r, min_section, sections, previous.as_deref())?);
-    // `make_mut` kopiert den Chunk nur, solange ihn ein Bild gerade liest; die Abschnitte selbst
-    // hängen an eigenen `Arc`s und werden dabei nicht mitkopiert.
-    Arc::make_mut(world.chunks.get_mut(&(x, z)).unwrap()).light = Some(light);
-    world.touch();
-    Ok(())
-}
-
-fn read_section_blocks(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
-    if shared.proto.legacy {
-        let chunk_x = r.i32()?;
-        let chunk_z = r.i32()?;
-        let count = r.var_int()?;
-        if !(0..=SECTION_BLOCKS as i32).contains(&count) {
-            return Err(crate::protocol::buf::err(
-                "POV: alte Blockänderungen unplausibel",
-            ));
-        }
-        let mut world = shared.extras.pov.world.lock().unwrap();
-        for _ in 0..count {
-            let horizontal = r.u8()?;
-            let y = r.u8()? as i32;
-            let state = r.var_int()? as u32;
-            let x = chunk_x * 16 + (horizontal >> 4) as i32;
-            let z = chunk_z * 16 + (horizontal & 15) as i32;
-            world.set_block(x, y, z, state);
-        }
-        return Ok(());
-    }
-    let (section_x, section_y, section_z) = unpack_section_pos(r.i64()?);
-    let count = r.var_int()?;
-    if !(0..=SECTION_BLOCKS as i32).contains(&count) {
-        return Err(crate::protocol::buf::err(
-            "POV: Blockaenderungen unplausibel",
-        ));
-    }
-    let mut changes = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let value = r.var_long()? as u64;
-        let local = value & 0xFFF;
-        let state = (value >> 12) as u32;
-        let x = section_x * 16 + ((local >> 8) & 15) as i32;
-        let z = section_z * 16 + ((local >> 4) & 15) as i32;
-        let y = section_y * 16 + (local & 15) as i32;
-        changes.push((x, y, z, state));
-    }
-    let mut world = shared.extras.pov.world.lock().unwrap();
-    for (x, y, z, state) in changes {
-        world.set_block(x, y, z, state);
-    }
-    Ok(())
 }
 
 fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
@@ -1621,11 +523,9 @@ fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
             player: kind == shared.proto.ids.player_entity_type,
         }
     };
-    let mut world = shared.extras.pov.world.lock().unwrap();
-    if id != world.own_entity
-        && (world.entities.len() < MAX_ENTITIES || world.entities.contains_key(&id))
-    {
-        world.entities.insert(id, entity);
+    let mut entities = shared.extras.pov.entities.lock().unwrap();
+    if id != entities.own && (entities.map.len() < MAX_ENTITIES || entities.map.contains_key(&id)) {
+        entities.map.insert(id, entity);
     }
     Ok(())
 }
@@ -1645,15 +545,7 @@ fn read_move_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
             r.i16()? as f64 / 4096.0,
         )
     };
-    if let Some(entity) = shared
-        .extras
-        .pov
-        .world
-        .lock()
-        .unwrap()
-        .entities
-        .get_mut(&id)
-    {
+    if let Some(entity) = shared.extras.pov.entities.lock().unwrap().map.get_mut(&id) {
         entity.x += dx;
         entity.y += dy;
         entity.z += dz;
@@ -1682,15 +574,7 @@ fn read_teleport_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> 
     } else {
         0
     };
-    if let Some(entity) = shared
-        .extras
-        .pov
-        .world
-        .lock()
-        .unwrap()
-        .entities
-        .get_mut(&id)
-    {
+    if let Some(entity) = shared.extras.pov.entities.lock().unwrap().map.get_mut(&id) {
         entity.x = if relatives & 1 != 0 { entity.x + x } else { x };
         entity.y = if relatives & 2 != 0 { entity.y + y } else { y };
         entity.z = if relatives & 4 != 0 { entity.z + z } else { z };
@@ -1701,332 +585,12 @@ fn read_teleport_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> 
 fn read_entity_sync(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
     let (x, y, z) = (r.f64()?, r.f64()?, r.f64()?);
-    if let Some(entity) = shared
-        .extras
-        .pov
-        .world
-        .lock()
-        .unwrap()
-        .entities
-        .get_mut(&id)
-    {
+    if let Some(entity) = shared.extras.pov.entities.lock().unwrap().map.get_mut(&id) {
         entity.x = x;
         entity.y = y;
         entity.z = z;
     }
     Ok(())
-}
-
-// ===================== Palette und Koordinaten =====================
-
-/// Eine gelesene Palette samt Häufigkeiten. Die Häufigkeiten fallen beim Auspacken ohnehin an –
-/// sie noch einmal über eine Hashtabelle zu zählen, wäre je Abschnitt ein zweiter Durchlauf.
-struct RawPalette {
-    values: Vec<u32>,
-    indices: Vec<u16>,
-    counts: Vec<u32>,
-}
-
-/// Kopf einer Palette lesen: Bitbreite und (bei indirekten Paletten) die Einträge.
-/// Rückgabe: (Bitbreite, Einträge oder `None` für die globale Palette).
-fn palette_head(r: &mut Reader, max_indirect_bits: u8) -> io::Result<(u8, Option<Vec<u32>>)> {
-    let bits = r.u8()?;
-    if bits > 32 {
-        return Err(crate::protocol::buf::err("POV: Palette breiter als 32 Bit"));
-    }
-    if bits == 0 || bits <= max_indirect_bits {
-        let count = if bits == 0 { 1 } else { r.var_int()? };
-        if !(1..=4096).contains(&count) {
-            return Err(crate::protocol::buf::err("POV: lokale Palette unplausibel"));
-        }
-        let mut values = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            values.push(r.var_int()? as u32);
-        }
-        return Ok((bits, Some(values)));
-    }
-    Ok((bits, None))
-}
-
-/// Zahl der Longs hinter der Palette – und in den alten Protokollen die Prüfung der Längenangabe.
-fn palette_longs(r: &mut Reader, size: usize, bits: u8, modern: bool) -> io::Result<usize> {
-    let per_long = 64usize / bits as usize;
-    if per_long == 0 {
-        return Err(crate::protocol::buf::err("POV: ungueltige Palettenbreite"));
-    }
-    let expected = size.div_ceil(per_long);
-    if modern {
-        return Ok(expected);
-    }
-    let encoded = r.var_int()?;
-    if encoded < 0 || encoded as usize != expected {
-        return Err(crate::protocol::buf::err("POV: falsche Palettenlaenge"));
-    }
-    Ok(expected)
-}
-
-fn read_palette(
-    r: &mut Reader,
-    size: usize,
-    max_indirect_bits: u8,
-    modern: bool,
-) -> io::Result<RawPalette> {
-    let (bits, local) = palette_head(r, max_indirect_bits)?;
-
-    if bits == 0 {
-        let values = local.unwrap_or_else(|| vec![0]);
-        if !modern {
-            let longs = r.var_int()?;
-            if longs != 0 {
-                return Err(crate::protocol::buf::err(
-                    "POV: Singleton-Palette mit Daten",
-                ));
-            }
-        }
-        return Ok(RawPalette {
-            counts: vec![size as u32],
-            values,
-            indices: vec![0; size],
-        });
-    }
-
-    let per_long = 64usize / bits as usize;
-    let longs = palette_longs(r, size, bits, modern)?;
-    let mut data = Vec::with_capacity(longs);
-    for _ in 0..longs {
-        data.push(r.i64()? as u64);
-    }
-
-    let mask = if bits == 32 {
-        u32::MAX as u64
-    } else {
-        (1u64 << bits) - 1
-    };
-
-    // Indirekte Palette: der gepackte Wert ist direkt der Paletteneintrag.
-    if let Some(values) = local {
-        let mut counts = vec![0u32; values.len()];
-        let mut indices = Vec::with_capacity(size);
-        let mut fault = None;
-        unpack_all(&data, size, per_long, bits, mask, |packed| {
-            match counts.get_mut(packed) {
-                Some(count) => *count += 1,
-                None => fault = Some("POV: Palettenindex ausserhalb"),
-            }
-            indices.push(packed as u16);
-        })?;
-        if let Some(message) = fault {
-            return Err(crate::protocol::buf::err(message));
-        }
-        return Ok(RawPalette {
-            values,
-            indices,
-            counts,
-        });
-    }
-
-    // Globale Palette: eine örtliche Palette daraus bauen, damit der Abschnitt klein bleibt.
-    let mut values: Vec<u32> = Vec::new();
-    let mut counts: Vec<u32> = Vec::new();
-    let mut seen: HashMap<u32, u16> = HashMap::new();
-    let mut indices = Vec::with_capacity(size);
-    let mut fault = None;
-    unpack_all(&data, size, per_long, bits, mask, |packed| {
-        let state = packed as u32;
-        let slot = match seen.get(&state) {
-            Some(slot) => *slot,
-            None => {
-                if values.len() >= u16::MAX as usize {
-                    fault = Some("POV: Abschnitt mit zu vielen Zustaenden");
-                    return;
-                }
-                let slot = values.len() as u16;
-                values.push(state);
-                counts.push(0);
-                seen.insert(state, slot);
-                slot
-            }
-        };
-        counts[slot as usize] += 1;
-        indices.push(slot);
-    })?;
-    if let Some(message) = fault {
-        return Err(crate::protocol::buf::err(message));
-    }
-    Ok(RawPalette {
-        values,
-        indices,
-        counts,
-    })
-}
-
-/// Palette nur überspringen – für die Biome, die die Ansicht nicht braucht.
-fn skip_palette(
-    r: &mut Reader,
-    size: usize,
-    max_indirect_bits: u8,
-    modern: bool,
-) -> io::Result<()> {
-    let (bits, _) = palette_head(r, max_indirect_bits)?;
-    if bits == 0 {
-        if !modern {
-            let longs = r.var_int()?;
-            if longs != 0 {
-                return Err(crate::protocol::buf::err(
-                    "POV: Singleton-Palette mit Daten",
-                ));
-            }
-        }
-        return Ok(());
-    }
-    let longs = palette_longs(r, size, bits, modern)?;
-    r.skip(longs * 8)
-}
-
-/// Alle gepackten Einträge der Reihe nach an `f` geben.
-///
-/// Bewusst über die Longs statt über die Blocknummern: Vorher kostete **jeder einzelne der 4096
-/// Blöcke** eine Division, eine Modulo-Rechnung, einen Bereichstest und eine variable
-/// Schiebeoperation. Jetzt wird ein Long einmal geholt und dann Eintrag für Eintrag
-/// herausgeschoben – bei rund 170 Chunks mit je einem guten Dutzend Abschnitten sind das ein paar
-/// Millionen eingesparte Divisionen pro Beitritt.
-#[inline]
-fn unpack_all(
-    data: &[u64],
-    size: usize,
-    per_long: usize,
-    bits: u8,
-    mask: u64,
-    mut f: impl FnMut(usize),
-) -> io::Result<()> {
-    let mut left = size;
-    for long in data {
-        if left == 0 {
-            break;
-        }
-        let mut value = *long;
-        let take = per_long.min(left);
-        for _ in 0..take {
-            f((value & mask) as usize);
-            value >>= bits;
-        }
-        left -= take;
-    }
-    if left > 0 {
-        return Err(crate::protocol::buf::err("POV: Palettendaten zu kurz"));
-    }
-    Ok(())
-}
-
-/// Aus der gelesenen Palette einen Abschnitt bauen: Luftzustände auf Eintrag 0 zusammenlegen,
-/// alles Übrige dahinter. `None` = der Abschnitt besteht doch nur aus Luft.
-///
-/// Welche Zustände Luft sind, verrät der Blockzähler des Abschnitts: er zählt alle Blöcke, die
-/// **nicht** Luft sind, und Luft gibt es in Vanilla in genau drei Ausprägungen (`air`,
-/// `cave_air`, `void_air`). Gesucht wird deshalb eine Teilmenge von höchstens drei Einträgen,
-/// deren Häufigkeiten die fehlende Zahl genau ergeben – das geht in einem Durchlauf.
-fn compact(raw: RawPalette, non_air: usize) -> Option<Section> {
-    let RawPalette {
-        values,
-        indices,
-        counts,
-    } = raw;
-    let air = air_entries(&values, &counts, SECTION_BLOCKS.saturating_sub(non_air));
-
-    // Neue Palette: Eintrag 0 ist Luft.
-    let mut palette = vec![0u32];
-    let mut remap = vec![0u16; values.len()];
-    for (slot, value) in values.iter().enumerate() {
-        if air[slot] {
-            continue;
-        }
-        remap[slot] = palette.len() as u16;
-        palette.push(*value);
-    }
-    if palette.len() == 1 {
-        return None; // doch nur Luft
-    }
-
-    let indices = Indices::remapped(&indices, &remap, palette.len());
-    // Die Biome setzt der Aufrufer: Sie stehen im Paket erst hinter der Blockpalette.
-    Some(Section {
-        palette,
-        indices,
-        biomes: Biomes::Single(0),
-    })
-}
-
-/// Welche Paletteneinträge sind Luft? `air_total` ist die Zahl der Luftblöcke im Abschnitt.
-fn air_entries(values: &[u32], counts: &[u32], air_total: usize) -> Vec<bool> {
-    let mut air = vec![false; values.len()];
-    if air_total == 0 {
-        return air;
-    }
-    // Zustand 0 ist in jeder Protokollversion `minecraft:air`.
-    let mut rest = air_total as i64;
-    for (slot, value) in values.iter().enumerate() {
-        if *value == 0 {
-            air[slot] = true;
-            rest -= counts[slot] as i64;
-        }
-    }
-    if rest <= 0 {
-        return air;
-    }
-    let rest = rest as u32;
-
-    // Ein einzelner weiterer Zustand (der Normalfall: cave_air).
-    let open: Vec<usize> = (0..values.len()).filter(|slot| !air[*slot]).collect();
-    if let Some(slot) = open.iter().find(|slot| counts[**slot] == rest) {
-        air[*slot] = true;
-        return air;
-    }
-    // Sonst zwei – mehr als drei Luftzustände gibt es in Minecraft nicht.
-    let mut by_count: HashMap<u32, usize> = HashMap::with_capacity(open.len());
-    for slot in &open {
-        by_count.entry(counts[*slot]).or_insert(*slot);
-    }
-    for slot in &open {
-        let Some(missing) = rest.checked_sub(counts[*slot]) else {
-            continue;
-        };
-        if let Some(other) = by_count.get(&missing) {
-            if other != slot {
-                air[*slot] = true;
-                air[*other] = true;
-                return air;
-            }
-        }
-    }
-    // Nichts Eindeutiges gefunden: lieber alles stehen lassen, als Blöcke zu erfinden.
-    air
-}
-
-fn unpack_block_pos(value: i64) -> (i32, i32, i32) {
-    let x = (value >> 38) as i32;
-    let y = (value << 52 >> 52) as i32;
-    let z = (value << 26 >> 38) as i32;
-    (x, y, z)
-}
-
-/// Protokoll 47 legte die 12 Y-Bits noch zwischen X und Z; moderne Pakete legen sie ans Ende.
-fn unpack_legacy_block_pos(value: i64) -> (i32, i32, i32) {
-    let x = (value >> 38) as i32;
-    let y = (value << 26 >> 52) as i32;
-    let z = (value << 38 >> 38) as i32;
-    (x, y, z)
-}
-
-fn unpack_chunk_pos(value: i64) -> (i32, i32) {
-    let value = value as u64;
-    (value as u32 as i32, (value >> 32) as u32 as i32)
-}
-
-fn unpack_section_pos(value: i64) -> (i32, i32, i32) {
-    let x = (value >> 42) as i32;
-    let y = (value << 44 >> 44) as i32;
-    let z = (value << 22 >> 42) as i32;
-    (x, y, z)
 }
 
 // ===================== Bedienung und Renderer =====================
@@ -2085,7 +649,7 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
         },
         "info" | "status" => {
             let pov = &shared.extras.pov;
-            let world = pov.world.lock().unwrap();
+            let world = shared.world.lock().unwrap();
             let sections: usize = world
                 .chunks
                 .values()
@@ -2098,8 +662,8 @@ pub fn command(shared: &Arc<Shared>, arg: &str) {
                 .values()
                 .filter(|chunk| chunk.light.is_some())
                 .count();
-            let entities = world.entities.len();
             drop(world);
+            let entities = pov.entities.lock().unwrap().map.len();
             shared.console.info(&format!(
                 "POV: {} · y={}..{} · {} Chunks · {} mit Licht · {} Abschnitte · {} Entities · {}x{} · {} fps · {}",
                 dimension.name,
@@ -2173,6 +737,11 @@ pub(crate) fn start_assets(shared: &Arc<Shared>) {
                     // Nachrechnen bliebe jedes Biom auf dem Ebene-Ton stehen.
                     pov.rebuild_biome_tints();
                     owned.console.ok("Live-Ansicht: Texturen sind geladen.");
+                    if let Some(assets) = owned.extras.pov.assets() {
+                        owned
+                            .console
+                            .event("assets", &format!("{:?}", assets.footprint()));
+                    }
                 }
                 Err(error) => {
                     owned
@@ -2211,7 +780,8 @@ pub(crate) fn start_web(shared: &Arc<Shared>) {
 }
 
 pub(crate) fn web_world(shared: &Arc<Shared>) -> serde_json::Value {
-    let world = shared.extras.pov.world.lock().unwrap();
+    let world = shared.world.lock().unwrap();
+    let entities = shared.extras.pov.entities.lock().unwrap().map.len();
     let position = shared.position();
     serde_json::json!({
         "connected": shared.in_game.load(Ordering::Relaxed),
@@ -2221,7 +791,7 @@ pub(crate) fn web_world(shared: &Arc<Shared>) -> serde_json::Value {
         })),
         "dimension": &world.dimension.name,
         "chunks": world.chunks.len(),
-        "entities": world.entities.len(),
+        "entities": entities,
         "textures": shared.extras.pov.assets().is_some(),
         "texture_error": shared.extras.pov.asset_note(),
     })
@@ -2325,7 +895,7 @@ fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
         frame,
         ..
     } = &mut *scratch;
-    pov.fill_scene(scene);
+    pov.fill_scene(shared, scene);
     render_into(scene, position, width, height, color, pixels, frame);
 
     // Auch bei `force` mitrechnen: Sonst behielte der Merker den Stand von **vor** dem
@@ -2609,7 +1179,7 @@ pub(crate) fn web_frame(
             web_rgba,
             ..
         } = &mut *scratch;
-        shared.extras.pov.fill_scene(scene);
+        shared.extras.pov.fill_scene(shared, scene);
         render_textured(scene, position, width, height, assets, pixels);
         web_rgba.clear();
         web_rgba.reserve(width * height * 4);
@@ -3071,6 +1641,7 @@ fn overlay_entities(
 mod tests {
     use super::*;
     use crate::protocol::buf::Writer;
+    use crate::world::*;
 
     /// Ein Lichtpaket für `sections` Weltabschnitte bauen: Himmelslicht nur in den in `lit`
     /// genannten **Licht**abschnitten, Blocklicht nirgends.
@@ -3473,7 +2044,8 @@ mod tests {
             }
             write_biomes(&mut w, format, &biomes);
 
-            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            let chunk = Chunk::decode(format, &dimension(1), &w.data, &Values::for_version("26.1"))
+                .unwrap();
             let section = chunk.section(0).expect("Abschnitt");
             for (index, biome) in biomes.iter().enumerate() {
                 // Zellenreihenfolge y, z, x – je vier Blöcke eine Zelle.
@@ -3498,7 +2070,8 @@ mod tests {
     fn einwertige_biompalette_bleibt_einwertig() {
         let mut w = Writer::default();
         write_section(&mut w, MODERN, &[1u32; SECTION_BLOCKS], SECTION_BLOCKS);
-        let chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        let chunk =
+            Chunk::decode(MODERN, &dimension(1), &w.data, &Values::for_version("26.1")).unwrap();
         let section = chunk.section(0).expect("Abschnitt");
         assert!(matches!(section.biomes, Biomes::Single(1)));
         assert_eq!(section.biomes.get(7, 9, 11), 1);
@@ -3509,7 +2082,8 @@ mod tests {
         for format in [LEGACY, MODERN, MODERN_FLUID] {
             let mut w = Writer::default();
             write_section(&mut w, format, &[0u32; SECTION_BLOCKS], 0);
-            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            let chunk = Chunk::decode(format, &dimension(1), &w.data, &Values::for_version("26.1"))
+                .unwrap();
             assert_eq!(chunk.block(0, 0, 0), 0);
             assert!(
                 chunk.sections[0].is_none(),
@@ -3553,7 +2127,8 @@ mod tests {
         states[3000..3500].fill(0);
         let mut w = Writer::default();
         write_section(&mut w, MODERN, &states, SECTION_BLOCKS - 3500);
-        let chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        let chunk =
+            Chunk::decode(MODERN, &dimension(1), &w.data, &Values::for_version("26.1")).unwrap();
         for index in 0..SECTION_BLOCKS {
             let (x, y, z) = (
                 (index & 15) as i32,
@@ -3578,7 +2153,8 @@ mod tests {
         for format in [LEGACY, MODERN, MODERN_FLUID] {
             let mut w = Writer::default();
             write_section(&mut w, format, &states, SECTION_BLOCKS);
-            let chunk = Chunk::decode(format, &dimension(1), &w.data).unwrap();
+            let chunk = Chunk::decode(format, &dimension(1), &w.data, &Values::for_version("26.1"))
+                .unwrap();
             for (index, state) in states.iter().enumerate() {
                 let (x, y, z) = (
                     (index & 15) as i32,
@@ -3597,7 +2173,9 @@ mod tests {
         let states = vec![1u32; SECTION_BLOCKS];
         let mut w = Writer::default();
         write_section(&mut w, MODERN_FLUID, &states, SECTION_BLOCKS);
-        let (chunk, format) = Format::probe(LEGACY, &dimension(1), &w.data).expect("erkannt");
+        let (chunk, format) =
+            Format::probe(LEGACY, &dimension(1), &w.data, &Values::for_version("26.1"))
+                .expect("erkannt");
         assert_eq!(format, MODERN_FLUID);
         assert_eq!(chunk.block(0, 0, 0), 1);
     }
@@ -3608,7 +2186,8 @@ mod tests {
         let states = vec![1u32; SECTION_BLOCKS];
         let mut w = Writer::default();
         write_section(&mut w, MODERN, &states, SECTION_BLOCKS);
-        let mut chunk = Chunk::decode(MODERN, &dimension(1), &w.data).unwrap();
+        let mut chunk =
+            Chunk::decode(MODERN, &dimension(1), &w.data, &Values::for_version("26.1")).unwrap();
         chunk.set_block(3, 4, 5, 77);
         assert_eq!(chunk.block(3, 4, 5), 77);
         assert_eq!(chunk.block(3, 4, 6), 1);
@@ -3863,14 +2442,11 @@ mod tests {
     #[test]
     #[ignore]
     fn messlauf_bildrate() {
-        let pov = Pov::new(&crate::options::Options::default());
-        {
-            let mut world = pov.world.lock().unwrap();
-            // 13x13 Chunks – genau so viele behält die Ansicht nach dem Aufräumen.
-            for x in -6..=6i32 {
-                for z in -6..=6i32 {
-                    world.chunks.insert((x, z), ground_chunk());
-                }
+        let mut chunks = HashMap::new();
+        // 13x13 Chunks – genau so viele behält die Ansicht nach dem Aufräumen.
+        for x in -6..=6i32 {
+            for z in -6..=6i32 {
+                chunks.insert((x, z), ground_chunk());
             }
         }
         let position = (8.0, 18.0, 8.0, 30.0f32, -10.0f32);
@@ -3881,7 +2457,7 @@ mod tests {
         // Die dritte Größe ist die des Browser-Viewers: dort liegt die eigentliche Rechenlast.
         for (width, height) in [(64usize, 32usize), (160, 80), (426, 240)] {
             // Einmal warmlaufen, damit die Messung nicht den ersten Zugriff mitzählt.
-            pov.fill_scene(&mut scene);
+            scene.chunks.clone_from(&chunks);
             render_into(
                 &scene,
                 position,
@@ -3895,7 +2471,7 @@ mod tests {
             let runs = 200;
             let started = Instant::now();
             for _ in 0..runs {
-                pov.fill_scene(&mut scene);
+                scene.chunks.clone_from(&chunks);
                 render_into(
                     &scene,
                     position,
@@ -4257,13 +2833,15 @@ mod tests {
             height: 384,
         };
         // Einmal vorweg, damit der Zwischenspeicher warm ist.
-        let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data).expect("lesbar");
+        let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data, &Values::for_version("26.1"))
+            .expect("lesbar");
         assert_eq!(chunk.sections.iter().flatten().count(), 8);
 
         const ROUNDS: usize = 400;
         let started = std::time::Instant::now();
         for _ in 0..ROUNDS {
-            let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data).expect("lesbar");
+            let chunk = Chunk::decode(MODERN_FLUID, &dim, &w.data, &Values::for_version("26.1"))
+                .expect("lesbar");
             std::hint::black_box(&chunk);
         }
         let each = started.elapsed().as_secs_f64() * 1000.0 / ROUNDS as f64;
@@ -4286,9 +2864,9 @@ mod tests {
             let len = (random() % 4096) as usize;
             let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
             for format in [LEGACY, MODERN, MODERN_FLUID] {
-                let _ = Chunk::decode(format, &dimension(24), &data);
+                let _ = Chunk::decode(format, &dimension(24), &data, &Values::for_version("26.1"));
             }
-            let _ = Format::probe(MODERN, &dimension(24), &data);
+            let _ = Format::probe(MODERN, &dimension(24), &data, &Values::for_version("26.1"));
             assert!(round < 400);
         }
     }

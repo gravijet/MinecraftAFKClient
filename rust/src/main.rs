@@ -15,15 +15,18 @@ mod board;
 mod client;
 mod console;
 mod extras;
+mod memory;
 mod menu;
 mod movement;
 mod net;
 mod options;
+mod physics;
 #[cfg(feature = "pov")]
 mod pov;
 mod protocol;
 mod rules;
 mod web;
+mod world;
 
 use crate::client::Client;
 use crate::console::Console;
@@ -32,6 +35,7 @@ use crate::protocol::Protocol;
 use std::path::Path;
 
 fn main() {
+    memory::limit_arenas();
     // Zuerst, noch vor jeder Ausgabe: `--help` und `--accounts` legen keine `Console` an,
     // schreiben aber Pfade – und die Windows-Konsole zerlegt sonst jeden Umlaut darin.
     console::prepare_terminal();

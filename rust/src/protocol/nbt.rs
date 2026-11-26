@@ -39,7 +39,6 @@ impl Nbt {
 
     /// Ganzzahliges Feld eines Compounds. Registry-Daten verwenden je nach Bereich Byte,
     /// Short, Int oder Long; für Welthöhen sind alle vier verlustfrei als `i32` darstellbar.
-    #[cfg(feature = "pov")]
     pub(crate) fn get_i32(&self, key: &str) -> Option<i32> {
         match self.get(key)? {
             Nbt::Byte(value) => Some(*value as i32),

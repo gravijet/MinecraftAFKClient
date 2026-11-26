@@ -5,18 +5,18 @@
 //! Nur die Zuordnung der Netzwerk-State-ID zum Blockzustand liegt komprimiert bei; sie wurde mit
 //! `rust/data/generate-block-states.sh` aus den offiziellen Server-Reports erzeugt.
 
+use super::jar::Jar;
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::RwLock;
 #[cfg(not(feature = "pov"))]
 use std::sync::{Arc, OnceLock};
 #[cfg(not(feature = "pov"))]
 use std::thread;
-use zip::ZipArchive;
 
 const STATES_1_8_9: &[u8] = include_bytes!("../../data/block-states-1.8.9.txt.gz");
 const STATES_1_21_1: &[u8] = include_bytes!("../../data/block-states-1.21.1.txt.gz");
@@ -138,7 +138,7 @@ fn rgb(value: u32) -> [u8; 3] {
 /// Eine Farbkarte der JAR als 256x256-Tabelle. Fehlt oder passt sie nicht, bleibt es beim
 /// Ebene-Ton – erfunden wird keine.
 #[cfg(feature = "pov")]
-fn load_colormap(archive: &mut ZipArchive<File>, name: &str) -> Option<Box<[[u8; 3]]>> {
+fn load_colormap(archive: &mut Jar, name: &str) -> Option<Box<[[u8; 3]]>> {
     let path = format!("assets/minecraft/textures/colormap/{}.png", name);
     let bytes = read_zip(archive, &path, MAX_ARCHIVE_ASSET_BYTES)?;
     let texture = decode_png(&bytes).ok()?;
@@ -198,13 +198,18 @@ struct Texture {
     rgba: Vec<u8>,
 }
 
+/// Die Ressourcen einer Client-JAR – **nach Bedarf** geladen.
+///
+/// Früher wurden beim Start alle rund 30 000 Blockzustände samt Modellen und Texturen
+/// aufgelöst. Das kostete gut 90 MB Arbeitsspeicher, die der Allokator wegen der vielen kleinen
+/// JSON-Reste nie zurückgab – für eine Ansicht, die je Bild ein paar hundert verschiedene Blöcke
+/// zeigt. Jetzt löst [`Assets::ensure_states`] genau die Zustände auf, die in der Welt
+/// vorkommen; alles andere bleibt in der JAR.
 pub(crate) struct Assets {
-    states: Vec<u16>,
-    materials: Vec<Material>,
-    textures: Vec<Texture>,
+    protocol: String,
+    store: RwLock<Store>,
     block_defaults: HashMap<String, u32>,
     item_icons: Mutex<HashMap<String, Vec<u8>>>,
-    archive: Mutex<ZipArchive<File>>,
     missing_png: Vec<u8>,
     /// Die beiden Farbkarten der JAR, je 256x256 RGB. Aus ihnen kommt der Gras- und Laubton
     /// eines Bioms – dieselbe Tabelle, die auch das Spiel selbst abtastet. Nur die volle
@@ -215,19 +220,31 @@ pub(crate) struct Assets {
     foliage_map: Option<Box<[[u8; 3]]>>,
 }
 
+/// Was nach und nach aufgelöst wird.
+struct Store {
+    /// Material je Blockzustand; [`UNRESOLVED`] = noch nicht gebraucht.
+    state_material: Vec<u16>,
+    loader: Loader,
+}
+
+const UNRESOLVED: u16 = u16::MAX;
+
 impl Assets {
     pub(crate) fn load(path: &Path, protocol: &str) -> Result<Assets, String> {
-        let file = File::open(path)
-            .map_err(|error| format!("{} liess sich nicht oeffnen: {}", path.display(), error))?;
-        let mut archive = ZipArchive::new(file)
-            .map_err(|error| format!("{} ist keine lesbare JAR/ZIP: {}", path.display(), error))?;
+        let mut archive = Jar::open(path)
+            .map_err(|error| format!("{} ist keine lesbare JAR: {}", path.display(), error))?;
         verify_archive_version(&mut archive, protocol)?;
         let mut loader = Loader::new(archive);
-        let state_text = state_table(protocol)?;
-        let mut states = Vec::new();
+        let mut state_count = 0usize;
         let mut block_defaults = HashMap::new();
         let mut blocks = HashSet::new();
-        for (expected, line) in state_text.lines().enumerate() {
+        let mut table = String::new();
+        GzDecoder::new(state_table_bytes(protocol)?)
+            .read_to_string(&mut table)
+            .map_err(|error| {
+                format!("Block-State-Tabelle konnte nicht gelesen werden: {}", error)
+            })?;
+        for (expected, line) in table.lines().enumerate() {
             let mut fields = line.splitn(4, '\t');
             let id = fields
                 .next()
@@ -261,9 +278,11 @@ impl Assets {
             {
                 return Err(format!("Block {} hat mehrere Default-States", block));
             }
-            states.push(loader.material_id(block, properties));
+            let _ = properties;
+            state_count += 1;
         }
-        if states.is_empty() || loader.materials.is_empty() {
+        drop(table);
+        if state_count == 0 {
             return Err(format!("Block-State-Tabelle fuer {} ist leer", protocol));
         }
         if block_defaults.len() != blocks.len() {
@@ -279,19 +298,87 @@ impl Assets {
         let grass_map = load_colormap(&mut loader.archive, "grass");
         #[cfg(feature = "pov")]
         let foliage_map = load_colormap(&mut loader.archive, "foliage");
-        Ok(Assets {
-            states,
-            materials: loader.materials,
-            textures: loader.textures,
+        loader.forget_sources();
+        let assets = Assets {
+            protocol: protocol.to_string(),
+            store: RwLock::new(Store {
+                state_material: vec![UNRESOLVED; state_count],
+                loader,
+            }),
             block_defaults,
             item_icons: Mutex::new(HashMap::new()),
-            archive: Mutex::new(loader.archive),
             missing_png,
             #[cfg(feature = "pov")]
             grass_map,
             #[cfg(feature = "pov")]
             foliage_map,
-        })
+        };
+        crate::memory::trim();
+        Ok(assets)
+    }
+
+    /// Was die geladenen Ressourcen belegen: (Texturen, Texturbytes, Materialien, Elemente).
+    pub(crate) fn footprint(&self) -> (usize, usize, usize, usize) {
+        let store = self.store.read().unwrap();
+        let loader = &store.loader;
+        (
+            loader.textures.len(),
+            loader.textures.iter().map(|t| t.rgba.len()).sum(),
+            loader.materials.len(),
+            loader.materials.iter().map(|m| m.elements.len()).sum(),
+        )
+    }
+
+    /// Modelle und Texturen für diese Blockzustände laden, soweit noch nicht geschehen.
+    ///
+    /// Ein Durchgang durch die (gepackte) Zustandstabelle der Version löst alle fehlenden auf
+    /// einmal auf; danach werden die Zwischenstände der JSON-Dateien verworfen.
+    pub(crate) fn ensure_states(&self, states: impl IntoIterator<Item = u32>) {
+        let mut wanted: Vec<u32> = {
+            let store = self.store.read().unwrap();
+            states
+                .into_iter()
+                .filter(|state| store.state_material.get(*state as usize) == Some(&UNRESOLVED))
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let Ok(bytes) = state_table_bytes(&self.protocol) else {
+            return;
+        };
+        let mut store = self.store.write().unwrap();
+        let Store {
+            state_material,
+            loader,
+        } = &mut *store;
+        let mut reader = std::io::BufReader::new(GzDecoder::new(bytes));
+        let mut line = String::new();
+        let mut next = 0usize;
+        let mut id = 0u32;
+        while next < wanted.len() {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if id == wanted[next] {
+                let mut fields = line.trim_end_matches('\n').splitn(4, '\t');
+                let _ = fields.next();
+                let block = fields.next().unwrap_or("");
+                let properties = fields.next().unwrap_or("");
+                if let Some(slot) = state_material.get_mut(id as usize) {
+                    *slot = loader.material_id(block, properties);
+                }
+                next += 1;
+            }
+            id += 1;
+        }
+        loader.forget_sources();
+        drop(store);
+        crate::memory::trim();
     }
 
     /// Die Farbtöne eines Bioms, so wie das Spiel sie rechnet.
@@ -350,11 +437,17 @@ impl Assets {
         leave: f64,
         biome: &BiomeTint,
     ) -> Option<TexturedHit> {
-        let material_id = self.states.get(state as usize).copied().unwrap_or(0);
-        let material = self
+        let store = self.store.read().unwrap();
+        let loader = &store.loader;
+        let material_id = store
+            .state_material
+            .get(state as usize)
+            .copied()
+            .unwrap_or(0);
+        let material = loader
             .materials
             .get(material_id as usize)
-            .unwrap_or(&self.materials[0]);
+            .unwrap_or(&loader.materials[0]);
         let origin16 = [
             (origin.0 - cell.0 as f64) * 16.0,
             (origin.1 - cell.1 as f64) * 16.0,
@@ -383,7 +476,7 @@ impl Assets {
                 };
                 let point = add_scaled(local_origin, local_direction, distance);
                 let (u, v) = face_uv(point, element.from, element.to, face_index, face.uv);
-                let rgba = self.sample_face(face, u, v, biome);
+                let rgba = sample_face(&loader.textures, face, u, v, biome);
                 if rgba.3 < 16 {
                     continue;
                 }
@@ -393,18 +486,23 @@ impl Assets {
         }
         best
     }
+}
 
-    fn sample_face(&self, face: Face, u: f64, v: f64, biome: &BiomeTint) -> (u8, u8, u8, u8) {
+fn sample_face(
+    textures: &[Texture],
+    face: Face,
+    u: f64,
+    v: f64,
+    biome: &BiomeTint,
+) -> (u8, u8, u8, u8) {
+    {
         let (u, v) = match face.rotation.rem_euclid(360) {
             90 => (1.0 - v, u),
             180 => (1.0 - u, 1.0 - v),
             270 => (v, 1.0 - u),
             _ => (u, v),
         };
-        let texture = self
-            .textures
-            .get(face.texture as usize)
-            .unwrap_or(&self.textures[0]);
+        let texture = textures.get(face.texture as usize).unwrap_or(&textures[0]);
         let x = ((u.rem_euclid(1.0) * texture.width as f64) as usize).min(texture.width - 1);
         let y = ((v.rem_euclid(1.0) * texture.frame_height as f64) as usize)
             .min(texture.frame_height - 1);
@@ -425,17 +523,26 @@ impl Assets {
         }
         rgba
     }
+}
 
+impl Assets {
     /// Die Farbe, die ein Blockzustand auf einer bestimmten Seite an dieser Stelle wirklich
     /// liefert – ohne Kamera, ohne Licht, ohne Nebel. Damit lässt sich blockgenau prüfen, ob die
     /// Ressourcen richtig gelesen wurden.
     #[cfg(test)]
     pub(crate) fn sample(&self, state: u32, face: usize, u: f64, v: f64) -> (u8, u8, u8, u8) {
-        let material_id = self.states.get(state as usize).copied().unwrap_or(0);
-        let material = self
+        self.ensure_states([state]);
+        let store = self.store.read().unwrap();
+        let loader = &store.loader;
+        let material_id = store
+            .state_material
+            .get(state as usize)
+            .copied()
+            .unwrap_or(0);
+        let material = loader
             .materials
             .get(material_id as usize)
-            .unwrap_or(&self.materials[0]);
+            .unwrap_or(&loader.materials[0]);
         let selected = material
             .elements
             .iter()
@@ -446,12 +553,12 @@ impl Assets {
                 uv: None,
                 rotation: 0,
             });
-        self.sample_face(selected, u, v, &BiomeTint::PLAINS)
+        sample_face(&loader.textures, selected, u, v, &BiomeTint::PLAINS)
     }
 
     pub(crate) fn raw(&self, path: &str) -> Option<Vec<u8>> {
-        let mut archive = self.archive.lock().ok()?;
-        read_zip(&mut archive, path, MAX_ARCHIVE_ASSET_BYTES)
+        let mut store = self.store.write().ok()?;
+        read_zip(&mut store.loader.archive, path, MAX_ARCHIVE_ASSET_BYTES)
     }
 
     /// Vanilla-Icon fuer einen Registry-Namen. Fuer Blockitems wird das echte Blockmodell
@@ -491,16 +598,17 @@ impl Assets {
     /// ausgewaehlten Original-JAR.
     fn render_item_model(&self, name: &str) -> Option<Vec<u8>> {
         let (namespace, path) = resource_id(name);
-        let mut archive = self.archive.lock().ok()?;
+        let mut store = self.store.write().ok()?;
+        let archive = &mut store.loader.archive;
         let definition = read_zip(
-            &mut archive,
+            archive,
             &format!("assets/{}/items/{}.json", namespace, path),
             MAX_JSON_BYTES,
         )?;
         let definition: Value = serde_json::from_slice(&definition).ok()?;
         let model = first_item_model(definition.get("model")?, 0)?;
         let mut cache = HashMap::new();
-        let textures = resolved_model_textures(&mut archive, model, 0, &mut cache)?;
+        let textures = resolved_model_textures(archive, model, 0, &mut cache)?;
 
         let mut layers = Vec::new();
         for index in 0..8 {
@@ -513,7 +621,7 @@ impl Assets {
             }
             let (texture_namespace, texture_path) = resource_id(&resolved);
             let bytes = read_zip(
-                &mut archive,
+                archive,
                 &format!("assets/{}/textures/{}.png", texture_namespace, texture_path),
                 MAX_ARCHIVE_ASSET_BYTES,
             )?;
@@ -527,10 +635,11 @@ impl Assets {
     /// Renderer zusammengesetzt werden; nur der Einstieg in die Modellkette ist ein anderer.
     fn render_legacy_item_model(&self, name: &str) -> Option<Vec<u8>> {
         let (namespace, path) = resource_id(name);
-        let mut archive = self.archive.lock().ok()?;
+        let mut store = self.store.write().ok()?;
+        let archive = &mut store.loader.archive;
         let model = format!("{}:item/{}", namespace, path);
         let mut cache = HashMap::new();
-        let textures = resolved_model_textures(&mut archive, &model, 0, &mut cache)?;
+        let textures = resolved_model_textures(archive, &model, 0, &mut cache)?;
 
         let mut layers = Vec::new();
         for index in 0..8 {
@@ -543,7 +652,7 @@ impl Assets {
             }
             let (texture_namespace, texture_path) = resource_id(&resolved);
             let bytes = read_zip(
-                &mut archive,
+                archive,
                 &format!("assets/{}/textures/{}.png", texture_namespace, texture_path),
                 MAX_ARCHIVE_ASSET_BYTES,
             )?;
@@ -559,8 +668,11 @@ impl Assets {
     /// Blockitems als kleines GUI-Modell statt als flach aufgeklebter Seitentextur. Die
     /// Elementgeometrie und alle Pixel stammen aus demselben Vanilla-Modell wie die Welt.
     fn render_block_icon(&self, state: u32) -> Option<Vec<u8>> {
-        let material_id = *self.states.get(state as usize)?;
-        let material = self.materials.get(material_id as usize)?;
+        self.ensure_states([state]);
+        let store = self.store.read().ok()?;
+        let loader = &store.loader;
+        let material_id = *store.state_material.get(state as usize)?;
+        let material = loader.materials.get(material_id as usize)?;
         let mut quads = Vec::new();
         for element in &material.elements {
             for face_index in 0..6 {
@@ -610,7 +722,7 @@ impl Assets {
         let mut depth = vec![f64::NEG_INFINITY; 16 * 16];
         for (face, world_face, vertices) in quads {
             raster_triangle(
-                self,
+                &loader.textures,
                 face,
                 world_face,
                 [vertices[0], vertices[1], vertices[2]],
@@ -618,7 +730,7 @@ impl Assets {
                 &mut depth,
             );
             raster_triangle(
-                self,
+                &loader.textures,
                 face,
                 world_face,
                 [vertices[0], vertices[2], vertices[3]],
@@ -631,7 +743,7 @@ impl Assets {
 
     #[cfg(test)]
     pub(crate) fn material_count(&self) -> usize {
-        self.states.len()
+        self.store.read().unwrap().state_material.len()
     }
 }
 
@@ -670,7 +782,7 @@ fn first_item_model(value: &Value, depth: usize) -> Option<&str> {
 }
 
 fn resolved_model_textures(
-    archive: &mut ZipArchive<File>,
+    archive: &mut Jar,
     name: &str,
     depth: usize,
     cache: &mut HashMap<String, HashMap<String, String>>,
@@ -742,8 +854,8 @@ fn composite_item_layers(layers: &[Texture]) -> Option<Vec<u8>> {
 /// Offizielle Client-JARs tragen ihre Version selbst ein. Ein Resourcepack hat diese Datei nicht
 /// und bleibt zulaessig; ist sie vorhanden, darf eine versehentlich gewaehlte andere Spielversion
 /// aber nicht still mit den falschen Netzwerk-State-IDs gerendert werden.
-fn verify_archive_version(archive: &mut ZipArchive<File>, protocol: &str) -> Result<(), String> {
-    if archive.by_name("version.json").is_err() {
+fn verify_archive_version(archive: &mut Jar, protocol: &str) -> Result<(), String> {
+    if !archive.contains("version.json") {
         return Ok(());
     }
     let bytes = read_zip(archive, "version.json", MAX_JSON_BYTES)
@@ -764,7 +876,7 @@ fn verify_archive_version(archive: &mut ZipArchive<File>, protocol: &str) -> Res
 }
 
 struct Loader {
-    archive: ZipArchive<File>,
+    archive: Jar,
     json: HashMap<String, Option<Value>>,
     models: HashMap<String, ResolvedModel>,
     texture_ids: HashMap<String, u16>,
@@ -787,7 +899,7 @@ struct ModelUse {
 }
 
 impl Loader {
-    fn new(archive: ZipArchive<File>) -> Loader {
+    fn new(archive: Jar) -> Loader {
         let mut rgba = vec![0u8; 16 * 16 * 4];
         for y in 0..16 {
             for x in 0..16 {
@@ -811,7 +923,24 @@ impl Loader {
                 rgba,
             }],
             material_ids: HashMap::new(),
-            materials: Vec::new(),
+            // Material 0: Würfel mit der Fehlertextur – Ersatz für alles, was sich nicht
+            // auflösen lässt.
+            materials: vec![Material {
+                elements: vec![Element {
+                    from: [0.0; 3],
+                    to: [16.0; 3],
+                    faces: std::array::from_fn(|_| {
+                        Some(Face {
+                            texture: 0,
+                            tint: None,
+                            uv: None,
+                            rotation: 0,
+                        })
+                    }),
+                    transform: identity(),
+                    offset: [0.0; 3],
+                }],
+            }],
         }
     }
 
@@ -1001,6 +1130,13 @@ impl Loader {
         model
     }
 
+    /// Geparste JSON-Dateien und aufgelöste Modelle verwerfen. Sie werden nur beim Auflösen
+    /// gebraucht; die fertigen Materialien und Texturen bleiben.
+    fn forget_sources(&mut self) {
+        self.json = HashMap::new();
+        self.models = HashMap::new();
+    }
+
     fn json(&mut self, path: &str) -> Option<Value> {
         if !self.json.contains_key(path) {
             let parsed = read_zip(&mut self.archive, path, MAX_JSON_BYTES)
@@ -1013,8 +1149,7 @@ impl Loader {
     fn texture_exists(&mut self, name: &str) -> bool {
         let (namespace, path) = resource_id(name);
         let file = format!("assets/{}/textures/{}.png", namespace, path);
-        let exists = self.archive.by_name(&file).is_ok();
-        exists
+        self.archive.contains(&file)
     }
 
     fn texture(&mut self, name: &str) -> u16 {
@@ -1042,7 +1177,7 @@ impl Loader {
     }
 }
 
-fn state_table(protocol: &str) -> Result<String, String> {
+fn state_table_bytes(protocol: &str) -> Result<&'static [u8], String> {
     let bytes = match protocol {
         "1.8.9" => STATES_1_8_9,
         "1.21.1" => STATES_1_21_1,
@@ -1053,21 +1188,11 @@ fn state_table(protocol: &str) -> Result<String, String> {
         "26.4" => STATES_26_4,
         other => return Err(format!("Keine Block-State-Tabelle fuer {}", other)),
     };
-    let mut text = String::new();
-    GzDecoder::new(bytes)
-        .read_to_string(&mut text)
-        .map_err(|error| format!("Block-State-Tabelle konnte nicht gelesen werden: {}", error))?;
-    Ok(text)
+    Ok(bytes)
 }
 
-fn read_zip(archive: &mut ZipArchive<File>, path: &str, max_size: u64) -> Option<Vec<u8>> {
-    let file = archive.by_name(path).ok()?;
-    if file.size() > max_size {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(file.size() as usize);
-    file.take(max_size + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 <= max_size).then_some(bytes)
+fn read_zip(archive: &mut Jar, path: &str, max_size: u64) -> Option<Vec<u8>> {
+    archive.read(path, max_size)
 }
 
 fn resource_id(name: &str) -> (&str, &str) {
@@ -1291,7 +1416,7 @@ fn face_vertices(from: [f64; 3], to: [f64; 3], face: usize) -> [[f64; 3]; 4] {
 }
 
 fn raster_triangle(
-    assets: &Assets,
+    textures: &[Texture],
     face: Face,
     world_face: usize,
     vertices: [IconVertex; 3],
@@ -1353,7 +1478,7 @@ fn raster_triangle(
             let v = wa * a.uv.1 + wb * b.uv.1 + wc * c.uv.1;
             // Ein Gegenstands-Icon hängt an keinem Ort in der Welt und hat deshalb kein Biom.
             // Vanilla zeichnet Inventar-Icons genauso: mit dem Ton der gemäßigten Ebene.
-            let color = assets.sample_face(face, u, v, &BiomeTint::PLAINS);
+            let color = sample_face(textures, face, u, v, &BiomeTint::PLAINS);
             if color.3 < 16 {
                 continue;
             }
@@ -1656,6 +1781,11 @@ pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
                     let _ = web.ready.set(Arc::new(assets));
                     web.set_note(None);
                     owned.console.ok("Browser-Menü: Texturen sind geladen.");
+                    if let Some(assets) = web.ready.get() {
+                        owned
+                            .console
+                            .event("assets", &format!("{:?}", assets.footprint()));
+                    }
                 }
                 Err(error) => {
                     owned
@@ -1707,7 +1837,10 @@ mod tests {
             ("26.3", 35_723),
             ("26.4", 37_840),
         ] {
-            let table = state_table(version).unwrap();
+            let mut table = String::new();
+            GzDecoder::new(state_table_bytes(version).unwrap())
+                .read_to_string(&mut table)
+                .unwrap();
             assert_eq!(table.lines().count(), expected, "{}", version);
             assert!(table.starts_with("0\tminecraft:air\t\t1"), "{}", version);
 

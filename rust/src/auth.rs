@@ -312,6 +312,22 @@ impl Account {
 
     /// Meldet die Sitzung bei Mojang an – Pflicht vor dem verschlüsselten Login.
     pub fn join_server(&mut self, server_hash: &str, ipv4: bool) -> Res<()> {
+        // Eigener Sitzungsserver (Gegenstück zu `-Dminecraft.api.session.host` auf dem Server):
+        // für Testserver und alternative Anmeldedienste. Dann darf auch ein Offline-Konto
+        // beitreten – der fremde Dienst entscheidet selbst, was er annimmt.
+        if let Ok(host) = std::env::var("AFK_SESSION_SERVER") {
+            let host = host.trim_end_matches('/');
+            let response = session_agent(ipv4)
+                .post(&format!("{}/session/minecraft/join", host))
+                .send_json(json!({
+                    "accessToken": self.token,
+                    "selectedProfile": hex(&self.profile_id),
+                    "serverId": server_hash
+                }));
+            return response
+                .map(|_| ())
+                .map_err(|e| format!("Sitzungs-Join abgelehnt: {}", short(e)));
+        }
         if !self.online {
             return Err(
                 "Der Server verlangt eine echte Microsoft-Sitzung – mit --offline geht das nicht \

@@ -2202,7 +2202,7 @@ fn alle_oertlichen_befehle_ueberstehen_auch_unsinn() {
 fn sichtweite_passt_zur_bauform() {
     let server = common::start(&common::MC_26_1, plan_with_ground());
     let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "-q"]);
-    let expected: u8 = if cfg!(feature = "pov") { 6 } else { 2 };
+    let expected: u8 = if cfg!(feature = "pov") { 5 } else { 2 };
     let ok = common::wait_note(
         &server.notes,
         TIMEOUT,
@@ -2257,3 +2257,4 @@ fn messlauf_wie_viele_chatzeilen_ankommen() {
     );
     let _ = child.kill();
 }
+
