@@ -41,6 +41,9 @@ pub struct Protocol {
     /// Ab 26.3 trägt `AcceptTeleportation` die übernommene Position; das frühere zusätzliche
     /// `MovePlayer`-Echo nach jedem Teleport entfällt.
     pub teleport_ack_position: bool,
+    /// Ab 26.3 tragen Entity-Bewegungen Zwischenschritte (`VecDelta`/`PositionPath`).
+    #[cfg_attr(not(feature = "pov"), allow(dead_code))]
+    pub entity_steps: bool,
     /// Ab 26.4 handeln Client und Server den Sitzungsschlüssel per X25519 aus
     /// (`ClientboundKey` statt `ClientboundHello`, siehe [`crate::net::crypto`]), und
     /// Verschlüsselung und Kompression werden erst mit `ApplyOptions`/`LoginFinished` scharf.
@@ -48,6 +51,8 @@ pub struct Protocol {
     /// Ab 26.1 steht in jedem Chunk-Abschnitt vor den Paletten **zweimal** ein Short
     /// (Block- und Flüssigkeitszähler), davor nur einmal.
     pub section_fluid_count: bool,
+    /// Ab 26.4 steht im Chunk ein Biom je Block statt je 4x4x4-Zelle.
+    pub block_biomes: bool,
     /// Feldreihenfolge im Team-Paket.
     pub team_layout: TeamLayout,
     /// Wie sich jede Gegenstands-Komponente überspringen lässt (siehe [`items`]).
@@ -278,8 +283,10 @@ const P1_8_9: Protocol = Protocol {
     legacy: true,
     modern: false,
     teleport_ack_position: false,
+    entity_steps: false,
     key_exchange: false,
     section_fluid_count: false,
+    block_biomes: false,
     team_layout: TeamLayout::V1_8,
     item_shapes: "",
     cb_level_chunk_bulk: 0x26,
@@ -346,8 +353,10 @@ const P1_21_1: Protocol = Protocol {
     legacy: false,
     modern: false,
     teleport_ack_position: false,
+    entity_steps: false,
     key_exchange: false,
     section_fluid_count: false,
+    block_biomes: false,
     team_layout: TeamLayout::Legacy,
     item_shapes: SHAPES_1_21_1,
     cb_level_chunk_bulk: -1,
@@ -360,8 +369,10 @@ const P1_21_11: Protocol = Protocol {
     legacy: false,
     modern: true,
     teleport_ack_position: false,
+    entity_steps: false,
     key_exchange: false,
     section_fluid_count: false,
+    block_biomes: false,
     team_layout: TeamLayout::VarIntRules,
     item_shapes: SHAPES_1_21_11,
     cb_level_chunk_bulk: -1,
@@ -374,8 +385,10 @@ const P26_1: Protocol = Protocol {
     legacy: false,
     modern: true,
     teleport_ack_position: false,
+    entity_steps: false,
     key_exchange: false,
     section_fluid_count: true,
+    block_biomes: false,
     team_layout: TeamLayout::VarIntRules,
     item_shapes: SHAPES_26_1,
     cb_level_chunk_bulk: -1,
@@ -388,8 +401,10 @@ const P26_2: Protocol = Protocol {
     legacy: false,
     modern: true,
     teleport_ack_position: false,
+    entity_steps: false,
     key_exchange: false,
     section_fluid_count: true,
+    block_biomes: false,
     team_layout: TeamLayout::Reordered,
     item_shapes: SHAPES_26_2,
     cb_level_chunk_bulk: -1,
@@ -402,8 +417,10 @@ const P26_3: Protocol = Protocol {
     legacy: false,
     modern: true,
     teleport_ack_position: true,
+    entity_steps: true,
     key_exchange: false,
     section_fluid_count: true,
+    block_biomes: false,
     team_layout: TeamLayout::Reordered,
     item_shapes: SHAPES_26_3,
     cb_level_chunk_bulk: -1,
@@ -418,8 +435,10 @@ const P26_4: Protocol = Protocol {
     legacy: false,
     modern: true,
     teleport_ack_position: true,
+    entity_steps: true,
     key_exchange: true,
     section_fluid_count: true,
+    block_biomes: true,
     team_layout: TeamLayout::Reordered,
     item_shapes: SHAPES_26_4,
     cb_level_chunk_bulk: -1,

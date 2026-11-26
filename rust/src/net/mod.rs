@@ -54,9 +54,9 @@ const MAX_PACKET_SIZE: usize = 32 * 1024 * 1024;
 /// neue Allokation. Sie wachsen dabei aber auf das **größte je gesehene** Paket und geben diesen
 /// Platz nie wieder her: Ein einzelner 8-MB-Chunk beim Beitritt hielt so für den Rest der Laufzeit
 /// 8 MB belegt, obwohl danach nur noch Chat mit ein paar Dutzend Byte kommt.
-const BUFFER_HIGH_WATER: usize = 1024 * 1024;
-/// So viel bleibt beim Einziehen stehen – genug für jedes gewöhnliche Paket.
-const BUFFER_KEEP: usize = 64 * 1024;
+const BUFFER_HIGH_WATER: usize = 128 * 1024;
+/// So viel bleibt beim Einziehen stehen – genug für Chat, Bewegung und die meisten Chunks.
+const BUFFER_KEEP: usize = 32 * 1024;
 
 /// Einen ausgeuferten Puffer wieder einziehen (siehe [`BUFFER_HIGH_WATER`]). Der Regelfall kostet
 /// genau einen Vergleich.
@@ -288,9 +288,9 @@ pub struct PacketWriter {
     stream: TcpStream,
     enc: Option<Cfb8>,
     threshold: i32,
-    /// Wiederverwendeter Deflate-Zustand. `reset()` behält Fenster und Tabellen; ein neuer
-    /// `ZlibEncoder` je Paket würde diese Arbeitsbereiche bei jedem großen Senden neu anlegen.
-    deflate: Compress,
+    /// Wiederverwendeter Deflate-Zustand, angelegt beim ersten Paket über der Schwelle. Seine
+    /// Tabellen belegen rund 240 kB, und die meisten Verbindungen senden nie ein so großes Paket.
+    deflate: Option<Box<Compress>>,
     /// Wiederverwendete Puffer für den Paketrahmen. Ohne sie legt **jedes** gesendete Paket zwei
     /// bis drei kurzlebige Vektoren an; bei zwanzig Positionspaketen je Sekunde (Bewegung,
     /// Anti-AFK) ist das reine Verwaltungsarbeit. Der Zugriff ist unkritisch: `send` läuft nur
@@ -344,12 +344,14 @@ impl PacketWriter {
             // Mit Kompression: VarInt „Länge im entpackten Zustand", dahinter der zlib-Strom.
             push_var_int(&mut self.body, payload.len() as i32);
             self.body.reserve(zlib_bound(payload.len()));
-            self.deflate.reset();
-            let status = self
+            let deflate = self
                 .deflate
+                .get_or_insert_with(|| Box::new(Compress::new(OUTGOING_COMPRESSION, true)));
+            deflate.reset();
+            let status = deflate
                 .compress_vec(payload, &mut self.body, FlushCompress::Finish)
                 .map_err(|e| err(&format!("zlib: {}", e)))?;
-            if status != Status::StreamEnd || self.deflate.total_in() != payload.len() as u64 {
+            if status != Status::StreamEnd || deflate.total_in() != payload.len() as u64 {
                 return Err(err("Ausgehender zlib-Strom blieb unvollstaendig"));
             }
             push_var_int(&mut self.frame, self.body.len() as i32);
@@ -421,7 +423,7 @@ pub fn connect(
             stream: write_half,
             enc: None,
             threshold: -1,
-            deflate: Compress::new(OUTGOING_COMPRESSION, true),
+            deflate: None,
             body: Vec::with_capacity(256),
             frame: Vec::with_capacity(256),
         },

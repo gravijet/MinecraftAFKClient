@@ -31,10 +31,14 @@ pub(crate) const MAX_SECTIONS: usize = 256;
 /// Ein Paletten-Index je Block, dicht gepackt. Nur Zweierpotenzen als Breite: Dann kostet ein
 /// Zugriff eine Verschiebung und eine Maske statt einer Division – der Strahl der Live-Ansicht
 /// liest pro Bild zehntausende Blöcke.
+///
+/// Ohne Wörter steht in jedem Block derselbe Index `fill` (reiner Stein, reines Wasser): Solche
+/// Abschnitte sind in der Standard-Bauform häufig und kosten so nichts statt 512 Byte.
 #[derive(Clone)]
 struct Packed {
     /// log2 der Bitbreite (0 = 1 Bit … 4 = 16 Bit).
     shift: u8,
+    fill: u16,
     words: Box<[u64]>,
 }
 
@@ -45,7 +49,16 @@ impl Packed {
         let per_word = 64 >> shift;
         Packed {
             shift,
+            fill: 0,
             words: vec![0u64; SECTION_BLOCKS / per_word].into_boxed_slice(),
+        }
+    }
+
+    fn uniform(slot: usize) -> Packed {
+        Packed {
+            shift: 0,
+            fill: slot as u16,
+            words: Box::new([]),
         }
     }
 
@@ -53,8 +66,11 @@ impl Packed {
         1 << self.shift
     }
 
+    /// Wie viele Paletteneinträge ohne Verbreitern Platz haben (einheitlich: keiner mehr).
     fn capacity(&self) -> usize {
-        if self.bits() >= 16 {
+        if self.words.is_empty() {
+            0
+        } else if self.bits() >= 16 {
             u16::MAX as usize + 1
         } else {
             1 << self.bits()
@@ -63,6 +79,9 @@ impl Packed {
 
     #[inline]
     fn get(&self, index: usize) -> usize {
+        if self.words.is_empty() {
+            return self.fill as usize;
+        }
         let bits = self.bits();
         let per_word_shift = 6 - self.shift;
         let word = self.words[index >> per_word_shift];
@@ -72,6 +91,12 @@ impl Packed {
 
     #[inline]
     fn set(&mut self, index: usize, value: usize) {
+        if self.words.is_empty() {
+            if value == self.fill as usize {
+                return;
+            }
+            *self = self.widened(value.max(self.fill as usize) + 1);
+        }
         let bits = self.bits();
         let per_word_shift = 6 - self.shift;
         let slot = &mut self.words[index >> per_word_shift];
@@ -201,7 +226,7 @@ impl Section {
         self.palette.get(self.data.get(index)).copied().unwrap_or(0)
     }
 
-    #[cfg(any(feature = "pov", test))]
+    #[cfg(feature = "pov")]
     #[inline]
     pub(crate) fn is_air(&self, index: usize) -> bool {
         self.data.get(index) == 0
@@ -209,8 +234,17 @@ impl Section {
 
     fn from_slots(palette: Vec<u32>, slots: impl Iterator<Item = usize>) -> Section {
         let mut data = Packed::for_palette(palette.len());
+        let (mut first, mut same, mut count) = (None, true, 0);
         for (index, slot) in slots.enumerate().take(SECTION_BLOCKS) {
             data.set(index, slot);
+            same &= *first.get_or_insert(slot) == slot;
+            count += 1;
+        }
+        // Fehlende Einträge bleiben Luft – einheitlich ist nur ein vollständiger Abschnitt.
+        match first {
+            None => data = Packed::uniform(0),
+            Some(slot) if same && count == SECTION_BLOCKS => data = Packed::uniform(slot),
+            _ => {}
         }
         Section {
             palette,
@@ -247,7 +281,14 @@ impl Section {
 
     /// Belegter Speicher in Byte (für die Selbstauskunft).
     pub(crate) fn bytes(&self) -> usize {
-        self.palette.capacity() * 4 + self.data.words.len() * 8
+        #[cfg(feature = "pov")]
+        let biomes = match self.biomes {
+            Biomes::Single(_) => 0,
+            Biomes::Cells(_) => SECTION_BIOMES * 2,
+        };
+        #[cfg(not(feature = "pov"))]
+        let biomes = 0;
+        self.palette.capacity() * 4 + self.data.words.len() * 8 + biomes
     }
 }
 
@@ -261,6 +302,19 @@ pub(crate) struct Format {
     pub(crate) modern_palette: bool,
     /// Zusätzlicher Flüssigkeitszähler je Abschnitt (ab 26.1).
     pub(crate) fluid_count: bool,
+    /// Biom je Block statt je 4x4x4-Zelle (ab 26.4): 4096 Einträge, Palette bis 8 Bit.
+    pub(crate) block_biomes: bool,
+}
+
+impl Format {
+    /// Einträge und größte indirekte Palettenbreite der Biome eines Abschnitts.
+    fn biome_layout(self) -> (usize, u8) {
+        if self.block_biomes {
+            (SECTION_BLOCKS, 8)
+        } else {
+            (SECTION_BIOMES, 3)
+        }
+    }
 }
 
 impl Format {
@@ -280,6 +334,7 @@ impl Format {
             Format {
                 modern_palette: !preferred.modern_palette,
                 fluid_count: !preferred.fluid_count,
+                ..preferred
             },
         ]
     }
@@ -372,7 +427,7 @@ impl Chunk {
     /// Direkter Blockzugriff ohne jeden Merker. Im laufenden Betrieb geht alles über [`Cursor`];
     /// diese beiden Wege bleiben als **Vergleichsmaßstab** für die Tests stehen – nur so lässt
     /// sich zeigen, dass der Merker wirklich nichts am Ergebnis ändert.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "pov"))]
     pub(crate) fn block(&self, x: i32, y: i32, z: i32) -> u32 {
         match self.section(y) {
             Some(section) => section.state(local_index(x, y, z)),
@@ -382,7 +437,7 @@ impl Chunk {
 
     /// `true`, wenn an der Stelle etwas Sichtbares steht. Billiger als [`Chunk::block`], weil die
     /// Palette dafür gar nicht angefasst werden muss.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "pov"))]
     pub(crate) fn solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.section(y)
             .is_some_and(|section| !section.is_air(local_index(x, y, z)))
@@ -434,7 +489,8 @@ pub(crate) fn read_section(
     // hat bisher 4096 Indizes ausgepackt und sofort wieder weggeworfen.
     if block_count == 0 {
         skip_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
-        skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
+        let (cells, bits) = format.biome_layout();
+        skip_palette(r, cells, bits, format.modern_palette)?;
         return Ok(None);
     }
 
@@ -442,9 +498,12 @@ pub(crate) fn read_section(
     // Biome stehen im selben Abschnitt, nur gröber aufgelöst: eine Nummer je 4x4x4 Zelle.
     // Aus ihr kommt die Einfärbung von Gras, Laub und Wasser (siehe [`crate::web::assets`]).
     #[cfg(feature = "pov")]
-    let biomes = read_biomes(r, format.modern_palette)?;
+    let biomes = read_biomes(r, format)?;
     #[cfg(not(feature = "pov"))]
-    skip_palette(r, SECTION_BIOMES, 3, format.modern_palette)?;
+    {
+        let (cells, bits) = format.biome_layout();
+        skip_palette(r, cells, bits, format.modern_palette)?;
+    }
 
     #[cfg_attr(not(feature = "pov"), allow(unused_mut))]
     Ok(
@@ -489,15 +548,24 @@ fn biome_index(x: i32, y: i32, z: i32) -> usize {
 }
 
 #[cfg(feature = "pov")]
-fn read_biomes(r: &mut Reader, modern: bool) -> io::Result<Biomes> {
-    let raw = read_palette(r, SECTION_BIOMES, 3, modern)?;
+fn read_biomes(r: &mut Reader, format: Format) -> io::Result<Biomes> {
+    let (size, bits) = format.biome_layout();
+    let raw = read_palette(r, size, bits, format.modern_palette)?;
     // Eine einwertige Palette ist der Normalfall; sie hier zusammenzufassen spart den Kasten.
     if raw.values.len() == 1 {
         return Ok(Biomes::Single(clamp_biome(raw.values[0])));
     }
     let mut cells = [0u16; SECTION_BIOMES];
-    for (cell, slot) in cells.iter_mut().zip(raw.indices) {
-        *cell = clamp_biome(raw.values.get(slot as usize).copied().unwrap_or(0));
+    for (cell, value) in cells.iter_mut().enumerate() {
+        // Ab 26.4 steht ein Biom je Block; für die Einfärbung reicht der Eckblock jeder Zelle.
+        let index = if format.block_biomes {
+            let (x, y, z) = (cell & 3, cell >> 4, (cell >> 2) & 3);
+            ((y * 4) << 8) | ((z * 4) << 4) | (x * 4)
+        } else {
+            cell
+        };
+        let slot = raw.indices.get(index).copied().unwrap_or(0);
+        *value = clamp_biome(raw.values.get(slot as usize).copied().unwrap_or(0));
     }
     Ok(Biomes::Cells(Box::new(cells)))
 }
@@ -877,6 +945,18 @@ impl World {
                 sections += 1;
                 bytes += section.bytes();
             }
+            #[cfg(feature = "pov")]
+            if let Some(light) = &chunk.light {
+                bytes += light
+                    .sky
+                    .iter()
+                    .chain(light.block.iter())
+                    .map(|part| match part {
+                        LightSection::Uniform(_) => 2,
+                        LightSection::Nibbles(_) => 2 + LIGHT_BYTES,
+                    })
+                    .sum::<usize>();
+            }
         }
         (self.chunks.len(), sections, bytes)
     }
@@ -1051,6 +1131,7 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
         let preferred = world.format.unwrap_or(Format {
             modern_palette: shared.proto.modern,
             fluid_count: shared.proto.section_fluid_count,
+            block_biomes: shared.proto.block_biomes,
         });
         (
             world.dimension.clone(),
@@ -1609,4 +1690,28 @@ fn unpack_section_pos(value: i64) -> (i32, i32, i32) {
     let y = (value << 44 >> 44) as i32;
     let z = (value << 22 >> 42) as i32;
     (x, y, z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn einheitlicher_abschnitt_kostet_keine_daten_und_bleibt_aenderbar() {
+        let mut section = Section::from_slots(vec![0, 7], std::iter::repeat_n(1, SECTION_BLOCKS));
+        assert!(section.data.words.is_empty());
+        assert_eq!(section.state(4095), 7);
+
+        // Ein einzelner Luftblock macht ihn wieder gepackt, der Rest bleibt erhalten.
+        section.set(5, 0);
+        assert_eq!(section.state(5), 0);
+        assert_eq!(section.state(6), 7);
+        section.set(9, 3);
+        assert_eq!((section.state(9), section.state(10)), (3, 7));
+
+        // Unvollständige Eingabe: Fehlendes ist Luft, nicht der erste Wert.
+        let short = Section::from_slots(vec![0, 7], std::iter::repeat_n(1, 10));
+        assert_eq!((short.state(9), short.state(10)), (7, 0));
+        assert_eq!(Section::empty().state(0), 0);
+    }
 }

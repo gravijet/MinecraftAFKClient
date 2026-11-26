@@ -87,30 +87,14 @@ jobs:
           platform='${{ matrix.platform }}'
           cargo build --locked --release
           cp "target/release/afk$ext" "../out/afk-$platform$ext"
-          cargo build --locked --release --features movement
-          cp "target/release/afk$ext" "../out/afk-$platform-move$ext"
-          cargo build --locked --release --features items
-          cp "target/release/afk$ext" "../out/items-afk-$platform$ext"
-          cargo build --locked --release --features web-menu
-          cp "target/release/afk$ext" "../out/items-web-afk-$platform$ext"
-          cargo build --locked --release --features premium
-          cp "target/release/afk$ext" "../out/premium-afk-$platform$ext"
-          cargo build --locked --release --features premium,items
-          cp "target/release/afk$ext" "../out/premium-items-afk-$platform$ext"
-          cargo build --locked --release --features pov-client
+          cargo build --locked --release --features pov
           cp "target/release/afk$ext" "../out/pov-afk-$platform$ext"
-          cargo build --locked --release --features ultra
-          cp "target/release/afk$ext" "../out/ultra-afk-$platform$ext"
 
       - name: Tests
         working-directory: rust
         run: |
           cargo test --locked --release
-          cargo test --locked --release --all-features
-          # `web-menu` eigens: `--all-features` schaltet zugleich `pov` ein, und dahinter tritt
-          # der eigene Ressourcen-Halter von `web-menu` zurueck (siehe pov_assets.rs). Ohne
-          # diesen Lauf bliebe der ganze Browser-Menue-Pfad ohne `pov` ungeprueft.
-          cargo test --locked --release --features web-menu
+          cargo test --locked --release --features pov
 
       - name: Hochladen
         shell: bash
@@ -118,7 +102,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          test "$(find out -maxdepth 1 -type f | wc -l)" -eq 8
+          test "$(find out -maxdepth 1 -type f | wc -l)" -eq 2
           gh release upload "$ENTWURF" out/* --clobber
 
   veroeffentlichen:
@@ -134,11 +118,7 @@ jobs:
           # Vor dem Entfernen des alten Releases die vollständige, exakte Dateiliste prüfen.
           expected=$(printf '%s\n' \
             RELEASE.md \
-            afk-linux afk-linux-move items-afk-linux items-web-afk-linux pov-afk-linux \
-            premium-afk-linux premium-items-afk-linux ultra-afk-linux \
-            afk-windows.exe afk-windows-move.exe items-afk-windows.exe items-web-afk-windows.exe \
-            pov-afk-windows.exe premium-afk-windows.exe premium-items-afk-windows.exe \
-            ultra-afk-windows.exe | sort)
+            afk-linux pov-afk-linux afk-windows.exe pov-afk-windows.exe | sort)
           actual=$(gh release view "$ENTWURF" --json assets --jq '.assets[].name' | sort)
           if [ "$actual" != "$expected" ]; then
             echo "Sammel-Release ist unvollständig:" >&2

@@ -532,7 +532,21 @@ fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
 
 fn read_move_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
-    let (dx, dy, dz) = if shared.proto.legacy {
+    let (dx, dy, dz) = if shared.proto.entity_steps {
+        // Ab 26.3: Eigenschaften (Boden | Schritte << 1), dann ein Delta oder mehrere
+        // Zwischenschritte (je Tickabstand + Delta). Die Summe ist die neue Position.
+        let steps = (r.var_int()? as u32 >> 1) as usize;
+        let mut sum = (0.0, 0.0, 0.0);
+        for _ in 0..steps.max(1) {
+            if steps > 0 {
+                r.var_int()?; // Ticks bis zu diesem Schritt
+            }
+            sum.0 += r.i16()? as f64 / 4096.0;
+            sum.1 += r.i16()? as f64 / 4096.0;
+            sum.2 += r.i16()? as f64 / 4096.0;
+        }
+        sum
+    } else if shared.proto.legacy {
         (
             r.i8()? as f64 / 32.0,
             r.i8()? as f64 / 32.0,
@@ -584,7 +598,27 @@ fn read_teleport_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> 
 
 fn read_entity_sync(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let id = r.var_int()?;
-    let (x, y, z) = (r.f64()?, r.f64()?, r.f64()?);
+    let (x, y, z) = if shared.proto.entity_steps {
+        // Ab 26.3 ein `PositionPath`: 0 = Endpunkt, 1 = Schritte (Punkt + Tick), dann ein Flag.
+        match r.var_int()? {
+            0 => (r.f64()?, r.f64()?, r.f64()?),
+            1 => {
+                let count = r.var_int()?;
+                if !(1..=64).contains(&count) {
+                    return Err(crate::protocol::buf::err("Positionspfad unplausibel"));
+                }
+                let mut last = (0.0, 0.0, 0.0);
+                for _ in 0..count {
+                    last = (r.f64()?, r.f64()?, r.f64()?);
+                    r.var_int()?;
+                }
+                last
+            }
+            _ => return Err(crate::protocol::buf::err("unbekannter Positionspfad")),
+        }
+    } else {
+        (r.f64()?, r.f64()?, r.f64()?)
+    };
     if let Some(entity) = shared.extras.pov.entities.lock().unwrap().map.get_mut(&id) {
         entity.x = x;
         entity.y = y;
@@ -1773,14 +1807,17 @@ mod tests {
     const LEGACY: Format = Format {
         modern_palette: false,
         fluid_count: false,
+        block_biomes: false,
     };
     const MODERN: Format = Format {
         modern_palette: true,
         fluid_count: false,
+        block_biomes: false,
     };
     const MODERN_FLUID: Format = Format {
         modern_palette: true,
         fluid_count: true,
+        block_biomes: false,
     };
 
     fn dimension(sections: i32) -> Dimension {

@@ -2257,4 +2257,3 @@ fn messlauf_wie_viele_chatzeilen_ankommen() {
     );
     let _ = child.kill();
 }
-

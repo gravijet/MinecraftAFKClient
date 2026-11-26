@@ -173,6 +173,11 @@ pub struct Shared {
     /// Der erste Teleport ist nicht nur gelesen, sondern bereits bestätigt und gespiegelt.
     /// Trennt diese kurze Phase von `in_game`, das schon mit dem Login-Paket wahr wird.
     position_ready: AtomicBool,
+    /// Ab 26.3: Teleport-Bestätigung für den nächsten Client-Tick. Der Vanilla-Client arbeitet
+    /// Pakete erst im nächsten Frame ab (`Minecraft.runTick` → `processQueuedPackets`); eine
+    /// sofortige Antwort traf den Server vor seinem ersten Spieler-Tick, wo
+    /// `handleAcceptTeleportPacket` noch gegen Position 0 rechnet („moved too quickly"-Schleife).
+    pending_accept: Mutex<Option<Writer>>,
     /// Bei modernen Protokollen ist auch der erste Chunk-Stapel vollständig empfangen und mit
     /// `PlayerLoaded` abgeschlossen. 1.21.1 kennt dieses Signal noch nicht.
     world_loaded: AtomicBool,
@@ -249,6 +254,7 @@ impl Client {
             idle: (Mutex::new(()), Condvar::new()),
             position: Mutex::new(None),
             position_ready: AtomicBool::new(false),
+            pending_accept: Mutex::new(None),
             world_loaded: AtomicBool::new(false),
             chunk_batch_done: AtomicBool::new(false),
             player_loaded_sent: AtomicBool::new(false),
@@ -356,13 +362,25 @@ impl Client {
         if matches!(verb, "world" | "welt") {
             let (chunks, sections, bytes) = self.shared.world.lock().unwrap().footprint();
             let dimension = self.shared.world.lock().unwrap().dimension.name.clone();
-            return self.shared.console.info(&format!(
+            self.shared.console.info(&format!(
                 "Welt {}: {} Chunks, {} gefüllte Abschnitte, {} kB",
                 dimension,
                 chunks,
                 sections,
                 bytes / 1024
             ));
+            #[cfg(feature = "pov")]
+            if let Some(assets) = self.shared.extras.pov.assets() {
+                let (textures, texture_bytes, materials, elements) = assets.footprint();
+                self.shared.console.info(&format!(
+                    "Texturen: {} geladen ({} kB), {} Materialien mit {} Flächen",
+                    textures,
+                    texture_bytes / 1024,
+                    materials,
+                    elements
+                ));
+            }
+            return;
         }
         if crate::extras::command(&self.shared, verb, arg) {
             return;
@@ -565,6 +583,7 @@ impl Shared {
     fn restart_world_load(&self, forget_position: bool) {
         if forget_position {
             self.position_ready.store(false, Ordering::SeqCst);
+            *self.pending_accept.lock().unwrap() = None;
         }
         self.world_loaded.store(false, Ordering::SeqCst);
         self.chunk_batch_done.store(false, Ordering::SeqCst);
@@ -844,6 +863,7 @@ fn net_loop(shared: Arc<Shared>) {
         shared.generation.fetch_add(1, Ordering::SeqCst);
         *shared.writer.lock().unwrap() = None;
         *shared.position.lock().unwrap() = None;
+        *shared.pending_accept.lock().unwrap() = None;
         // Wartende Befehls-Planer erkennen an der neuen Generation, dass sie fertig sind.
         shared.wake();
         shared.rules.reset();
@@ -1085,11 +1105,11 @@ fn run_connection(shared: &Arc<Shared>, after_transfer: bool) -> Result<(), Stri
 
 /// Der Client-Tick: derselbe 50-ms-Takt, in dem auch ein echter Client arbeitet.
 ///
-/// Drei Aufgaben, alle unmittelbar dem Vanilla-Client abgeschaut:
-/// * **Tick-Ende** – ab 1.21.2 schließt jeder Tick mit einem leeren Paket ab. Das ist kein
-///   KeepAlive-Ersatz, sondern die Protokollgrenze für die in diesem Tick empfangenen Eingaben.
-/// * **Positionserinnerung** – auch wer stillsteht, meldet alle 20 Ticks erneut seine Position
-///   (siehe [`position_heartbeat`]).
+/// Aufgaben, alle dem Vanilla-Client abgeschaut:
+/// * **Teleport-Bestätigung** ab 26.3 (siehe [`Shared::pending_accept`]).
+/// * **Physik und Bewegungspakete** ([`crate::physics::driver::tick`]), inklusive der
+///   Positionserinnerung alle 20 Ticks.
+/// * **Tick-Ende** – ab 1.21.2 schließt jeder Tick mit einem leeren Paket ab.
 /// * **Notbremse der Ladephase** – falls der Server nie einen Chunk-Stapel schickt.
 ///
 /// Der Thread lebt genau eine TCP-Verbindung lang (erkannt an der Generation) und taktet gegen
@@ -1125,6 +1145,7 @@ fn start_client_ticks(shared: &Arc<Shared>) -> Result<(), String> {
 fn client_tick(shared: &Arc<Shared>) {
     // Die Notbremse zuerst: ohne sie käme der Client auf einem Server ohne Chunks nie in die
     // Spielphase, und die beiden Pakete darunter gingen nie hinaus.
+    send_pending_accept(shared);
     finish_world_load(shared);
     if !shared.ready_for_gameplay() {
         return;
@@ -1133,6 +1154,17 @@ fn client_tick(shared: &Arc<Shared>) {
     if shared.proto.ids.sb_client_tick_end >= 0 {
         shared.send_empty(shared.proto.ids.sb_client_tick_end);
     }
+}
+
+/// Die aufgeschobene Teleport-Bestätigung senden (siehe [`Shared::pending_accept`]); erst
+/// danach gilt die Position als bestätigt.
+fn send_pending_accept(shared: &Arc<Shared>) {
+    let Some(accept) = shared.pending_accept.lock().unwrap().take() else {
+        return;
+    };
+    shared.send(accept);
+    shared.position_ready.store(true, Ordering::SeqCst);
+    shared.wake();
 }
 
 struct Session {
@@ -1849,7 +1881,11 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
         accept.f64(new.2);
         accept.f32(new.3);
         accept.f32(new.4);
-        shared.send(accept);
+        // Ein zweiter Teleport vor dem Tick ersetzt den ersten: Der Server wartet nur auf die
+        // jüngste Nummer. `position_ready` setzt erst `send_pending_accept`.
+        *shared.pending_accept.lock().unwrap() = Some(accept);
+        crate::extras::on_position(shared, previous_position.is_none());
+        return Ok(());
     } else {
         if id >= 0 {
             let mut accept = Writer::packet(ids.sb_accept_teleportation);

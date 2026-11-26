@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Baut alle acht Rust-Bauformen. Jede Datei spricht Minecraft 1.8.9, 1.21.1, 1.21.11,
-# 26.1 und 26.2.
+# Baut beide Bauformen: afk-linux (Standard) und pov-afk-linux (mit Live-Ansicht).
+# Jede Datei spricht Minecraft 1.8.9, 1.21.1, 1.21.11, 26.1, 26.2, 26.3 und 26.4.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,20 +22,8 @@ echo "Rust-Build ..."
     cd rust
     cargo build --locked --release
     publish "afk-linux"
-    cargo build --locked --release --features movement
-    publish "afk-linux-move"
-    cargo build --locked --release --features items
-    publish "items-afk-linux"
-    cargo build --locked --release --features web-menu
-    publish "items-web-afk-linux"
-    cargo build --locked --release --features premium
-    publish "premium-afk-linux"
-    cargo build --locked --release --features premium,items
-    publish "premium-items-afk-linux"
-    cargo build --locked --release --features pov-client
+    cargo build --locked --release --features pov
     publish "pov-afk-linux"
-    cargo build --locked --release --features ultra
-    publish "ultra-afk-linux"
 )
 
 echo

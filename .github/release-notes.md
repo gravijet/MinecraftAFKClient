@@ -1,5 +1,11 @@
-2.9.0 rebuilds the browser view and keeps proxy passwords out of the process list.
+3.0.0 adds Minecraft 26.3 and 26.4, real player physics and far lower memory use.
 
-Proxy: The client also reads the proxy address from the `AFK_PROXY` environment variable. Unlike `--proxy`, it is not visible to other local users through `ps` or `/proc/<pid>/cmdline`. An explicit `--proxy` takes precedence.
+Builds: There are now exactly two files per platform. `afk-*` is the standard client (chat, commands, macros, movement, scoreboard, menus, inventory, anti-AFK, browser menu); `pov-afk-*` adds the live view. The former slim, move, items, premium and ultra variants are gone; the panel unlocks features itself.
 
-Browser view: The live view and the browser menu now share one page. The GUI size fits the window, so wide screens like the beacon and the trader no longer extend past the edge on phones. Container slots sit exactly on the game texture. The loom shows its pattern slot, and crafting table and crafter slots appear in the correct order. On touch devices, a long press opens an item's details with left, right and shift click; previously Android could send an unintended right click. Keys 1 to 9 select the hotbar, and Esc or E closes the menu. Without textures, the view draws slots and item abbreviations instead of a blank screen. Connection loss, an expired token and a server that has not yet been joined each show a clear state. Rejected clicks appear as a message. The camera image follows the window's aspect ratio, pauses in hidden tabs and no longer leaks image memory. Minecraft 1.8.9 uses its own hotbar textures. `state.json` additionally reports `version`.
+Versions: Minecraft 26.3 and 26.4 (pre-release 1) are supported. 26.4 uses the new login encryption: X25519 key exchange, HKDF-SHA256, separate keys and IVs per direction and an integrity check, verified against Mojang's own classes. Packet ids for all modern versions are generated from Mojang's reports.
+
+Physics: The bot moves like a vanilla player. Gravity, ground friction per block, step height, jumping, sprinting, sneaking with edge protection, water, lava, ladders, cobwebs and slime are ported from the vanilla client, with collision shapes generated from the official server jar. Walking off an edge now falls instead of floating. `:go` presses keys and lets the physics move the player. Knockback and explosions push the bot as they would a real player.
+
+Memory: The world is kept bit-packed and textures load on demand. The live view build uses about 10 to 14 MB instead of over 100 MB; the standard client about 1.4 MB.
+
+Fixes: The code-of-conduct prompt is accepted once (MC-312695). On 26.3 and later the teleport confirmation is sent on the next client tick, as the vanilla client does; an immediate answer made 26.4 servers log "moved too quickly" in a loop at join.

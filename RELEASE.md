@@ -1,5 +1,10 @@
 # Builds
 
-Build all variants with `build-all.sh` or `build-all.ps1`. Output is generated under `dist/` and is excluded from Git.
+`build-all.sh` and `build-all.ps1` build both variants into `dist/` (excluded from Git):
 
-For a single variant, use `cargo build --release --features <feature>` in `rust/`. Keep authentication caches out of release archives.
+| File | Cargo |
+| --- | --- |
+| `afk-linux` / `afk-windows.exe` | `cargo build --release` |
+| `pov-afk-linux` / `pov-afk-windows.exe` | `cargo build --release --features pov` |
+
+Keep authentication caches out of release archives.

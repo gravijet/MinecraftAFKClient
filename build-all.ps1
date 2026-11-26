@@ -1,6 +1,7 @@
 <#
-    Baut alle acht Rust-Bauformen von AFKSystems und legt sie in dist\ ab.
-    Jede Datei unterstuetzt Minecraft 1.8.9, 1.21.1, 1.21.11, 26.1 und 26.2.
+    Baut beide Bauformen von AFKSystems und legt sie in dist\ ab:
+    afk-windows.exe (Standard) und pov-afk-windows.exe (mit Live-Ansicht).
+    Jede Datei spricht Minecraft 1.8.9, 1.21.1, 1.21.11, 26.1, 26.2, 26.3 und 26.4.
 
     Aufruf:  .\build-all.ps1
 #>
@@ -33,19 +34,8 @@ try {
     Invoke-Native { & cargo build --locked --release } "Rust-Build"
     Copy-Item 'target\release\afk.exe' (Join-Path $dist 'afk-windows.exe') -Force
 
-    $variants = @(
-        @{ Features = 'movement';      File = 'afk-windows-move.exe';          Label = 'Bewegung' },
-        @{ Features = 'items';         File = 'items-afk-windows.exe';          Label = 'Items' },
-        @{ Features = 'web-menu';      File = 'items-web-afk-windows.exe';     Label = 'Items + Browser-Menü' },
-        @{ Features = 'premium';       File = 'premium-afk-windows.exe';        Label = 'Premium' },
-        @{ Features = 'premium,items'; File = 'premium-items-afk-windows.exe'; Label = 'Premium + Items' },
-        @{ Features = 'pov-client';    File = 'pov-afk-windows.exe';            Label = 'POV' },
-        @{ Features = 'ultra';         File = 'ultra-afk-windows.exe';          Label = 'Ultra' }
-    )
-    foreach ($variant in $variants) {
-        Invoke-Native { & cargo build --locked --release --features $variant.Features } "Rust-Build $($variant.Label)"
-        Copy-Item 'target\release\afk.exe' (Join-Path $dist $variant.File) -Force
-    }
+    Invoke-Native { & cargo build --locked --release --features pov } "Rust-Build POV"
+    Copy-Item 'target\release\afk.exe' (Join-Path $dist 'pov-afk-windows.exe') -Force
 } finally {
     Pop-Location
 }
