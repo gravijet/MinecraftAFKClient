@@ -80,7 +80,7 @@ impl Class {
 
     /// Kollisionsboxen in Blockkoordinaten (0..1, Zäune bis 1,5).
     pub fn boxes(&self) -> impl Iterator<Item = Aabb> + '_ {
-        self.boxes.chunks_exact(BOX).map(|b| {
+        self.boxes.as_chunks::<BOX>().0.iter().map(|b| {
             let f = |i: usize| f32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as f64;
             Aabb {
                 min: [f(0), f(4), f(8)],
