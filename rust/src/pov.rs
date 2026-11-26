@@ -165,6 +165,15 @@ struct Scene {
     biome_tints: Arc<[BiomeTint]>,
 }
 
+impl Scene {
+    /// Nach dem Bild die Chunks loslassen. Behielte die Szene sie bis zum nächsten Bild, hielte
+    /// sie nach dem letzten Bild (Ansicht geschlossen) die längst entladenen Chunks und jeden
+    /// seither geänderten Abschnitt ein zweites Mal fest.
+    fn release(&mut self) {
+        self.chunks.clear();
+    }
+}
+
 /// Wiederverwendete Puffer des Zeichners.
 ///
 /// Ohne sie legt **jedes** Bild die Szene, den Bildpunktpuffer und die Ausgabezeichenkette neu
@@ -403,15 +412,11 @@ impl Pov {
     /// Chunks einlesen.
     fn fill_scene(&self, shared: &Shared, scene: &mut Scene) {
         let world = shared.world.lock().unwrap();
-        // Die Chunk-Tabelle nur kopieren, wenn sich seit dem letzten Bild wirklich etwas geändert
-        // hat. Ein stillstehender Bot bekommt minutenlang keinen neuen Chunk; die Tabelle mit
-        // ihren gut 170 Einträgen trotzdem achtmal je Sekunde neu aufzubauen (mit einem
-        // Arc-Zähler je Eintrag) war der teuerste Posten des Zeichners im Leerlauf.
+        // Die Tabelle gilt nur für dieses eine Bild (siehe [`Scene::release`]); sie zu füllen
+        // kostet je Chunk einen Arc-Zähler. Die Blockzustände werden nur bei Änderungen geprüft.
         let changed = scene.chunk_revision != world.revision;
-        if changed {
-            scene.chunks.clone_from(&world.chunks);
-            scene.chunk_revision = world.revision;
-        }
+        scene.chunks.clone_from(&world.chunks);
+        scene.chunk_revision = world.revision;
         drop(world);
         scene.entities.clear();
         scene
@@ -931,6 +936,7 @@ fn draw_once(shared: &Arc<Shared>, home: bool, force: bool) {
     } = &mut *scratch;
     pov.fill_scene(shared, scene);
     render_into(scene, position, width, height, color, pixels, frame);
+    scene.release();
 
     // Auch bei `force` mitrechnen: Sonst behielte der Merker den Stand von **vor** dem
     // erzwungenen Bild, und das nächste Bild der Live-Ansicht galt fälschlich als unverändert –
@@ -1215,6 +1221,7 @@ pub(crate) fn web_frame(
         } = &mut *scratch;
         shared.extras.pov.fill_scene(shared, scene);
         render_textured(scene, position, width, height, assets, pixels);
+        scene.release();
         web_rgba.clear();
         web_rgba.reserve(width * height * 4);
         for pixel in pixels {
