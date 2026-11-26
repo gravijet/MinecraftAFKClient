@@ -12,33 +12,23 @@
 mod antiafk;
 mod auth;
 mod board;
-mod buf;
 mod client;
-mod conn;
 mod console;
-mod dns;
 mod extras;
-mod item_names;
-mod items;
 mod menu;
 mod movement;
-mod nbt;
+mod net;
 mod options;
 #[cfg(feature = "pov")]
 mod pov;
-// `web-menu` liest dieselben JAR-Ressourcen und startet denselben Browser-Server wie die volle
-// Live-Ansicht – nur ohne `pov` (Chunks, Weltspeicher, Raycaster).
-mod pov_assets;
-mod pov_resources;
-mod pov_web;
-mod proto;
-mod proxy;
+mod protocol;
 mod rules;
+mod web;
 
 use crate::client::Client;
 use crate::console::Console;
 use crate::options::{Command, Options};
-use crate::proto::Protocol;
+use crate::protocol::Protocol;
 use std::path::Path;
 
 fn main() {
@@ -134,7 +124,7 @@ fn warn_about_unused_options(console: &Console, options: &Options) {
     if options.pov_size.is_some() || options.pov_autostart.is_some() || options.pov_fps.is_some() {
         console.warn("--pov/--pov-size/--pov-fps brauchen die POV-Datei; wird ignoriert.");
     }
-    if options.pov_resources != pov_resources::Source::Auto && options.pov_web.is_none() {
+    if options.pov_resources != web::resources::Source::Auto && options.pov_web.is_none() {
         console.warn("--pov-resources wird ohne --pov-web nicht geladen.");
     }
 }
@@ -289,7 +279,7 @@ fn print_usage() {
             "Minecraft-AFK-Client"
         },
         Protocol::names(),
-        proto::DEFAULT.name,
+        protocol::DEFAULT.name,
         options::DEFAULT_VIEW_DISTANCE,
         if cfg!(feature = "pov") {
             "\nLive-Ansicht:\n\

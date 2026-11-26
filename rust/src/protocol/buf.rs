@@ -157,7 +157,7 @@ impl<'a> Reader<'a> {
 
 /// VarInt an einen beliebigen Bytepuffer anhängen.
 ///
-/// Ausgelagert, weil der Rahmenbau in [`crate::conn`] dieselbe Kodierung braucht, dort aber
+/// Ausgelagert, weil der Rahmenbau in [`crate::net`] dieselbe Kodierung braucht, dort aber
 /// keinen ganzen [`Writer`] anlegen soll – der wäre je Paket eine weitere kurzlebige Allokation.
 pub fn push_var_int(out: &mut Vec<u8>, value: i32) {
     let mut v = value as u32;

@@ -9,21 +9,21 @@
 //! einer Verbindung ein Tick-End-Sender. Im Leerlauf blockieren sie – kein Polling, praktisch
 //! 0 % CPU.
 //!
-//! Die Protokollversion steckt in [`crate::proto::Protocol`] und kommt aus `--mc`; alle
-//! versionsabhängigen Stellen sind unten mit `proto.modern` bzw. über `proto.game` markiert.
+//! Die Protokollversion steckt in [`crate::protocol::Protocol`] und kommt aus `--mc`; alle
+//! versionsabhängigen Stellen sind unten mit `proto.modern` bzw. über `proto.ids` markiert.
 //!
 //! Nur im Build mit `--features movement` kommt [`crate::movement`] dazu: gesteuerte Bewegung auf
 //! Zuruf (`:go`, `:look`, `:home`). Ohne das Feature ist davon nichts einkompiliert.
 
 use crate::auth::{self, Account};
-use crate::buf::{Reader, Writer};
-use crate::conn::{self, PacketReader, PacketWriter};
 use crate::console::Console;
+use crate::net::{self, crypto, PacketReader, PacketWriter};
 use crate::options::Options;
-use crate::proto::CLIENT_COMMAND_RESPAWN;
-use crate::proto::{config as cfg, handshake, login, pack_status, In, Protocol, State};
+use crate::protocol::buf::{Reader, Writer};
+use crate::protocol::CLIENT_COMMAND_RESPAWN;
+use crate::protocol::{handshake, pack_status, ConfigIn, In, LoginIn, Protocol, State};
 use crate::rules::{Event, Rules};
-use crate::{dns, nbt};
+use crate::{net::dns, protocol::nbt};
 
 use rand::RngCore;
 use rsa::pkcs8::DecodePublicKey;
@@ -280,17 +280,17 @@ impl Client {
             crate::pov::start_assets(&shared);
         }
         // Wie oben, aber ohne den `pov`-Weltteil: derselbe Browser-Server, eigene Ressourcen-
-        // Ablage (siehe [`crate::pov_assets::WebAssets`]). Ohne `Pov` gibt es keinen
+        // Ablage (siehe [`crate::web::assets::WebAssets`]). Ohne `Pov` gibt es keinen
         // `web_running`-Merker – dieser Zweig läuft aber wie der obige genau einmal, beim
         // Anlegen des Clients.
         #[cfg(not(feature = "pov"))]
         {
             if let Some(address) = shared.options().pov_web {
-                if let Err(error) = crate::pov_web::start(&shared, address) {
+                if let Err(error) = crate::web::start(&shared, address) {
                     shared.console.error(&format!("Browser-Menü: {}", error));
                 }
             }
-            crate::pov_assets::load_for_web(&shared);
+            crate::web::assets::load_for_web(&shared);
         }
 
         for (name, task) in [("afk-net", true), ("afk-sender", false)] {
@@ -438,13 +438,13 @@ impl Shared {
         }
     }
 
-    /// Letztes Klartextpaket senden und im selben Zug auf Verschlüsselung umschalten.
+    /// Senden und danach den Schreiber umschalten (Verschlüsselung, Kompression).
     ///
     /// Beides muss unter **einer** Sperre passieren. Zwischen zwei getrennten Aufrufen könnte ein
-    /// anderer Thread ein Paket dazwischenschieben; das ginge dann unverschlüsselt hinaus,
-    /// während der Server bereits entschlüsselt – und die Verbindung wäre ohne erkennbaren Grund
-    /// weg.
-    fn send_and_encrypt(&self, packet: Writer, key: &[u8; 16]) {
+    /// anderer Thread ein Paket dazwischenschieben; das ginge dann im alten Zustand hinaus,
+    /// während der Server bereits umgeschaltet hat – und die Verbindung wäre ohne erkennbaren
+    /// Grund weg.
+    fn send_then(&self, packet: Writer, configure: impl FnOnce(&mut PacketWriter)) {
         let mut guard = self.writer.lock().unwrap();
         if let Some(writer) = guard.as_mut() {
             if writer.send(packet).is_err() {
@@ -452,7 +452,7 @@ impl Shared {
                 *guard = None;
                 return;
             }
-            writer.enable_encryption(key);
+            configure(writer);
         }
     }
 
@@ -728,7 +728,7 @@ fn sender_loop(shared: Arc<Shared>) {
             };
             match outgoing {
                 Outgoing::Command(command) => {
-                    let mut w = Writer::packet(shared.proto.game.sb_chat_command);
+                    let mut w = Writer::packet(shared.proto.ids.sb_chat_command);
                     if shared.proto.legacy {
                         w.string(&format!("/{}", command));
                     } else {
@@ -819,7 +819,7 @@ fn sanitize(input: &str, limit: usize) -> String {
 }
 
 fn chat_packet(shared: &Shared, message: &str, offset: u32) -> Writer {
-    let mut w = Writer::packet(shared.proto.game.sb_chat);
+    let mut w = Writer::packet(shared.proto.ids.sb_chat);
     w.string(message);
     if shared.proto.legacy {
         return w;
@@ -848,9 +848,12 @@ fn net_loop(shared: Arc<Shared>) {
     let mut transfers: u32 = 0;
     // Fehlversuche *in Folge* – ein erreichtes Spiel setzt sie zurück.
     let mut attempts: u32 = 0;
+    // Die nächste Verbindung folgt einem Transfer: Der Handshake meldet dann `TRANSFER` statt
+    // `LOGIN`, genau wie der Vanilla-Client (Server mit `accepts-transfers=false` lehnen ab).
+    let mut after_transfer = false;
     while shared.running.load(Ordering::Relaxed) {
         let started = Instant::now();
-        let result = run_connection(&shared);
+        let result = run_connection(&shared, after_transfer);
         let lasted = started.elapsed();
 
         shared.in_game.store(false, Ordering::SeqCst);
@@ -865,6 +868,7 @@ fn net_loop(shared: Arc<Shared>) {
         crate::extras::on_disconnect(&shared);
 
         let transferred = shared.intentional.swap(false, Ordering::SeqCst);
+        after_transfer = transferred;
         if !transferred {
             match &result {
                 Err(e) => {
@@ -977,7 +981,7 @@ fn backoff(policy: &crate::options::Reconnect, attempt: u32) -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
+fn run_connection(shared: &Arc<Shared>, after_transfer: bool) -> Result<(), String> {
     let (host, port, srv_allowed) = shared.target.lock().unwrap().clone();
 
     // SRV nur beim Standardport – exakt wie MCProtocolLib im Java-Client. Manche Server haben
@@ -1008,7 +1012,7 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     );
 
     let (mut reader, writer) =
-        conn::connect(&real_host, real_port, proxy).map_err(|e| e.to_string())?;
+        net::connect(&real_host, real_port, proxy).map_err(|e| e.to_string())?;
     *shared.writer.lock().unwrap() = Some(writer);
     start_client_ticks(shared)?;
     // Cookies werden hier bewusst **nicht** geleert.
@@ -1040,10 +1044,14 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
     intention.var_int(shared.proto.version);
     intention.string(&handshake_host);
     intention.u16(handshake_port);
-    intention.var_int(handshake::INTENT_LOGIN);
+    intention.var_int(if after_transfer && !shared.proto.legacy {
+        handshake::INTENT_TRANSFER
+    } else {
+        handshake::INTENT_LOGIN
+    });
     shared.send(intention);
 
-    let mut hello = Writer::packet(login::SB_HELLO);
+    let mut hello = Writer::packet(shared.proto.ids.login_sb_hello);
     hello.string(&username);
     if !shared.proto.legacy {
         hello.uuid(&profile_id);
@@ -1056,6 +1064,8 @@ fn run_connection(shared: &Arc<Shared>) -> Result<(), String> {
         dead: false,
         chunk_batch: ChunkBatch::new(),
         last_signature: None,
+        pending_keys: None,
+        pending_threshold: None,
     };
 
     let mut packet: Vec<u8> = Vec::with_capacity(1024);
@@ -1135,8 +1145,8 @@ fn client_tick(shared: &Arc<Shared>) {
         return;
     }
     position_heartbeat(shared);
-    if shared.proto.game.sb_client_tick_end >= 0 {
-        shared.send_empty(shared.proto.game.sb_client_tick_end);
+    if shared.proto.ids.sb_client_tick_end >= 0 {
+        shared.send_empty(shared.proto.ids.sb_client_tick_end);
     }
 }
 
@@ -1158,7 +1168,7 @@ fn position_heartbeat(shared: &Arc<Shared>) {
         return;
     };
     // Genau wie im Original: unveränderte Blickrichtung heißt das kurze Pos-Paket, nicht PosRot.
-    let mut w = Writer::packet(shared.proto.game.sb_move_player_pos);
+    let mut w = Writer::packet(shared.proto.ids.sb_move_player_pos);
     w.f64(x);
     w.f64(y);
     w.f64(z);
@@ -1180,9 +1190,17 @@ struct Session {
     /// Signatur der letzten gezählten Nachricht. Der Server zählt zwei gleiche Signaturen
     /// direkt hintereinander nur einmal – der Vanilla-Client macht es genauso.
     last_signature: Option<Box<[u8; 256]>>,
+    /// Ab 26.4: ausgehandelte Schlüssel, bis `ApplyOptions` sie scharf schaltet.
+    pending_keys: Option<crypto::SessionKeys>,
+    /// Ab 26.4: angekündigte Kompressionsschwelle, bis ein Options-Bit sie einschaltet.
+    pending_threshold: Option<i32>,
 }
 
 // ===================== Login-Phase =====================
+
+/// Bits in `ApplyOptions`/`LoginFinished` ab 26.4 (`ConnectionOptionsPacket`).
+const OPTION_ENCRYPTION: u8 = 1;
+const OPTION_COMPRESSION: u8 = 2;
 
 fn handle_login(
     shared: &Arc<Shared>,
@@ -1191,22 +1209,23 @@ fn handle_login(
     id: i32,
     r: &mut Reader,
 ) -> Result<bool, String> {
-    match id {
-        login::CB_HELLO => {
-            let server_id = r.string().map_err(|e| e.to_string())?;
-            let public_key = r.byte_array().map_err(|e| e.to_string())?;
-            let challenge = r.byte_array().map_err(|e| e.to_string())?;
+    let ids = &shared.proto.ids;
+    let err = |e: io::Error| e.to_string();
+    match shared.proto.login_incoming(id) {
+        // Bis 26.3: RSA-Schlüssel, eigener AES-Schlüssel, der zugleich IV beider Richtungen ist.
+        LoginIn::Hello => {
+            let server_id = r.string().map_err(err)?;
+            let public_key = r.byte_array().map_err(err)?;
+            let challenge = r.byte_array().map_err(err)?;
             let should_authenticate = r.bool().unwrap_or(true);
 
             let mut secret = [0u8; 16];
             rand::rngs::OsRng.fill_bytes(&mut secret);
-
             if should_authenticate {
                 let hash = auth::server_hash(&server_id, &secret, &public_key);
-                let ipv4 = reader.local_addr().map_err(|e| e.to_string())?.is_ipv4();
+                let ipv4 = reader.local_addr().map_err(err)?.is_ipv4();
                 shared.account.lock().unwrap().join_server(&hash, ipv4)?;
             }
-
             let key = RsaPublicKey::from_public_key_der(&public_key)
                 .map_err(|e| format!("Server-Schlüssel unlesbar: {}", e))?;
             let mut rng = rand::rngs::OsRng;
@@ -1216,32 +1235,83 @@ fn handle_login(
             let encrypted_challenge = key
                 .encrypt(&mut rng, Pkcs1v15Encrypt, &challenge)
                 .map_err(|e| e.to_string())?;
-
-            let mut w = Writer::packet(login::SB_KEY);
+            let mut w = Writer::packet(ids.login_sb_key);
             w.byte_array(&encrypted_secret);
             w.byte_array(&encrypted_challenge);
             // Ab jetzt ist alles verschlüsselt – Senden und Umschalten unter derselben Sperre.
-            shared.send_and_encrypt(w, &secret);
-            reader.enable_encryption(&secret);
+            shared.send_then(w, |writer| writer.enable_encryption(&secret, &secret));
+            reader.enable_encryption(&secret, &secret);
         }
-        login::CB_COMPRESSION => {
-            let threshold = r.var_int().map_err(|e| e.to_string())?;
-            reader.set_threshold(threshold);
-            if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
-                writer.set_threshold(threshold);
+        // Ab 26.4: X25519-Tausch. Verschlüsselt wird erst auf `ApplyOptions` hin.
+        LoginIn::Key => {
+            let salt = r.i64().map_err(err)?;
+            let server_id = r.string().map_err(err)?;
+            let server_key = r.byte_array().map_err(err)?;
+            let authenticate = r.bool().map_err(err)?;
+            let name = shared.account.lock().unwrap().name.clone();
+            let keys = crypto::exchange(&crypto::Offer {
+                salt,
+                server_id: &server_id,
+                server_key_der: &server_key,
+                authenticate,
+                client_name: &name,
+                protocol: shared.proto.version,
+            })?;
+            if authenticate {
+                let ipv4 = reader.local_addr().map_err(err)?.is_ipv4();
+                shared
+                    .account
+                    .lock()
+                    .unwrap()
+                    .join_server(&keys.auth_digest, ipv4)?;
+            }
+            let mut w = Writer::packet(ids.login_sb_key);
+            w.byte_array(&keys.client_key_der);
+            w.raw(&keys.signature);
+            shared.send(w);
+            session.pending_keys = Some(keys);
+        }
+        LoginIn::Compression => {
+            let threshold = r.var_int().map_err(err)?;
+            if shared.proto.key_exchange {
+                // Ab 26.4 gilt die Schwelle erst, wenn ein Options-Bit sie einschaltet.
+                session.pending_threshold = Some(threshold);
+            } else {
+                reader.set_threshold(threshold);
+                if let Some(writer) = shared.writer.lock().unwrap().as_mut() {
+                    writer.set_threshold(threshold);
+                }
             }
         }
-        login::CB_FINISHED => {
+        LoginIn::ApplyOptions => {
+            let options = r.u8().map_err(err)?;
+            let answer = Writer::packet(ids.login_sb_options_applied);
+            apply_connection_options(shared, session, reader, options, answer)?;
+        }
+        LoginIn::Finished => {
             if shared.proto.legacy {
                 // Protokoll 47 geht nach LoginSuccess unmittelbar in die Spielphase.
                 session.state = State::Game;
-            } else {
-                shared.send(Writer::packet(login::SB_ACKNOWLEDGED));
-                session.state = State::Configuration;
-                shared.send(client_information(shared, cfg::SB_CLIENT_INFORMATION));
+                return Ok(false);
             }
+            let answer = Writer::packet(ids.login_sb_acknowledged);
+            if shared.proto.key_exchange {
+                skip_game_profile(r).map_err(err)?;
+                r.uuid().map_err(err)?; // Sitzungs-ID des Servers (nur Telemetrie)
+                let options = r.u8().map_err(err)?;
+                apply_connection_options(shared, session, reader, options, answer)?;
+            } else {
+                shared.send(answer);
+            }
+            session.state = State::Configuration;
+            // Genau wie der Vanilla-Client: Kennung, (ab 26.4) leere Mod-Liste, Einstellungen.
+            shared.send(client_brand(shared.proto, ids.config_sb_custom_payload));
+            if shared.proto.key_exchange {
+                shared.send(empty_mod_list(ids.config_sb_custom_payload));
+            }
+            shared.send(client_information(shared, ids.config_sb_client_information));
         }
-        login::CB_DISCONNECT => {
+        LoginIn::Disconnect => {
             // In der Login-Phase kommt der Grund noch als JSON-Text, nicht als NBT.
             let reason = match r.string() {
                 Ok(json) => nbt::render_json(&json, shared.console.fmt()),
@@ -1249,26 +1319,96 @@ fn handle_login(
             };
             return Err(reason);
         }
-        login::CB_CUSTOM_QUERY => {
-            let transaction = r.var_int().map_err(|e| e.to_string())?;
-            let mut w = Writer::packet(login::SB_CUSTOM_QUERY_ANSWER);
+        LoginIn::CustomQuery => {
+            let transaction = r.var_int().map_err(err)?;
+            let mut w = Writer::packet(ids.login_sb_custom_query_answer);
             w.var_int(transaction);
             w.bool(false); // wir verstehen die Anfrage nicht -> leere Antwort
             shared.send(w);
         }
-        login::CB_COOKIE_REQUEST => {
-            let key = r.string().map_err(|e| e.to_string())?;
-            shared.send(cookie_response(shared, login::SB_COOKIE_RESPONSE, &key));
+        LoginIn::CookieRequest => {
+            let key = r.string().map_err(err)?;
+            shared.send(cookie_response(shared, ids.login_sb_cookie_response, &key));
         }
-        _ => {}
+        LoginIn::Ignored => {}
     }
     Ok(false)
 }
 
+/// `ClientHandshakePacketListenerImpl.applyConnectionOptions` (26.4): eingehend umschalten,
+/// Antwort noch im alten Zustand senden, dann ausgehend umschalten.
+fn apply_connection_options(
+    shared: &Arc<Shared>,
+    session: &mut Session,
+    reader: &mut PacketReader,
+    options: u8,
+    answer: Writer,
+) -> Result<(), String> {
+    let keys = if options & OPTION_ENCRYPTION != 0 {
+        Some(
+            session
+                .pending_keys
+                .take()
+                .ok_or("Server schaltet Verschlüsselung ohne Schlüsseltausch ein")?,
+        )
+    } else {
+        None
+    };
+    let threshold = if options & OPTION_COMPRESSION != 0 {
+        Some(
+            session
+                .pending_threshold
+                .ok_or("Server schaltet Kompression ohne Schwelle ein")?,
+        )
+    } else {
+        None
+    };
+    if let Some(keys) = &keys {
+        reader.enable_encryption(&keys.inbound_key, &keys.inbound_iv);
+    }
+    if let Some(threshold) = threshold {
+        reader.set_threshold(threshold);
+    }
+    shared.send_then(answer, |writer| {
+        if let Some(keys) = &keys {
+            writer.enable_encryption(&keys.outbound_key, &keys.outbound_iv);
+        }
+        if let Some(threshold) = threshold {
+            writer.set_threshold(threshold);
+        }
+    });
+    Ok(())
+}
+
+/// `ByteBufCodecs.GAME_PROFILE`: UUID, Name, Eigenschaften (Name, Wert, optionale Signatur).
+fn skip_game_profile(r: &mut Reader) -> io::Result<()> {
+    r.uuid()?;
+    r.string()?;
+    let properties = r.var_int()?;
+    if !(0..=16).contains(&properties) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zu viele Profil-Eigenschaften",
+        ));
+    }
+    for _ in 0..properties {
+        r.string()?;
+        r.string()?;
+        if r.bool()? {
+            r.string()?;
+        }
+    }
+    Ok(())
+}
+
 // ===================== Konfigurations-Phase =====================
-//
-// Die IDs dieser Phase sind in allen unterstützten Versionen gleich; nur den Verhaltenskodex
-// gibt es erst ab 1.21.11 (in 1.21.1 hat die Phase so viele Pakete gar nicht).
+
+/// So lange wartet die Bestätigung des Verhaltenskodex. Ein Mensch liest ihn erst; ein Client,
+/// der in derselben Millisekunde antwortet, trifft auf Servern bis 26.3 ein Wettrennen im
+/// Server (MC-312695: `handleAcceptCodeOfConduct` lief dort ohne Wechsel auf den
+/// Hauptthread und konnte den Server abstürzen lassen). Mit Abstand ist die Aufgabe des
+/// Servers sicher angelaufen, bevor die Antwort ankommt.
+const CODE_OF_CONDUCT_DELAY: Duration = Duration::from_millis(1500);
 
 fn handle_config(
     shared: &Arc<Shared>,
@@ -1276,49 +1416,70 @@ fn handle_config(
     id: i32,
     r: &mut Reader,
 ) -> Result<bool, String> {
-    match id {
-        cfg::CB_KEEP_ALIVE => {
-            let ping = r.i64().map_err(|e| e.to_string())?;
-            let mut w = Writer::packet(cfg::SB_KEEP_ALIVE);
+    let ids = &shared.proto.ids;
+    let err = |e: io::Error| e.to_string();
+    match shared.proto.config_incoming(id) {
+        ConfigIn::KeepAlive => {
+            let ping = r.i64().map_err(err)?;
+            let mut w = Writer::packet(ids.config_sb_keep_alive);
             w.i64(ping);
             shared.send(w);
         }
-        cfg::CB_PING => {
-            let ping = r.i32().map_err(|e| e.to_string())?;
-            let mut w = Writer::packet(cfg::SB_PONG);
+        ConfigIn::Ping => {
+            let ping = r.i32().map_err(err)?;
+            let mut w = Writer::packet(ids.config_sb_pong);
             w.i32(ping);
             shared.send(w);
         }
-        cfg::CB_FINISH => {
-            shared.send(Writer::packet(cfg::SB_FINISH));
+        ConfigIn::Finish => {
+            shared.send(Writer::packet(ids.config_sb_finish));
             session.state = State::Game;
         }
-        cfg::CB_SELECT_KNOWN_PACKS => {
+        ConfigIn::SelectKnownPacks => {
             // Wir kennen keine Packs -> leere Liste. Der Server schickt daraufhin alle
-            // Registry-Daten selbst (die wir ohnehin nur überspringen).
-            let mut w = Writer::packet(cfg::SB_SELECT_KNOWN_PACKS);
+            // Registry-Daten selbst.
+            let mut w = Writer::packet(ids.config_sb_select_known_packs);
             w.var_int(0);
             shared.send(w);
         }
-        cfg::CB_CODE_OF_CONDUCT if shared.proto.modern => {
-            // Ab 1.21.11: ohne Bestätigung lässt der Server niemanden ins Spiel.
-            shared.send(Writer::packet(cfg::SB_ACCEPT_CODE_OF_CONDUCT));
+        ConfigIn::CodeOfConduct => accept_code_of_conduct(shared),
+        ConfigIn::RegistryData => crate::extras::registry(shared, r),
+        ConfigIn::ResourcePackPush => {
+            let pack = r.uuid().map_err(err)?;
+            acknowledge_resource_pack(shared, ids.config_sb_resource_pack, &pack);
         }
-        cfg::CB_REGISTRY_DATA => crate::extras::registry(shared, r),
-        cfg::CB_RESOURCE_PACK_PUSH => {
-            let pack = r.uuid().map_err(|e| e.to_string())?;
-            acknowledge_resource_pack(shared, cfg::SB_RESOURCE_PACK, &pack);
+        ConfigIn::StoreCookie => store_cookie(shared, r)?,
+        ConfigIn::CookieRequest => {
+            let key = r.string().map_err(err)?;
+            shared.send(cookie_response(shared, ids.config_sb_cookie_response, &key));
         }
-        cfg::CB_STORE_COOKIE => store_cookie(shared, r)?,
-        cfg::CB_COOKIE_REQUEST => {
-            let key = r.string().map_err(|e| e.to_string())?;
-            shared.send(cookie_response(shared, cfg::SB_COOKIE_RESPONSE, &key));
-        }
-        cfg::CB_TRANSFER => return transfer(shared, r),
-        cfg::CB_DISCONNECT => return Err(disconnect_reason(shared, r)),
-        _ => {}
+        ConfigIn::Transfer => return transfer(shared, r),
+        ConfigIn::Disconnect => return Err(disconnect_reason(shared, r)),
+        ConfigIn::Ignored => {}
     }
     Ok(false)
+}
+
+/// Den Verhaltenskodex bestätigen – genau einmal je Anfrage, mit Abstand (siehe
+/// [`CODE_OF_CONDUCT_DELAY`]) und nur, solange dieselbe Verbindung noch besteht.
+fn accept_code_of_conduct(shared: &Arc<Shared>) {
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let owned = Arc::clone(shared);
+    let spawned = thread::Builder::new()
+        .name("afk-conduct".into())
+        .spawn(move || {
+            if owned.wait(CODE_OF_CONDUCT_DELAY, generation) && owned.valid(generation) {
+                owned.send(Writer::packet(
+                    owned.proto.ids.config_sb_accept_code_of_conduct,
+                ));
+            }
+        });
+    if spawned.is_err() {
+        // Ohne Thread lieber sofort bestätigen als gar nicht – sonst kommt niemand ins Spiel.
+        shared.send(Writer::packet(
+            shared.proto.ids.config_sb_accept_code_of_conduct,
+        ));
+    }
 }
 
 // ===================== Spiel-Phase =====================
@@ -1329,7 +1490,7 @@ fn handle_game(
     id: i32,
     r: &mut Reader,
 ) -> Result<bool, String> {
-    let game = &shared.proto.game;
+    let game = &shared.proto.ids;
     match shared.proto.incoming(id) {
         // KeepAlive zuerst und sofort beantworten – das ist der eigentliche Schutz gegen
         // disconnect.timeout. Alles andere (Anzeige o. Ä.) kommt danach.
@@ -1493,11 +1654,18 @@ fn on_join(shared: &Arc<Shared>, session: &mut Session, first_join: bool) {
     session.dead = false;
     session.last_signature = None;
 
-    shared.send(client_information(
-        shared,
-        shared.proto.game.sb_client_information,
-    ));
-    shared.send(client_brand(shared.proto));
+    // Moderne Clients haben Einstellungen und Kennung schon in der Konfigurationsphase gemeldet;
+    // 1.8.9 kennt sie nicht und schickt beides nach `JoinGame` (`NetHandlerPlayClient`).
+    if shared.proto.legacy {
+        shared.send(client_information(
+            shared,
+            shared.proto.ids.sb_client_information,
+        ));
+        shared.send(client_brand(
+            shared.proto,
+            shared.proto.ids.sb_custom_payload,
+        ));
+    }
 
     if first_join {
         let name = shared.account.lock().unwrap().name.clone();
@@ -1667,24 +1835,34 @@ fn handle_position(shared: &Arc<Shared>, r: &mut Reader) -> Result<(), String> {
     );
     shared.set_position(new);
 
-    // Teleport bestätigen (Pflicht, sonst Rubberband/Kick) und die vorgegebene Position EINMAL
-    // zurückspiegeln – das ist die Antwort auf den Teleport, keine Eigenbewegung.
-    if id >= 0 {
-        let mut accept = Writer::packet(shared.proto.game.sb_accept_teleportation);
+    // Teleport bestätigen (Pflicht, sonst Rubberband/Kick). Ab 26.3 trägt die Bestätigung die
+    // übernommene Position selbst; davor spiegelt der Vanilla-Client sie mit einem eigenen
+    // `MovePlayer.PosRot` zurück – mit „nicht am Boden" und ohne Wandkontakt (Flags 0).
+    let ids = &shared.proto.ids;
+    if shared.proto.teleport_ack_position {
+        let mut accept = Writer::packet(ids.sb_accept_teleportation);
         accept.var_int(id);
+        accept.f64(new.0);
+        accept.f64(new.1);
+        accept.f64(new.2);
+        accept.f32(new.3);
+        accept.f32(new.4);
         shared.send(accept);
+    } else {
+        if id >= 0 {
+            let mut accept = Writer::packet(ids.sb_accept_teleportation);
+            accept.var_int(id);
+            shared.send(accept);
+        }
+        let mut echo = Writer::packet(ids.sb_move_player_pos_rot);
+        echo.f64(new.0);
+        echo.f64(new.1);
+        echo.f64(new.2);
+        echo.f32(new.3);
+        echo.f32(new.4);
+        echo.u8(0);
+        shared.send(echo);
     }
-
-    // Das Bewegungspaket ist in allen unterstützten Versionen bytegleich: ab 1.21.4 steht dort
-    // ein Flag-Byte statt des alten `onGround`-Bool – 0x01 bedeutet in beiden „am Boden".
-    let mut move_packet = Writer::packet(shared.proto.game.sb_move_player_pos_rot);
-    move_packet.f64(new.0);
-    move_packet.f64(new.1);
-    move_packet.f64(new.2);
-    move_packet.f32(new.3);
-    move_packet.f32(new.4);
-    move_packet.u8(0x01);
-    shared.send(move_packet);
     shared.mark_position_sent();
     shared.position_ready.store(true, Ordering::SeqCst);
     shared.wake();
@@ -1720,7 +1898,8 @@ fn sane(new: Position, previous: Position) -> Position {
         coordinate(new.1, previous.1),
         coordinate(new.2, previous.2),
         angle(new.3, previous.3),
-        angle(new.4, previous.4),
+        // `PositionMoveRotation.calculateAbsolute` begrenzt die Neigung genauso.
+        angle(new.4, previous.4).clamp(-90.0, 90.0),
     )
 }
 
@@ -1853,7 +2032,7 @@ fn finish_world_load(shared: &Arc<Shared>) {
     if !shared.in_game.load(Ordering::SeqCst) || !shared.position_ready.load(Ordering::SeqCst) {
         return;
     }
-    let packet = shared.proto.game.sb_player_loaded;
+    let packet = shared.proto.ids.sb_player_loaded;
     if packet >= 0
         && !shared.chunk_batch_done.load(Ordering::SeqCst)
         && !shared.world_load_overdue()
@@ -1883,7 +2062,7 @@ fn finish_world_load(shared: &Arc<Shared>) {
 /// schicken – siehe [`ChunkBatch`].
 fn acknowledge_chunk_batch(shared: &Arc<Shared>, session: &mut Session, size: i32) {
     session.chunk_batch.finish(size);
-    let mut w = Writer::packet(shared.proto.game.sb_chunk_batch_received);
+    let mut w = Writer::packet(shared.proto.ids.sb_chunk_batch_received);
     w.f32(session.chunk_batch.desired_chunks_per_tick());
     shared.send(w);
     shared.chunk_batch_done.store(true, Ordering::SeqCst);
@@ -1895,7 +2074,7 @@ fn maybe_acknowledge(shared: &Arc<Shared>) {
     if shared.unacked.load(Ordering::Relaxed) >= ACK_THRESHOLD {
         let offset = shared.unacked.swap(0, Ordering::Relaxed);
         if offset > 0 {
-            let mut w = Writer::packet(shared.proto.game.sb_chat_ack);
+            let mut w = Writer::packet(shared.proto.ids.sb_chat_ack);
             w.var_int(offset as i32);
             shared.send(w);
         }
@@ -1932,20 +2111,26 @@ fn client_information(shared: &Shared, packet_id: i32) -> Writer {
     w
 }
 
-/// Vanilla-Client-Brand zum Spielbeitritt.
+/// Client-Kennung (`minecraft:brand`, in 1.8.9 `MC|Brand`).
 ///
-/// Das Paket besteht ausschließlich aus der Resource-Location des Common-Custom-Payloads und
-/// dessen String-Nutzlast. Es wird pro Spielbeitritt genau einmal direkt nach
-/// `ClientInformation` gesendet – auch bei einem Unterserver-Wechsel, bei dem der Server ein
-/// neues Login-Paket ausliefert.
-fn client_brand(protocol: &Protocol) -> Writer {
-    let mut w = Writer::packet(protocol.game.sb_custom_payload);
+/// Moderne Clients schicken sie einmal in der Konfigurationsphase direkt nach dem Login, 1.8.9
+/// nach dem Beitritt. `packet_id` ist die Custom-Payload-ID der jeweiligen Phase.
+fn client_brand(protocol: &Protocol, packet_id: i32) -> Writer {
+    let mut w = Writer::packet(packet_id);
     w.string(if protocol.legacy {
         "MC|Brand"
     } else {
         BRAND_CHANNEL
     });
     w.string(&format!("{} {}", BRAND_PREFIX, protocol.name));
+    w
+}
+
+/// Ab 26.4 meldet der Vanilla-Client nach der Kennung seine (leere) Mod-Liste.
+fn empty_mod_list(packet_id: i32) -> Writer {
+    let mut w = Writer::packet(packet_id);
+    w.string("minecraft:mod_list");
+    w.var_int(0);
     w
 }
 
@@ -2396,158 +2581,29 @@ mod tests {
         }
     }
 
-    /// Die Paket-IDs jeder Version müssen sich eindeutig zuordnen lassen – ein Tippfehler in der
-    /// Tabelle (zwei gleiche IDs) würde sonst still das falsche Paket verarbeiten.
+    /// Jede ausgewertete Spielphasen-ID muss sich eindeutig zurück auf ihre Paketart abbilden –
+    /// zwei gleiche IDs würden still das falsche Paket verarbeiten.
     #[test]
     fn paket_ids_sind_je_version_eindeutig() {
-        for p in crate::proto::PROTOCOLS {
-            let g = &p.game;
-            #[allow(unused_mut)]
-            let mut ids = vec![
-                g.cb_chunk_batch_finished,
-                g.cb_chunk_batch_start,
-                g.cb_cookie_request,
-                g.cb_disconnect,
-                g.cb_keep_alive,
-                g.cb_login,
-                g.cb_ping,
-                g.cb_player_chat,
-                g.cb_player_position,
-                g.cb_resource_pack_push,
-                g.cb_respawn,
-                g.cb_set_health,
-                g.cb_start_configuration,
-                g.cb_store_cookie,
-                g.cb_system_chat,
-                g.cb_transfer,
-            ];
-            // Zusatz-IDs müssen sich in dieselbe Menge einreihen: eine Überschneidung mit einem
-            // der obigen Pakete würde still das falsche Paket verarbeiten.
-            {
-                let e = &p.extra;
-                let _ = e;
-                ids.extend_from_slice(&[
-                    e.cb_container_close,
-                    e.cb_container_set_content,
-                    e.cb_container_set_slot,
-                    e.cb_open_screen,
-                ]);
-                ids.extend_from_slice(&[
-                    e.cb_reset_score,
-                    e.cb_set_display_objective,
-                    e.cb_set_objective,
-                    e.cb_set_player_team,
-                    e.cb_set_score,
-                ]);
-                #[cfg(feature = "pov")]
-                ids.extend_from_slice(&[
-                    e.cb_level_chunk,
-                    e.cb_level_chunk_bulk,
-                    e.cb_forget_level_chunk,
-                    e.cb_block_update,
-                    e.cb_section_blocks_update,
-                    e.cb_add_entity,
-                    e.cb_remove_entities,
-                    e.cb_move_entity_pos,
-                    e.cb_move_entity_pos_rot,
-                    e.cb_teleport_entity,
-                ]);
-            }
-            ids.retain(|id| *id >= 0);
-            for (i, a) in ids.iter().enumerate() {
-                for b in &ids[i + 1..] {
-                    assert_ne!(a, b, "doppelte Paket-ID in {}", p.name);
+        for p in crate::protocol::PROTOCOLS {
+            let mut seen = std::collections::HashMap::new();
+            for id in 0..256 {
+                let kind = p.incoming(id);
+                if kind == In::Ignored {
+                    continue;
                 }
-                assert_ne!(p.incoming(*a), In::Ignored, "unbekannte ID in {}", p.name);
-            }
-        }
-    }
-
-    #[test]
-    fn ausgehende_tick_und_bewegungs_ids_folgen_dem_codec() {
-        for protocol in crate::proto::PROTOCOLS {
-            let game = &protocol.game;
-            if protocol.modern {
-                assert_eq!(game.sb_client_tick_end, game.sb_client_command + 1);
-                assert_eq!(game.sb_client_information, game.sb_client_tick_end + 1);
-            } else {
-                assert_eq!(game.sb_client_tick_end, -1);
-            }
-            {
-                if protocol.legacy {
-                    assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos + 1);
-                    assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_rot + 1);
-                } else {
-                    assert_eq!(game.sb_move_player_pos_rot, game.sb_move_player_pos + 1);
-                    assert_eq!(game.sb_move_player_rot, game.sb_move_player_pos_rot + 1);
+                if let Some(other) = seen.insert(kind, id) {
+                    panic!("{}: {:?} unter {} und {}", p.name, kind, other, id);
                 }
             }
-            if !protocol.legacy {
-                assert_eq!(game.sb_custom_payload, game.sb_cookie_response + 1);
+            for required in [In::KeepAlive, In::Login, In::Position, In::Disconnect] {
+                assert!(
+                    seen.contains_key(&required),
+                    "{}: {:?} fehlt",
+                    p.name,
+                    required
+                );
             }
-        }
-    }
-
-    /// Dieselbe Ableitung für das Lichtpaket: Nach Registry-Namen sortiert liegen zwischen
-    /// `level_chunk_with_light` und `login` genau `level_event`, `level_particles` und
-    /// `light_update`. Beide Beziehungen gelten in allen vier Tabellen – wäre eine der IDs
-    /// geraten, träfe höchstens eine davon zu.
-    #[cfg(feature = "pov")]
-    #[test]
-    fn licht_id_liegt_vor_dem_login() {
-        for protocol in crate::proto::PROTOCOLS {
-            if protocol.legacy {
-                continue;
-            }
-            assert_eq!(
-                protocol.extra.cb_light_update,
-                protocol.game.cb_login - 1,
-                "{}: light_update steht unmittelbar vor login",
-                protocol.name
-            );
-            assert_eq!(
-                protocol.extra.cb_light_update,
-                protocol.extra.cb_level_chunk + 3,
-                "{}: zwischen level_chunk_with_light und light_update liegen zwei Pakete",
-                protocol.name
-            );
-            assert_eq!(
-                protocol.incoming(protocol.extra.cb_light_update),
-                In::LightUpdate,
-                "{}",
-                protocol.name
-            );
-        }
-    }
-
-    /// Die Pakete der Spielphase sind nach ihrem Registry-Namen registriert, und
-    /// `chunk_batch_finished` steht direkt vor `chunk_batch_start`. Damit ist die ID des
-    /// Start-Pakets keine Annahme, sondern ableitbar – und dieser Test hält die Ableitung fest,
-    /// falls jemand eine der beiden Tabellenzeilen anfasst.
-    #[test]
-    fn chunk_stapel_ids_liegen_nebeneinander() {
-        for protocol in crate::proto::PROTOCOLS {
-            if protocol.legacy {
-                continue;
-            }
-            assert_eq!(
-                protocol.game.cb_chunk_batch_start,
-                protocol.game.cb_chunk_batch_finished + 1,
-                "{}",
-                protocol.name
-            );
-            assert_eq!(
-                protocol.incoming(protocol.game.cb_chunk_batch_start),
-                In::ChunkBatchStart,
-                "{}",
-                protocol.name
-            );
-            assert_eq!(
-                protocol.incoming(protocol.game.cb_chunk_batch_finished),
-                In::ChunkBatchFinished,
-                "{}",
-                protocol.name
-            );
         }
     }
 
@@ -2591,10 +2647,10 @@ mod tests {
 
     #[test]
     fn client_brand_hat_exakt_den_vanilla_payload_aufbau() {
-        for protocol in crate::proto::PROTOCOLS {
-            let packet = client_brand(protocol);
+        for protocol in crate::protocol::PROTOCOLS {
+            let packet = client_brand(protocol, protocol.ids.sb_custom_payload);
             let mut r = Reader::new(&packet.data);
-            assert_eq!(r.var_int().unwrap(), protocol.game.sb_custom_payload);
+            assert_eq!(r.var_int().unwrap(), protocol.ids.sb_custom_payload);
             assert_eq!(
                 r.string().unwrap(),
                 if protocol.legacy {

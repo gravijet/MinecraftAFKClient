@@ -29,13 +29,13 @@
 //! Bildzeile. Das Format ist Teil der Schnittstelle nach außen – ein Panel liest es mit –, es
 //! wird deshalb nicht ohne Not geändert.
 
-use crate::buf::Reader;
 use crate::client::Shared;
-use crate::nbt::Nbt;
 use crate::options::Options;
-use crate::pov_assets::Assets;
-use crate::pov_assets::BiomeTint;
-use crate::proto::In;
+use crate::protocol::buf::Reader;
+use crate::protocol::nbt::Nbt;
+use crate::protocol::In;
+use crate::web::assets::Assets;
+use crate::web::assets::BiomeTint;
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -295,7 +295,7 @@ impl Format {
             }
         }
         fallback.ok_or_else(|| {
-            first_error.unwrap_or_else(|| crate::buf::err("POV: Chunk nicht lesbar"))
+            first_error.unwrap_or_else(|| crate::protocol::buf::err("POV: Chunk nicht lesbar"))
         })
     }
 }
@@ -324,12 +324,12 @@ impl Chunk {
         let mut sections = Vec::with_capacity(dimension.section_count());
         while r.remaining() > 0 {
             if sections.len() >= MAX_SECTIONS {
-                return Err(crate::buf::err("POV: zu viele Chunk-Abschnitte"));
+                return Err(crate::protocol::buf::err("POV: zu viele Chunk-Abschnitte"));
             }
             sections.push(read_section(&mut r, format)?);
         }
         if sections.is_empty() {
-            return Err(crate::buf::err("POV: Chunk ohne Abschnitte"));
+            return Err(crate::protocol::buf::err("POV: Chunk ohne Abschnitte"));
         }
         Ok(Chunk {
             min_section: dimension.min_y.div_euclid(16),
@@ -395,12 +395,12 @@ fn local_index(x: i32, y: i32, z: i32) -> usize {
 fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section>>> {
     let block_count = r.i16()?;
     if !(0..=SECTION_BLOCKS as i16).contains(&block_count) {
-        return Err(crate::buf::err("POV: Blockzaehler unplausibel"));
+        return Err(crate::protocol::buf::err("POV: Blockzaehler unplausibel"));
     }
     if format.fluid_count {
         let fluid = r.i16()?;
         if !(0..=SECTION_BLOCKS as i16).contains(&fluid) {
-            return Err(crate::buf::err("POV: Fluidzaehler unplausibel"));
+            return Err(crate::protocol::buf::err("POV: Fluidzaehler unplausibel"));
         }
     }
 
@@ -416,7 +416,7 @@ fn read_section(r: &mut Reader, format: Format) -> io::Result<Option<Arc<Section
 
     let palette = read_palette(r, SECTION_BLOCKS, 8, format.modern_palette)?;
     // Biome stehen im selben Abschnitt, nur gröber aufgelöst: eine Nummer je 4x4x4 Zelle.
-    // Aus ihr kommt die Einfärbung von Gras, Laub und Wasser (siehe [`crate::pov_assets`]).
+    // Aus ihr kommt die Einfärbung von Gras, Laub und Wasser (siehe [`crate::web::assets`]).
     let biomes = read_biomes(r, format.modern_palette)?;
 
     Ok(compact(palette, block_count as usize).map(|mut section| {
@@ -611,7 +611,7 @@ impl SectionMask {
 fn read_mask(r: &mut Reader) -> io::Result<SectionMask> {
     let longs = r.var_int()?;
     if !(0..=MASK_LONGS as i32).contains(&longs) {
-        return Err(crate::buf::err("POV: Lichtmaske unplausibel"));
+        return Err(crate::protocol::buf::err("POV: Lichtmaske unplausibel"));
     }
     let mut mask = SectionMask::default();
     for slot in mask.0.iter_mut().take(longs as usize) {
@@ -659,13 +659,15 @@ fn read_light_arrays(
 ) -> io::Result<Box<[LightSection]>> {
     let sent = r.var_int()?;
     if !(0..=count as i32).contains(&sent) {
-        return Err(crate::buf::err("POV: Lichtfelder unplausibel"));
+        return Err(crate::protocol::buf::err("POV: Lichtfelder unplausibel"));
     }
     let mut arrays = Vec::with_capacity(sent as usize);
     for _ in 0..sent {
         let data = r.byte_slice()?;
         if data.len() != LIGHT_BYTES {
-            return Err(crate::buf::err("POV: Lichtfeld hat die falsche Groesse"));
+            return Err(crate::protocol::buf::err(
+                "POV: Lichtfeld hat die falsche Groesse",
+            ));
         }
         arrays.push(compact_light(data));
     }
@@ -674,7 +676,7 @@ fn read_light_arrays(
     let mut next = 0usize;
     for index in 0..count {
         if present.has(index) && empty.has(index) {
-            return Err(crate::buf::err(
+            return Err(crate::protocol::buf::err(
                 "POV: Lichtabschnitt zugleich vorhanden und leer",
             ));
         }
@@ -699,7 +701,9 @@ fn read_light_arrays(
         });
     }
     if next != arrays.len() {
-        return Err(crate::buf::err("POV: Lichtmaske und Felder passen nicht"));
+        return Err(crate::protocol::buf::err(
+            "POV: Lichtmaske und Felder passen nicht",
+        ));
     }
     Ok(out.into_boxed_slice())
 }
@@ -752,13 +756,15 @@ fn read_light(
 fn skip_block_entities(r: &mut Reader) -> io::Result<()> {
     let count = r.var_int()?;
     if !(0..=(SECTION_BLOCKS * MAX_SECTIONS) as i32).contains(&count) {
-        return Err(crate::buf::err("POV: Blockentitaeten unplausibel"));
+        return Err(crate::protocol::buf::err(
+            "POV: Blockentitaeten unplausibel",
+        ));
     }
     for _ in 0..count {
         r.u8()?; // x und z, je vier Bit
         r.i16()?; // y
         r.var_int()?; // Typ
-        crate::nbt::read_network(r)?;
+        crate::protocol::nbt::read_network(r)?;
     }
     Ok(())
 }
@@ -1090,7 +1096,7 @@ impl Pov {
         match self.format.load(Ordering::Relaxed) {
             u32::MAX => Format {
                 modern_palette: shared.proto.modern,
-                fluid_count: shared.proto.extra.section_fluid_count,
+                fluid_count: shared.proto.section_fluid_count,
             },
             code => Format::from_code(code),
         }
@@ -1152,7 +1158,7 @@ pub fn login(shared: &Arc<Shared>, own_entity: i32, r: &mut Reader) {
         r.bool()?;
         let worlds = r.var_int()?;
         if !(0..=1024).contains(&worlds) {
-            return Err(crate::buf::err("POV: Weltliste unplausibel"));
+            return Err(crate::protocol::buf::err("POV: Weltliste unplausibel"));
         }
         for _ in 0..worlds {
             r.skip_string()?;
@@ -1272,7 +1278,7 @@ fn read_incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) -> io::Result<(
         In::RemoveEntities => {
             let count = r.var_int()?;
             if !(0..=MAX_ENTITIES as i32).contains(&count) {
-                return Err(crate::buf::err("POV: Entity-Liste unplausibel"));
+                return Err(crate::protocol::buf::err("POV: Entity-Liste unplausibel"));
             }
             let mut world = shared.extras.pov.world.lock().unwrap();
             for _ in 0..count {
@@ -1307,18 +1313,18 @@ fn read_chunk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     if shared.proto.modern {
         let maps = r.var_int()?;
         if !(0..=64).contains(&maps) {
-            return Err(crate::buf::err("POV: Hoehenkarten unplausibel"));
+            return Err(crate::protocol::buf::err("POV: Hoehenkarten unplausibel"));
         }
         for _ in 0..maps {
             r.var_int()?;
             let longs = r.var_int()?;
             if !(0..=4096).contains(&longs) {
-                return Err(crate::buf::err("POV: Hoehenkarte zu gross"));
+                return Err(crate::protocol::buf::err("POV: Hoehenkarte zu gross"));
             }
             r.skip(longs as usize * 8)?;
         }
     } else {
-        crate::nbt::read_network(r)?;
+        crate::protocol::nbt::read_network(r)?;
     }
     // Ohne Kopie: die Chunkdaten werden unmittelbar aus dem Paketpuffer gelesen. Beim Beitritt
     // kommen gut 170 solche Pakete, und jede dieser Kopien lebte nur bis zum Ende dieser Funktion.
@@ -1379,7 +1385,9 @@ fn read_chunk_bulk(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let sky_light = r.bool()?;
     let count = r.var_int()?;
     if !(0..=MAX_CHUNKS as i32).contains(&count) {
-        return Err(crate::buf::err("POV: Chunk-Sammelpaket unplausibel"));
+        return Err(crate::protocol::buf::err(
+            "POV: Chunk-Sammelpaket unplausibel",
+        ));
     }
     let mut columns = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -1413,7 +1421,9 @@ fn decode_legacy_chunk(
     let has_sky = sky_hint.unwrap_or(data.len() == with_sky);
     let expected = if has_sky { with_sky } else { without_sky };
     if data.len() != expected {
-        return Err(crate::buf::err("POV: alte Chunkdaten haben falsche Länge"));
+        return Err(crate::protocol::buf::err(
+            "POV: alte Chunkdaten haben falsche Länge",
+        ));
     }
 
     let mut sections: Vec<Option<Arc<Section>>> = vec![None; 16];
@@ -1552,7 +1562,9 @@ fn read_section_blocks(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
         let chunk_z = r.i32()?;
         let count = r.var_int()?;
         if !(0..=SECTION_BLOCKS as i32).contains(&count) {
-            return Err(crate::buf::err("POV: alte Blockänderungen unplausibel"));
+            return Err(crate::protocol::buf::err(
+                "POV: alte Blockänderungen unplausibel",
+            ));
         }
         let mut world = shared.extras.pov.world.lock().unwrap();
         for _ in 0..count {
@@ -1568,7 +1580,9 @@ fn read_section_blocks(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
     let (section_x, section_y, section_z) = unpack_section_pos(r.i64()?);
     let count = r.var_int()?;
     if !(0..=SECTION_BLOCKS as i32).contains(&count) {
-        return Err(crate::buf::err("POV: Blockaenderungen unplausibel"));
+        return Err(crate::protocol::buf::err(
+            "POV: Blockaenderungen unplausibel",
+        ));
     }
     let mut changes = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -1604,7 +1618,7 @@ fn read_add_entity(shared: &Arc<Shared>, r: &mut Reader) -> io::Result<()> {
             x: r.f64()?,
             y: r.f64()?,
             z: r.f64()?,
-            player: kind == shared.proto.extra.player_entity_type,
+            player: kind == shared.proto.ids.player_entity_type,
         }
     };
     let mut world = shared.extras.pov.world.lock().unwrap();
@@ -1718,12 +1732,12 @@ struct RawPalette {
 fn palette_head(r: &mut Reader, max_indirect_bits: u8) -> io::Result<(u8, Option<Vec<u32>>)> {
     let bits = r.u8()?;
     if bits > 32 {
-        return Err(crate::buf::err("POV: Palette breiter als 32 Bit"));
+        return Err(crate::protocol::buf::err("POV: Palette breiter als 32 Bit"));
     }
     if bits == 0 || bits <= max_indirect_bits {
         let count = if bits == 0 { 1 } else { r.var_int()? };
         if !(1..=4096).contains(&count) {
-            return Err(crate::buf::err("POV: lokale Palette unplausibel"));
+            return Err(crate::protocol::buf::err("POV: lokale Palette unplausibel"));
         }
         let mut values = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -1738,7 +1752,7 @@ fn palette_head(r: &mut Reader, max_indirect_bits: u8) -> io::Result<(u8, Option
 fn palette_longs(r: &mut Reader, size: usize, bits: u8, modern: bool) -> io::Result<usize> {
     let per_long = 64usize / bits as usize;
     if per_long == 0 {
-        return Err(crate::buf::err("POV: ungueltige Palettenbreite"));
+        return Err(crate::protocol::buf::err("POV: ungueltige Palettenbreite"));
     }
     let expected = size.div_ceil(per_long);
     if modern {
@@ -1746,7 +1760,7 @@ fn palette_longs(r: &mut Reader, size: usize, bits: u8, modern: bool) -> io::Res
     }
     let encoded = r.var_int()?;
     if encoded < 0 || encoded as usize != expected {
-        return Err(crate::buf::err("POV: falsche Palettenlaenge"));
+        return Err(crate::protocol::buf::err("POV: falsche Palettenlaenge"));
     }
     Ok(expected)
 }
@@ -1764,7 +1778,9 @@ fn read_palette(
         if !modern {
             let longs = r.var_int()?;
             if longs != 0 {
-                return Err(crate::buf::err("POV: Singleton-Palette mit Daten"));
+                return Err(crate::protocol::buf::err(
+                    "POV: Singleton-Palette mit Daten",
+                ));
             }
         }
         return Ok(RawPalette {
@@ -1800,7 +1816,7 @@ fn read_palette(
             indices.push(packed as u16);
         })?;
         if let Some(message) = fault {
-            return Err(crate::buf::err(message));
+            return Err(crate::protocol::buf::err(message));
         }
         return Ok(RawPalette {
             values,
@@ -1835,7 +1851,7 @@ fn read_palette(
         indices.push(slot);
     })?;
     if let Some(message) = fault {
-        return Err(crate::buf::err(message));
+        return Err(crate::protocol::buf::err(message));
     }
     Ok(RawPalette {
         values,
@@ -1856,7 +1872,9 @@ fn skip_palette(
         if !modern {
             let longs = r.var_int()?;
             if longs != 0 {
-                return Err(crate::buf::err("POV: Singleton-Palette mit Daten"));
+                return Err(crate::protocol::buf::err(
+                    "POV: Singleton-Palette mit Daten",
+                ));
             }
         }
         return Ok(());
@@ -1895,7 +1913,7 @@ fn unpack_all(
         left -= take;
     }
     if left > 0 {
-        return Err(crate::buf::err("POV: Palettendaten zu kurz"));
+        return Err(crate::protocol::buf::err("POV: Palettendaten zu kurz"));
     }
     Ok(())
 }
@@ -2119,7 +2137,7 @@ pub(crate) fn start_assets(shared: &Arc<Shared>) {
     let pov = &shared.extras.pov;
     if matches!(
         shared.options().pov_resources,
-        crate::pov_resources::Source::Off
+        crate::web::resources::Source::Off
     ) {
         pov.assets
             .set_note(Some("ohne Texturen (--pov-resources aus)".to_string()));
@@ -2135,7 +2153,7 @@ pub(crate) fn start_assets(shared: &Arc<Shared>) {
             let version = owned.proto.name;
             let source = &owned.options().pov_resources;
             let pov = &owned.extras.pov;
-            let path = match crate::pov_resources::locate(&owned.console, version, source) {
+            let path = match crate::web::resources::locate(&owned.console, version, source) {
                 Ok(path) => path,
                 Err(error) => {
                     owned
@@ -2186,7 +2204,7 @@ pub(crate) fn start_web(shared: &Arc<Shared>) {
     {
         return;
     }
-    if let Err(error) = crate::pov_web::start(shared, address) {
+    if let Err(error) = crate::web::start(shared, address) {
         shared.extras.pov.web_running.store(false, Ordering::SeqCst);
         shared.console.error(&format!("Browser-POV: {}", error));
     }
@@ -2214,7 +2232,7 @@ pub(crate) fn web_asset(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn web_item(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
-    let name = crate::item_names::get(shared.proto.name, id)?;
+    let name = crate::protocol::item_names::get(shared.proto.name, id)?;
     Some(shared.extras.pov.assets()?.item_png(name))
 }
 
@@ -2598,7 +2616,7 @@ pub(crate) fn web_frame(
         for pixel in pixels {
             web_rgba.extend_from_slice(&[pixel.rgb.0, pixel.rgb.1, pixel.rgb.2, 255]);
         }
-        crate::pov_assets::encode_rgba_png(width, height, web_rgba)?
+        crate::web::assets::encode_rgba_png(width, height, web_rgba)?
     };
     let bytes: Arc<[u8]> = bytes.into();
     scratch.web_size = (width, height);
@@ -2819,7 +2837,7 @@ fn cast(
 /// Nachbarblock jenseits einer Fläche – dort steht das Licht, das sie beleuchtet, und nicht im
 /// getroffenen Block selbst (der ist undurchsichtig und deshalb stockdunkel).
 ///
-/// Reihenfolge wie in [`crate::pov_assets`]: west, ost, unten, oben, nord, süd.
+/// Reihenfolge wie in [`crate::web::assets`]: west, ost, unten, oben, nord, süd.
 const FACE_OFFSET: [(i32, i32, i32); 6] = [
     (-1, 0, 0),
     (1, 0, 0),
@@ -2834,7 +2852,7 @@ fn cast_textured(
     origin: (f64, f64, f64),
     dir: (f64, f64, f64),
     assets: &Assets,
-) -> Option<(crate::pov_assets::TexturedHit, Option<u8>)> {
+) -> Option<(crate::web::assets::TexturedHit, Option<u8>)> {
     let mut ray = Ray::new(origin, dir);
     while ray.distance <= MAX_DISTANCE {
         let section = cursor.section(ray.cell.0, ray.cell.1, ray.cell.2);
@@ -2919,7 +2937,7 @@ fn first_boundary(origin: f64, direction: f64, cell: i32) -> f64 {
 
 /// Seitenabhängige Helligkeit wie im Spiel: Oberseiten hell, Unterseiten dunkel, die vier
 /// Seitenflächen dazwischen. Dieselben Faktoren benutzt auch das Gegenstands-Icon in
-/// [`crate::pov_assets`].
+/// [`crate::web::assets`].
 ///
 /// Fullbright: Die Ansicht ignoriert bewusst die vom Server gemeldete Lichtstufe (`_light`) und
 /// zeigt die Texturfarben so, wie sie in der JAR stehen – nur noch mit der Seitenabhängigkeit
@@ -3052,7 +3070,7 @@ fn overlay_entities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::Writer;
+    use crate::protocol::buf::Writer;
 
     /// Ein Lichtpaket für `sections` Weltabschnitte bauen: Himmelslicht nur in den in `lit`
     /// genannten **Licht**abschnitten, Blocklicht nirgends.
@@ -3994,7 +4012,7 @@ mod tests {
         let console = crate::console::Console::new(false, false, false);
         let version = "1.21.1";
         let path =
-            crate::pov_resources::locate(&console, version, &crate::pov_resources::Source::Auto)
+            crate::web::resources::locate(&console, version, &crate::web::resources::Source::Auto)
                 .expect("Ressourcen beschaffen");
         let assets = Assets::load(&path, version).expect("Assets lesen");
 
@@ -4129,7 +4147,7 @@ mod tests {
         let console = crate::console::Console::new(false, false, false);
         let version = std::env::var("AFK_POV_VERSION").unwrap_or_else(|_| "1.21.1".to_string());
         let path =
-            crate::pov_resources::locate(&console, &version, &crate::pov_resources::Source::Auto)
+            crate::web::resources::locate(&console, &version, &crate::web::resources::Source::Auto)
                 .expect("Ressourcen beschaffen");
         let assets = Assets::load(&path, &version).expect("Assets lesen");
 
@@ -4159,7 +4177,7 @@ mod tests {
         for pixel in &pixels {
             rgba.extend_from_slice(&[pixel.rgb.0, pixel.rgb.1, pixel.rgb.2, 255]);
         }
-        let png = crate::pov_assets::encode_rgba_png(width, height, &rgba).expect("PNG");
+        let png = crate::web::assets::encode_rgba_png(width, height, &rgba).expect("PNG");
         std::fs::write(&target, png).expect("schreiben");
         println!("Bild geschrieben: {}", target);
     }

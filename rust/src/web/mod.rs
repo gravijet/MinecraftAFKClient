@@ -5,6 +5,9 @@
 //! Zustandsdaten nur aus dem laufenden Client. Dadurch funktioniert die Ansicht offline und ein
 //! fremder Webseiten-Tab kann nicht blind das lokale Menue anklicken.
 
+pub mod assets;
+pub mod resources;
+
 use crate::client::Shared;
 use rand::RngCore;
 use std::io::{Read, Write};
@@ -154,7 +157,7 @@ fn asset_bytes(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
 }
 #[cfg(not(feature = "pov"))]
 fn asset_bytes(shared: &Arc<Shared>, path: &str) -> Option<Vec<u8>> {
-    crate::pov_assets::web_asset(shared, path)
+    crate::web::assets::web_asset(shared, path)
 }
 
 #[cfg(feature = "pov")]
@@ -163,7 +166,7 @@ fn missing_bytes(shared: &Arc<Shared>) -> Option<Vec<u8>> {
 }
 #[cfg(not(feature = "pov"))]
 fn missing_bytes(shared: &Arc<Shared>) -> Option<Vec<u8>> {
-    crate::pov_assets::web_missing(shared)
+    crate::web::assets::web_missing(shared)
 }
 
 #[cfg(feature = "pov")]
@@ -172,7 +175,7 @@ fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
 }
 #[cfg(not(feature = "pov"))]
 fn item_bytes(shared: &Arc<Shared>, id: i32) -> Option<Vec<u8>> {
-    crate::pov_assets::web_item(shared, id)
+    crate::web::assets::web_item(shared, id)
 }
 
 /// Zustand für `/api/state.json` ohne den `pov`-Weltteil: nur Verbindung, Position und ob

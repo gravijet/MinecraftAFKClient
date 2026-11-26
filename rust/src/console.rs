@@ -172,11 +172,11 @@ impl Console {
     }
 
     /// Ausgabeformat für Text-Komponenten: eingefärbt oder roh.
-    pub fn fmt(&self) -> crate::nbt::Fmt {
+    pub fn fmt(&self) -> crate::protocol::nbt::Fmt {
         if self.is_color() {
-            crate::nbt::Fmt::Ansi
+            crate::protocol::nbt::Fmt::Ansi
         } else {
-            crate::nbt::Fmt::Plain
+            crate::protocol::nbt::Fmt::Plain
         }
     }
 
@@ -185,9 +185,9 @@ impl Console {
     /// davor weitergereicht werden können – eingefärbt wird erst hier.
     pub fn text(&self, legacy: &str) -> String {
         if self.is_color() {
-            crate::nbt::legacy_to_ansi(legacy)
+            crate::protocol::nbt::legacy_to_ansi(legacy)
         } else {
-            crate::nbt::strip_legacy(legacy)
+            crate::protocol::nbt::strip_legacy(legacy)
         }
     }
 

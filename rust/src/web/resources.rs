@@ -1,7 +1,7 @@
 //! Woher die Live-Ansicht ihre **echten** Minecraft-Ressourcen bekommt.
 //!
 //! Die Binary enthält bewusst keine Mojang-Texturen; sie liest Modelle, PNGs und GUI-Sprites aus
-//! einer originalen Client-JAR (siehe [`crate::pov_assets`]). Bisher musste der Pfad dorthin von
+//! einer originalen Client-JAR (siehe [`crate::web::assets`]). Bisher musste der Pfad dorthin von
 //! Hand mit `--pov-resources` gesetzt werden – ohne ihn zeigte die Browser-Ansicht gar keine
 //! Texturen, und das war der Normalfall.
 //!
@@ -302,7 +302,7 @@ fn stream_to_file(
             done, expected_size
         ));
     }
-    Ok(crate::buf::hex(&hasher.finalize()))
+    Ok(crate::protocol::buf::hex(&hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -329,7 +329,7 @@ mod tests {
 
     /// Gesucht wird nur an Stellen, an denen ein Launcher wirklich ablegt – und immer nach genau
     /// der Version, die auch gespielt wird. Eine JAR der falschen Version hätte die falschen
-    /// Netzwerk-State-IDs (siehe `verify_archive_version` in [`crate::pov_assets`]).
+    /// Netzwerk-State-IDs (siehe `verify_archive_version` in [`crate::web::assets`]).
     #[test]
     fn suchpfade_enthalten_die_version() {
         let paths = candidates("26.1");
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(again, path);
 
         // Und das Ergebnis muss auch wirklich als Ressourcenquelle taugen.
-        let assets = crate::pov_assets::Assets::load(&path, version).expect("Assets lesen");
+        let assets = crate::web::assets::Assets::load(&path, version).expect("Assets lesen");
         assert!(assets
             .raw("assets/minecraft/textures/block/stone.png")
             .is_some());

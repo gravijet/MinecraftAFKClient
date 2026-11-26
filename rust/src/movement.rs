@@ -19,10 +19,10 @@
 //!   rechts und mit jedem Versuch einen Block weiter. Erst wenn auch das nicht hilft, bricht der
 //!   Lauf mit einer Meldung ab, statt gegen die Wand zu rennen.
 
-use crate::buf::Writer;
 use crate::client::{Position, Shared, WORLD_LIMIT};
 use crate::console::{Console, BOLD, CYAN, GRAY};
 use crate::options;
+use crate::protocol::buf::Writer;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -689,7 +689,7 @@ pub(crate) fn send_rotation(shared: &Shared, yaw: f32, pitch: f32) {
     if !shared.set_rotation(yaw, pitch) {
         return;
     }
-    let mut w = Writer::packet(shared.proto.game.sb_move_player_rot);
+    let mut w = Writer::packet(shared.proto.ids.sb_move_player_rot);
     w.f32(yaw);
     w.f32(pitch);
     // In 1.21.1 ist das ein Bool, danach ein Flag-Byte. 0x01 bedeutet in beiden `onGround`.
@@ -710,7 +710,7 @@ fn send_move_ground(shared: &Shared, position: Position, on_ground: bool) {
     let (x, y, z, _, _) = position;
     // Die Blickrichtung ändert sich hier nicht. Vanilla sendet deshalb das kürzere Pos-Paket
     // und behauptet nicht in jedem Tick dieselben Winkel erneut.
-    let mut w = Writer::packet(shared.proto.game.sb_move_player_pos);
+    let mut w = Writer::packet(shared.proto.ids.sb_move_player_pos);
     w.f64(x);
     w.f64(y);
     w.f64(z);

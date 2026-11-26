@@ -2,8 +2,8 @@
 //! muss, steht im Startbefehl. Gespeichert wird nur, was gespeichert werden muss – die
 //! Microsoft-Konten unter `~/.config/afksystems/accounts/`.
 
-use crate::proto::{Protocol, DEFAULT};
-use crate::proxy::Proxy;
+use crate::net::proxy::Proxy;
+use crate::protocol::{Protocol, DEFAULT};
 use crate::rules::{Spec, Trigger};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -201,10 +201,10 @@ pub struct Options {
     /// Lokaler HTTP-Viewer fuer die texturierte Browser-POV.
     pub pov_web: Option<SocketAddr>,
     /// Woher die originalen Modelle, Texturen und GUI-Sprites kommen. Ohne Angabe sucht der
-    /// Client sie selbst (siehe [`crate::pov_resources`]); ins Binary eingebettet wird nichts.
+    /// Client sie selbst (siehe [`crate::web::resources`]); ins Binary eingebettet wird nichts.
     /// Gilt für die volle Live-Ansicht genauso wie fürs Browser-Menü ohne Weltteil (`web-menu`) –
     /// beide lesen dieselbe JAR.
-    pub pov_resources: crate::pov_resources::Source,
+    pub pov_resources: crate::web::resources::Source,
     /// Ohne Live-Ansicht und ohne Browser-Menü ist die Angabe wirkungslos und wird nur gemeldet.
 
     /// Nach einem Kick oder Netzabbruch neu verbinden. Standardmäßig gesetzt; `None` steht für
@@ -240,7 +240,7 @@ impl Default for Options {
             pov_size: None,
             pov_fps: None,
             pov_web: None,
-            pov_resources: crate::pov_resources::Source::Auto,
+            pov_resources: crate::web::resources::Source::Auto,
             reconnect: None,
         }
     }
@@ -357,7 +357,7 @@ fn parse_with_proxy_env<I: IntoIterator<Item = String>>(
             "--pov-resources" | "--pov-assets" => {
                 let wanted = value("--pov-resources")?;
                 {
-                    o.pov_resources = crate::pov_resources::Source::parse(&wanted);
+                    o.pov_resources = crate::web::resources::Source::parse(&wanted);
                 }
             }
             "-m" | "--mc" | "--version" => {
@@ -1051,7 +1051,7 @@ mod tests {
         ]);
         assert_eq!(web.pov_web.unwrap().to_string(), "127.0.0.1:8765");
         {
-            use crate::pov_resources::Source;
+            use crate::web::resources::Source;
             assert_eq!(
                 web.pov_resources,
                 Source::File(PathBuf::from("/tmp/client.jar"))

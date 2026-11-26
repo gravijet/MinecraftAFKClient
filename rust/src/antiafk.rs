@@ -12,8 +12,8 @@
 //! dreht, fällt mehr auf als jemand, der stillsteht – deshalb die Untergrenze in
 //! [`crate::options`].
 
-use crate::buf::Writer;
 use crate::client::Shared;
+use crate::protocol::buf::Writer;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -144,11 +144,7 @@ fn act(shared: &Arc<Shared>) {
     if shared.mover.is_active() {
         return;
     }
-    let mut swing = Writer::packet(shared.proto.extra.sb_swing);
-    if !shared.proto.legacy {
-        swing.var_int(0); // Haupthand; 1.8.9 hat keine Nutzlast
-    }
-    shared.send(swing);
+    crate::extras::swing_arm(shared);
 
     let Some((_, _, _, yaw, pitch)) = shared.position() else {
         return; // noch keine Position bekannt: der Armschwung muss reichen

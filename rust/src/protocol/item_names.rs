@@ -9,11 +9,13 @@
 
 use std::sync::OnceLock;
 
-const V1_8_9: &str = include_str!("../data/items-1.8.9.txt");
-const V1_21_1: &str = include_str!("../data/items-1.21.1.txt");
-const V1_21_11: &str = include_str!("../data/items-1.21.11.txt");
-const V26_1: &str = include_str!("../data/items-26.1.txt");
-const V26_2: &str = include_str!("../data/items-26.2.txt");
+const V1_8_9: &str = include_str!("../../data/items-1.8.9.txt");
+const V1_21_1: &str = include_str!("../../data/items-1.21.1.txt");
+const V1_21_11: &str = include_str!("../../data/items-1.21.11.txt");
+const V26_1: &str = include_str!("../../data/items-26.1.txt");
+const V26_2: &str = include_str!("../../data/items-26.2.txt");
+const V26_3: &str = include_str!("../../data/items-26.3.txt");
+const V26_4: &str = include_str!("../../data/items-26.4.txt");
 
 /// Ressourcenname für die Protokoll-ID. Die Listen sind nach `protocol_id` sortiert und
 /// lückenlos, deshalb ist die Zeilennummer direkt die Netzwerk-ID.
@@ -28,6 +30,8 @@ pub fn get(protocol: &str, id: i32) -> Option<&'static str> {
         "1.21.11" => &TABLES[1],
         "26.1" => &TABLES[2],
         "26.2" => &TABLES[3],
+        "26.3" => &TABLES[4],
+        "26.4" => &TABLES[5],
         _ => return None,
     };
     table
@@ -62,12 +66,7 @@ static LEGACY: OnceLock<Vec<(i32, i16, &'static str)>> = OnceLock::new();
 
 /// Je Protokollversion ein Verzeichnis, das erst beim ersten Nachschlagen entsteht. Eine Bauform,
 /// die nie ein Feld anzeigt, zahlt dafür kein Byte.
-static TABLES: [OnceLock<Vec<&'static str>>; 4] = [
-    OnceLock::new(),
-    OnceLock::new(),
-    OnceLock::new(),
-    OnceLock::new(),
-];
+static TABLES: [OnceLock<Vec<&'static str>>; 6] = [const { OnceLock::new() }; 6];
 
 fn table_source(protocol: &str) -> &'static str {
     match protocol {
@@ -75,6 +74,8 @@ fn table_source(protocol: &str) -> &'static str {
         "1.21.11" => V1_21_11,
         "26.1" => V26_1,
         "26.2" => V26_2,
+        "26.3" => V26_3,
+        "26.4" => V26_4,
         _ => "",
     }
 }
@@ -90,6 +91,8 @@ mod tests {
             ("1.21.11", V1_21_11, 1505),
             ("26.1", V26_1, 1506),
             ("26.2", V26_2, 1537),
+            ("26.3", V26_3, 1658),
+            ("26.4", V26_4, 1686),
         ] {
             assert_eq!(table.lines().count(), count, "{}", version);
             assert_eq!(get(version, 0), Some("minecraft:air"), "{}", version);

@@ -6,7 +6,7 @@
 //! nicht gibt – der wirft jedes Paket weg, das er nicht sofort beantworten muss.
 //!
 //! **Farben bleiben erhalten.** Alles, was hier landet, wird als `§`-Text gespeichert (siehe
-//! [`crate::nbt::Fmt::Legacy`]) statt als fertige ANSI-Zeile. Damit lässt sich dieselbe Zeile
+//! [`crate::protocol::nbt::Fmt::Legacy`]) statt als fertige ANSI-Zeile. Damit lässt sich dieselbe Zeile
 //! sowohl eingefärbt im Terminal anzeigen als auch über `--events` unverändert an ein Programm
 //! davor weiterreichen – mit Farbcodes, Fettschrift und allem, was der Server geschickt hat.
 //!
@@ -14,14 +14,14 @@
 //! schickt, soll den Client nicht wachsen lassen.
 //!
 //! Alle Feldreihenfolgen sind aus den Codec-Jars von MCProtocolLib abgelesen (siehe
-//! [`crate::proto`]); die einzige Stelle, die sich zwischen den Versionen unterscheidet, ist das
-//! Team-Paket – dafür gibt es [`crate::proto::TeamLayout`].
+//! [`crate::protocol`]); die einzige Stelle, die sich zwischen den Versionen unterscheidet, ist das
+//! Team-Paket – dafür gibt es [`crate::protocol::TeamLayout`].
 
-use crate::buf::Reader;
 use crate::client::Shared;
 use crate::console::{BOLD, GRAY};
-use crate::nbt::{self, Fmt};
-use crate::proto::{values, In, TeamLayout};
+use crate::protocol::buf::Reader;
+use crate::protocol::nbt::{self, Fmt};
+use crate::protocol::{values, In, TeamLayout};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -233,7 +233,11 @@ fn read_optional_number_format(r: &mut Reader) -> std::io::Result<Option<NumberF
         0 => NumberFormat::Blank,
         1 => NumberFormat::Styled(nbt::style_legacy(&nbt::read_network(r)?)),
         2 => NumberFormat::Fixed(nbt::render(&nbt::read_network(r)?, Fmt::Legacy)),
-        _ => return Err(crate::buf::err("Unbekanntes Scoreboard-Zahlenformat")),
+        _ => {
+            return Err(crate::protocol::buf::err(
+                "Unbekanntes Scoreboard-Zahlenformat",
+            ))
+        }
     }))
 }
 
@@ -251,7 +255,7 @@ fn read_team(shared: &Arc<Shared>, inner: &mut Inner, r: &mut Reader) -> std::io
     }
 
     if action == values::team::CREATE || action == values::team::UPDATE {
-        let team = match shared.proto.extra.team_layout {
+        let team = match shared.proto.team_layout {
             TeamLayout::V1_8 => {
                 r.skip_string()?; // Anzeigename
                 let prefix = r.string()?;

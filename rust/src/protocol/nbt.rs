@@ -7,7 +7,7 @@
 //! Programm davor (Panel/Webseite). Letzteres ist der Weg, auf dem Anzeigetafel und
 //! Gegenstandsnamen ihre Farben behalten.
 
-use crate::buf::Reader;
+use crate::protocol::buf::Reader;
 use std::io;
 
 /// Die Array-Varianten werden nie gerendert – gelesen werden müssen sie trotzdem, sonst stünde
@@ -143,13 +143,13 @@ pub fn read_named(r: &mut Reader) -> io::Result<Nbt> {
 
 fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Result<Nbt> {
     if depth > 64 {
-        return Err(crate::buf::err("NBT zu tief verschachtelt"));
+        return Err(crate::protocol::buf::err("NBT zu tief verschachtelt"));
     }
     // Jeder gelesene Wert kostet ein Guthaben; Listen und Compounds können damit nicht mehr
     // beliebig viele kleine Knoten erzeugen.
     match budget.checked_sub(1) {
         Some(left) => *budget = left,
-        None => return Err(crate::buf::err("NBT zu gross")),
+        None => return Err(crate::protocol::buf::err("NBT zu gross")),
     }
     Ok(match tag {
         1 => Nbt::Byte(r.i8()?),
@@ -170,7 +170,7 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Re
             // ist der Lesezeiger schon verschoben – dann lieber abbrechen als eine leere Liste
             // zurückgeben und den Rest des Pakets aus zufälligen Bytes zusammensetzen.
             if inner == 0 && len > 0 {
-                return Err(crate::buf::err("NBT-Liste ohne Elementtyp"));
+                return Err(crate::protocol::buf::err("NBT-Liste ohne Elementtyp"));
             }
             let mut items = Vec::new();
             if len > 0 {
@@ -209,7 +209,7 @@ fn read_payload(r: &mut Reader, tag: u8, depth: u32, budget: &mut u32) -> io::Re
             }
             Nbt::LongArray(v)
         }
-        _ => return Err(crate::buf::err("Unbekannter NBT-Typ")),
+        _ => return Err(crate::protocol::buf::err("Unbekannter NBT-Typ")),
     })
 }
 
@@ -782,14 +782,14 @@ mod tests {
         data.extend_from_slice(&(count as i32).to_be_bytes());
         data.resize(data.len() + count, 0);
 
-        let mut r = crate::buf::Reader::new(&data);
+        let mut r = crate::protocol::buf::Reader::new(&data);
         assert!(read_network(&mut r).is_err());
 
         // Was ein Server wirklich schickt, bleibt selbstverständlich lesbar.
         let mut small = vec![9u8, 1];
         small.extend_from_slice(&1000i32.to_be_bytes());
         small.resize(small.len() + 1000, 0);
-        let mut r = crate::buf::Reader::new(&small);
+        let mut r = crate::protocol::buf::Reader::new(&small);
         assert!(matches!(read_network(&mut r), Ok(Nbt::List(items)) if items.len() == 1000));
     }
 
@@ -858,7 +858,7 @@ mod tests {
         for _ in 0..4000 {
             let len = (random() % 512) as usize;
             let data: Vec<u8> = (0..len).map(|_| random() as u8).collect();
-            let mut r = crate::buf::Reader::new(&data);
+            let mut r = crate::protocol::buf::Reader::new(&data);
             if let Ok(tag) = read_network(&mut r) {
                 // Was gelesen wurde, muss sich auch in allen drei Formaten ausgeben lassen.
                 for fmt in [Fmt::Plain, Fmt::Ansi, Fmt::Legacy] {

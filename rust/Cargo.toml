@@ -31,6 +31,11 @@ aes = "0.8"
 # RSA/PKCS1v15 für das Verschlüsselungs-Handshake mit dem Server.
 rsa = "0.9"
 sha1 = "0.10"
+# Ab 26.4: Sitzungsschlüssel per X25519, abgeleitet mit HKDF-SHA256, Integrität per HMAC-SHA256.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
 # Beim Anlegen eines neuen Kontos wird ein dauerhaftes Device-Schluesselpaar erzeugt.

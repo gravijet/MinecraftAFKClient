@@ -9,7 +9,7 @@
 //! Token-Kette (der klassische Weg, ohne Xbox-Device-Signaturen):
 //!   MSA-Refresh -> XBL-User-Token -> XSTS -> Minecraft-Token -> Profil
 
-use crate::buf::{hex, uuid_from_str, uuid_to_dashed};
+use crate::protocol::buf::{hex, uuid_from_str, uuid_to_dashed};
 use base64::Engine;
 use rand::RngCore;
 use serde_json::{json, Value};

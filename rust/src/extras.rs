@@ -14,16 +14,16 @@
 //! Diese Datei legt den Zustand an, reicht Pakete an das zuständige Modul weiter und erledigt
 //! die kurzen Befehle selbst.
 
-use crate::buf::Reader;
 use crate::client::Shared;
 use crate::options::Options;
-use crate::proto::In;
+use crate::protocol::buf::Reader;
+use crate::protocol::In;
 
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::buf::Writer;
-use crate::proto::values;
+use crate::protocol::buf::Writer;
+use crate::protocol::values;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,9 +38,9 @@ pub struct Extras {
     /// volle Live-Ansicht. Mit `pov` gibt es stattdessen `Pov::assets` – beide schließen sich in
     /// den offiziellen Bauformen aus.
     #[cfg(not(feature = "pov"))]
-    pub(crate) web: crate::pov_assets::WebAssets,
+    pub(crate) web: crate::web::assets::WebAssets,
     /// Optional vom Server synchronisierte Registry-ID -> Ressourcenname. Vanilla-Namen kommen
-    /// zuverlässig aus [`crate::item_names`]; diese Liste darf sie bei einem Server ersetzen,
+    /// zuverlässig aus [`crate::protocol::item_names`]; diese Liste darf sie bei einem Server ersetzen,
     /// der `minecraft:item` tatsächlich synchronisiert.
     pub(crate) item_names: Mutex<Vec<String>>,
 
@@ -70,7 +70,7 @@ impl Extras {
             #[cfg(feature = "pov")]
             pov: crate::pov::Pov::new(options),
             #[cfg(not(feature = "pov"))]
-            web: crate::pov_assets::WebAssets::default(),
+            web: crate::web::assets::WebAssets::default(),
             item_names: Mutex::new(Vec::new()),
             antiafk: std::sync::atomic::AtomicU64::new(options.antiafk_seconds),
             antiafk_running: AtomicBool::new(false),
@@ -129,7 +129,7 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
         let Ok(name) = r.string() else { return };
         let Ok(has_data) = r.bool() else { return };
         let data = if has_data {
-            match crate::nbt::read_network(r) {
+            match crate::protocol::nbt::read_network(r) {
                 Ok(data) => Some(data),
                 Err(_) => return,
             }
@@ -172,7 +172,7 @@ fn registry_used(shared: &Arc<Shared>, r: &mut Reader) {
 
 // ===================== Haken aus dem Client =====================
 
-/// Zusatzpakete auswerten. Alles, was hier ankommt, hat [`crate::proto::Protocol::incoming`]
+/// Zusatzpakete auswerten. Alles, was hier ankommt, hat [`crate::protocol::Protocol::incoming`]
 /// bereits einer Ausbaustufe zugeordnet.
 pub fn incoming(shared: &Arc<Shared>, kind: In, r: &mut Reader) {
     // Eine Bauform, die nur sendet (`state`, `antiafk`), wertet überhaupt kein Zusatzpaket aus –
@@ -335,11 +335,7 @@ pub fn command(shared: &Arc<Shared>, verb: &str, arg: &str) -> bool {
             return true;
         }
         if matches!(verb, "swing" | "schlag" | "schlage" | "arm") {
-            let mut w = Writer::packet(shared.proto.extra.sb_swing);
-            if !shared.proto.legacy {
-                w.var_int(0); // Haupthand; 1.8.9 hat keine Nutzlast
-            }
-            shared.send(w);
+            swing_arm(shared);
             shared.console.info("Arm geschwungen.");
             return true;
         }
@@ -436,12 +432,12 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
         if shared.extras.sprinting.load(Ordering::Relaxed) {
             bits |= values::input::SPRINT;
         }
-        let mut w = Writer::packet(shared.proto.extra.sb_player_input);
+        let mut w = Writer::packet(shared.proto.ids.sb_player_input);
         w.u8(bits);
         return shared.send(w);
     }
 
-    let mut w = Writer::packet(shared.proto.extra.sb_player_command);
+    let mut w = Writer::packet(shared.proto.ids.sb_player_command);
     w.var_int(shared.entity_id.load(Ordering::Relaxed));
     w.var_int(if on { start } else { stop });
     w.var_int(0); // Zusatzwert (nur beim Reiten benutzt)
@@ -454,7 +450,7 @@ fn send_state(shared: &Arc<Shared>, on: bool, start: i32, stop: i32) {
 /// `ServerboundUseItemPacket` nur aus Hand und Sequenznummer – die acht zusätzlichen Bytes
 /// haben dort den Paket-Decoder des Servers aus dem Tritt gebracht und die Verbindung gekostet.
 fn use_item(shared: &Arc<Shared>) {
-    let mut w = Writer::packet(shared.proto.extra.sb_use_item);
+    let mut w = Writer::packet(shared.proto.ids.sb_use_item);
     if shared.proto.legacy {
         // Rechtsklick in die Luft: Blockposition (-1, 255, -1), Seite 255, kein mitgesendeter
         // Gegenstand und neutrale Cursorposition. Genau dieses BlockPlacement-Paket benutzt 1.8.9.
@@ -496,7 +492,7 @@ fn use_item(shared: &Arc<Shared>) {
 fn hotbar(shared: &Arc<Shared>, arg: &str) {
     match arg.trim().parse::<u8>() {
         Ok(slot @ 1..=9) => {
-            let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
+            let mut w = Writer::packet(shared.proto.ids.sb_set_carried_item);
             w.u16(slot as u16 - 1); // übertragen wird 0..8
             shared.send(w);
             shared
@@ -515,22 +511,37 @@ pub(crate) fn web_hotbar(shared: &Arc<Shared>, slot: usize) -> bool {
     if slot >= 9 || !shared.ready_for_gameplay() {
         return false;
     }
-    let mut w = Writer::packet(shared.proto.extra.sb_set_carried_item);
+    let mut w = Writer::packet(shared.proto.ids.sb_set_carried_item);
     w.u16(slot as u16);
     shared.send(w);
     shared.extras.selected_hotbar.store(slot, Ordering::Relaxed);
     true
 }
 
+/// Haupthand schwingen. Bis 26.2 `Swing` mit Hand (1.8.9 ohne Nutzlast), ab 26.3 das leere
+/// `Punch`, das der Server genauso als Schwung der Haupthand ausführt.
+pub(crate) fn swing_arm(shared: &Shared) {
+    let ids = &shared.proto.ids;
+    if ids.sb_punch >= 0 {
+        shared.send(Writer::packet(ids.sb_punch));
+        return;
+    }
+    let mut w = Writer::packet(ids.sb_swing);
+    if !shared.proto.legacy {
+        w.var_int(0);
+    }
+    shared.send(w);
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::proto::PROTOCOLS;
+    use crate::protocol::PROTOCOLS;
 
     /// Das Bitfeld ab 1.21.11 beschreibt den Gesamtzustand: beide Tasten müssen sich unabhängig
     /// setzen lassen, ohne einander zu überschreiben.
     #[test]
     fn eingabebits_stoeren_sich_nicht() {
-        use crate::proto::values;
+        use crate::protocol::values;
         let bits = values::input::SNEAK | values::input::SPRINT;
         assert_eq!(bits & values::input::SNEAK, values::input::SNEAK);
         assert_eq!(bits & values::input::SPRINT, values::input::SPRINT);
@@ -543,14 +554,15 @@ mod tests {
     #[test]
     fn zusatz_ids_sind_gefuellt() {
         for p in PROTOCOLS {
-            let e = &p.extra;
+            let e = &p.ids;
             for (name, id) in [
                 ("sb_container_click", e.sb_container_click),
                 ("sb_container_close", e.sb_container_close),
                 ("sb_player_command", e.sb_player_command),
                 ("sb_player_input", e.sb_player_input),
                 ("sb_set_carried_item", e.sb_set_carried_item),
-                ("sb_swing", e.sb_swing),
+                // Ab 26.3 ersetzt `punch` das Armschwingen.
+                ("sb_swing/sb_punch", e.sb_swing.max(e.sb_punch)),
                 ("sb_use_item", e.sb_use_item),
                 ("cb_level_chunk", e.cb_level_chunk),
                 ("cb_block_update", e.cb_block_update),
@@ -565,12 +577,11 @@ mod tests {
             }
             if p.legacy {
                 assert_eq!(e.cb_forget_level_chunk, -1);
-                assert_eq!(e.player_entity_type, -1);
-                assert!(e.cb_level_chunk_bulk > 0);
+                assert!(p.cb_level_chunk_bulk > 0);
             } else {
                 assert!(e.cb_forget_level_chunk > 0);
                 assert!(e.player_entity_type > 0);
-                assert_eq!(e.cb_level_chunk_bulk, -1);
+                assert_eq!(p.cb_level_chunk_bulk, -1);
             }
             let only_modern = [
                 ("cb_entity_position_sync", e.cb_entity_position_sync),

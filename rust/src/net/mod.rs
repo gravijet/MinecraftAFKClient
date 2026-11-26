@@ -3,7 +3,11 @@
 //! CFB8 ist hier von Hand implementiert (ein Byte pro Block) – das sind zwanzig Zeilen und
 //! spart eine weitere Abhängigkeit. Die Rechenlast ist bei Chat-Verkehr vernachlässigbar.
 
-use crate::buf::{err, push_var_int, Reader, Writer};
+pub mod crypto;
+pub mod dns;
+pub mod proxy;
+
+use crate::protocol::buf::{err, push_var_int, Reader, Writer};
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Block};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -86,9 +90,10 @@ pub struct Cfb8 {
 }
 
 impl Cfb8 {
-    pub fn new(key: &[u8; 16]) -> Self {
+    /// Bis 26.3 ist der IV der Schlüssel selbst; ab 26.4 kommt er aus dem Schlüsseltausch.
+    pub fn new(key: &[u8; 16], iv: &[u8; 16]) -> Self {
         let mut register = [0u8; 32];
-        register[..16].copy_from_slice(key); // Minecraft nutzt den Schlüssel zugleich als IV
+        register[..16].copy_from_slice(iv);
         Cfb8 {
             aes: Aes128::new(key.into()),
             register,
@@ -169,8 +174,8 @@ impl PacketReader {
         }
     }
 
-    pub fn enable_encryption(&mut self, key: &[u8; 16]) {
-        self.dec = Some(Cfb8::new(key));
+    pub fn enable_encryption(&mut self, key: &[u8; 16], iv: &[u8; 16]) {
+        self.dec = Some(Cfb8::new(key, iv));
     }
 
     pub fn set_threshold(&mut self, threshold: i32) {
@@ -295,8 +300,8 @@ pub struct PacketWriter {
 }
 
 impl PacketWriter {
-    pub fn enable_encryption(&mut self, key: &[u8; 16]) {
-        self.enc = Some(Cfb8::new(key));
+    pub fn enable_encryption(&mut self, key: &[u8; 16], iv: &[u8; 16]) {
+        self.enc = Some(Cfb8::new(key, iv));
     }
 
     pub fn set_threshold(&mut self, threshold: i32) {
@@ -400,7 +405,7 @@ fn zlib_bound(len: usize) -> usize {
 pub fn connect(
     host: &str,
     port: u16,
-    proxy: Option<&crate::proxy::Proxy>,
+    proxy: Option<&crate::net::proxy::Proxy>,
 ) -> io::Result<(PacketReader, PacketWriter)> {
     let stream = match proxy {
         Some(proxy) => proxy.connect(host, port)?,
@@ -667,11 +672,11 @@ mod tests {
         let plain: Vec<u8> = (0..500u32).map(|i| (i * 37 % 251) as u8).collect();
 
         let mut mine = plain.clone();
-        Cfb8::new(&key).encrypt(&mut mine);
+        Cfb8::new(&key, &key).encrypt(&mut mine);
         assert_eq!(mine, reference(&key, &plain, true));
 
         let mut back = mine.clone();
-        Cfb8::new(&key).decrypt(&mut back);
+        Cfb8::new(&key, &key).decrypt(&mut back);
         assert_eq!(back, plain);
     }
 
@@ -688,7 +693,7 @@ mod tests {
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = index as u8;
         }
-        let mut cipher = Cfb8::new(&key);
+        let mut cipher = Cfb8::new(&key, &key);
         let started = std::time::Instant::now();
         cipher.encrypt(&mut data);
         let elapsed = started.elapsed();
@@ -709,10 +714,10 @@ mod tests {
         let plain: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
 
         let mut whole = plain.clone();
-        Cfb8::new(&key).encrypt(&mut whole);
+        Cfb8::new(&key, &key).encrypt(&mut whole);
 
         let mut piecewise = plain.clone();
-        let mut cipher = Cfb8::new(&key);
+        let mut cipher = Cfb8::new(&key, &key);
         for chunk in piecewise.chunks_mut(7) {
             cipher.encrypt(chunk);
         }

@@ -18,11 +18,13 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use zip::ZipArchive;
 
-const STATES_1_8_9: &[u8] = include_bytes!("../data/block-states-1.8.9.txt.gz");
-const STATES_1_21_1: &[u8] = include_bytes!("../data/block-states-1.21.1.txt.gz");
-const STATES_1_21_11: &[u8] = include_bytes!("../data/block-states-1.21.11.txt.gz");
-const STATES_26_1: &[u8] = include_bytes!("../data/block-states-26.1.txt.gz");
-const STATES_26_2: &[u8] = include_bytes!("../data/block-states-26.2.txt.gz");
+const STATES_1_8_9: &[u8] = include_bytes!("../../data/block-states-1.8.9.txt.gz");
+const STATES_1_21_1: &[u8] = include_bytes!("../../data/block-states-1.21.1.txt.gz");
+const STATES_1_21_11: &[u8] = include_bytes!("../../data/block-states-1.21.11.txt.gz");
+const STATES_26_1: &[u8] = include_bytes!("../../data/block-states-26.1.txt.gz");
+const STATES_26_2: &[u8] = include_bytes!("../../data/block-states-26.2.txt.gz");
+const STATES_26_3: &[u8] = include_bytes!("../../data/block-states-26.3.txt.gz");
+const STATES_26_4: &[u8] = include_bytes!("../../data/block-states-26.4.txt.gz");
 
 const MAX_ARCHIVE_ASSET_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
@@ -1047,6 +1049,8 @@ fn state_table(protocol: &str) -> Result<String, String> {
         "1.21.11" => STATES_1_21_11,
         "26.1" => STATES_26_1,
         "26.2" => STATES_26_2,
+        "26.3" => STATES_26_3,
+        "26.4" => STATES_26_4,
         other => return Err(format!("Keine Block-State-Tabelle fuer {}", other)),
     };
     let mut text = String::new();
@@ -1622,7 +1626,7 @@ pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
     let web = &shared.extras.web;
     if matches!(
         shared.options().pov_resources,
-        crate::pov_resources::Source::Off
+        crate::web::resources::Source::Off
     ) {
         web.set_note(Some("ohne Texturen (--pov-resources aus)".to_string()));
         return;
@@ -1636,7 +1640,7 @@ pub(crate) fn load_for_web(shared: &Arc<crate::client::Shared>) {
             let version = owned.proto.name;
             let source = &owned.options().pov_resources;
             let web = &owned.extras.web;
-            let path = match crate::pov_resources::locate(&owned.console, version, source) {
+            let path = match crate::web::resources::locate(&owned.console, version, source) {
                 Ok(path) => path,
                 Err(error) => {
                     owned
@@ -1678,7 +1682,7 @@ pub(crate) fn web_asset(shared: &Arc<crate::client::Shared>, path: &str) -> Opti
 /// `web-menu` zieht `items` immer mit, ein eigenes Feature-Gate dafür ist deshalb unnötig.
 #[cfg(not(feature = "pov"))]
 pub(crate) fn web_item(shared: &Arc<crate::client::Shared>, id: i32) -> Option<Vec<u8>> {
-    let name = crate::item_names::get(shared.proto.name, id)?;
+    let name = crate::protocol::item_names::get(shared.proto.name, id)?;
     Some(shared.extras.web.get()?.item_png(name))
 }
 
@@ -1700,6 +1704,8 @@ mod tests {
             ("1.21.11", 29_671),
             ("26.1", 29_873),
             ("26.2", 32_366),
+            ("26.3", 35_723),
+            ("26.4", 37_840),
         ] {
             let table = state_table(version).unwrap();
             assert_eq!(table.lines().count(), expected, "{}", version);
@@ -1820,7 +1826,7 @@ mod tests {
         let console = crate::console::Console::new(false, false, false);
         let version = "1.21.1";
         let path =
-            crate::pov_resources::locate(&console, version, &crate::pov_resources::Source::Auto)
+            crate::web::resources::locate(&console, version, &crate::web::resources::Source::Auto)
                 .expect("Ressourcen beschaffen");
         let assets = Assets::load(&path, version).expect("Assets laden");
 

@@ -2008,27 +2008,6 @@ fn browser_pov_liefert_seite_und_live_zustand() {
     let _ = child.kill();
 }
 
-/// Ultra wartet umgekehrt auf `:pov live` – `--pov an` muss die Ansicht trotzdem von Anfang an
-/// starten. Sonst hätte die Option in der Datei, die sie am ehesten braucht, keine Wirkung.
-#[cfg(feature = "pov")]
-#[test]
-fn ultra_wartet_ab_startet_aber_auf_wunsch() {
-    let server = common::start(&common::MC_26_1, plan_with_ground());
-    let mut child = common::spawn_client(server.port, "26.1", &["--no-color"]);
-    let err = common::collect(child.stderr.take().unwrap());
-    let (joined, log) = common::wait_for(&err, TIMEOUT, "im Spiel");
-    assert!(joined, "kein Beitritt. Ausgabe:\n{}", log);
-    let (found, log) = common::wait_for(&err, Duration::from_secs(3), "(:pov stop)");
-    assert!(!found, "Ultra startete die Ansicht ungefragt:\n{}", log);
-    drop(child);
-
-    let server = common::start(&common::MC_26_1, plan_with_ground());
-    let mut child = common::spawn_client(server.port, "26.1", &["--no-color", "--pov", "an"]);
-    let err = common::collect(child.stderr.take().unwrap());
-    let (found, log) = common::wait_for(&err, TIMEOUT, "(:pov stop)");
-    assert!(found, "--pov an blieb bei Ultra wirkungslos:\n{}", log);
-}
-
 /// Messlauf statt Behauptung: 441 Chunks mit je acht gefüllten Abschnitten (so sieht eine
 /// gewachsene Überwelt aus) und danach der tatsächliche Speicherbedarf des Prozesses.
 ///

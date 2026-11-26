@@ -4,7 +4,7 @@
 //! Ein Gegenstand besteht seit 1.20.5 aus Anzahl, Nummer und einer offenen Liste von
 //! „Komponenten". Die Komponenten stehen **ohne Längenangabe** hintereinander: wer eine davon
 //! nicht kennt, kann auch die nächste nicht finden. Deshalb gibt es hier eine Tabelle, die je
-//! Komponente sagt, wie ihre Daten aufgebaut sind ([`crate::proto::Components::shapes`]) – sie
+//! Komponente sagt, wie ihre Daten aufgebaut sind ([`crate::protocol::Components::shapes`]) – sie
 //! ist aus denselben Codec-Jars abgelesen wie die Paket-IDs, nicht geraten.
 //!
 //! Was nicht in der Tabelle steht, beendet das Lesen **dieses** Pakets: der Gegenstand wird mit
@@ -13,12 +13,12 @@
 //! nicht" als geratene Inhalte. Ein Fehlschlag kostet nie die Verbindung: Pakete sind
 //! längenbegrenzt, ein falsch gelesenes Paket verschiebt den Strom also nicht.
 //!
-//! Namen und Lore werden als `§`-Text gehalten (siehe [`crate::nbt::Fmt::Legacy`]), damit die
+//! Namen und Lore werden als `§`-Text gehalten (siehe [`crate::protocol::nbt::Fmt::Legacy`]), damit die
 //! Farbformatierung des Servers erhalten bleibt – im Terminal wie auch über `--events`.
 
-use crate::buf::Reader;
-use crate::nbt::{self, Fmt};
-use crate::proto::Protocol;
+use crate::protocol::buf::Reader;
+use crate::protocol::nbt::{self, Fmt};
+use crate::protocol::Protocol;
 
 use std::io;
 
@@ -136,7 +136,7 @@ fn read_legacy_slot(r: &mut Reader) -> io::Result<Slot> {
 /// Komponenten lesen. Rückgabe `false`: unbekannte Komponente, ab hier ist der Lesezeiger
 /// unbrauchbar.
 fn read_components(proto: &'static Protocol, r: &mut Reader, item: &mut Item) -> io::Result<bool> {
-    let components = &proto.extra.components;
+    let ids = &proto.ids;
     let added = r.var_int()?;
     let removed = r.var_int()?;
     if !(0..=MAX_LIST).contains(&added) || !(0..=MAX_LIST).contains(&removed) {
@@ -147,21 +147,21 @@ fn read_components(proto: &'static Protocol, r: &mut Reader, item: &mut Item) ->
         let id = r.var_int()?;
         let shape = usize::try_from(id)
             .ok()
-            .and_then(|index| components.shapes.as_bytes().get(index).copied())
+            .and_then(|index| proto.item_shapes.as_bytes().get(index).copied())
             .unwrap_or(b'.');
 
         // Name und Lore werden gelesen, alles andere nur übersprungen.
-        if id == components.custom_name as i32 {
+        if id == ids.component_custom_name {
             item.name = Some(nbt::render(&nbt::read_network(r)?, Fmt::Legacy));
             continue;
         }
-        if id == components.item_name as i32 {
+        if id == ids.component_item_name {
             let value = nbt::render(&nbt::read_network(r)?, Fmt::Legacy);
             // Der Anzeigename des Servers hat Vorrang vor dem Namen des Gegenstands selbst.
             item.name.get_or_insert(value);
             continue;
         }
-        if id == components.lore as i32 {
+        if id == ids.component_lore {
             let count = list_len(r)?;
             // Platz auf Verdacht, aber nur für eine plausible Lore: Die Zahl kommt vom Server,
             // und dahinter muss noch nichts stehen. Was wirklich kommt, lässt den Vektor ohnehin
@@ -188,7 +188,7 @@ fn read_components(proto: &'static Protocol, r: &mut Reader, item: &mut Item) ->
 
 /// Eine Komponente überspringen. `false` = Aufbau nicht hinterlegt.
 ///
-/// Die Buchstaben stammen aus [`crate::proto`]; dort steht auch, woher die Tabelle kommt.
+/// Die Buchstaben stammen aus [`crate::protocol`]; dort steht auch, woher die Tabelle kommt.
 fn skip_shape(r: &mut Reader, shape: u8) -> io::Result<bool> {
     match shape {
         b'U' => {}
@@ -318,7 +318,7 @@ fn skip_properties(r: &mut Reader) -> io::Result<()> {
 fn list_len(r: &mut Reader) -> io::Result<i32> {
     let len = r.var_int()?;
     if !(0..=MAX_LIST).contains(&len) {
-        return Err(crate::buf::err("Gegenstands-Liste unplausibel"));
+        return Err(crate::protocol::buf::err("Gegenstands-Liste unplausibel"));
     }
     Ok(len)
 }
@@ -326,8 +326,8 @@ fn list_len(r: &mut Reader) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::Writer;
-    use crate::proto::PROTOCOLS;
+    use crate::protocol::buf::Writer;
+    use crate::protocol::PROTOCOLS;
 
     fn protocol(name: &str) -> &'static Protocol {
         Protocol::find(name).expect("Version")
@@ -353,15 +353,15 @@ mod tests {
     #[test]
     fn name_und_lore_werden_gelesen() {
         let proto = protocol("26.1");
-        let c = &proto.extra.components;
+        let c = &proto.ids;
         let mut w = Writer::default();
         w.var_int(1); // Anzahl
         w.var_int(848); // Nummer
         w.var_int(2); // zwei Komponenten
         w.var_int(0); // keine entfernten
-        w.var_int(c.custom_name as i32);
+        w.var_int(c.component_custom_name);
         text_component(&mut w, "Kompass", "gold");
-        w.var_int(c.lore as i32);
+        w.var_int(c.component_lore);
         w.var_int(2);
         text_component(&mut w, "Zeile 1", "gray");
         text_component(&mut w, "Zeile 2", "#ff8800");
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn bekannte_komponenten_werden_uebersprungen() {
         let proto = protocol("26.1");
-        let c = &proto.extra.components;
+        let c = &proto.ids;
         let mut w = Writer::default();
         w.var_int(1);
         w.var_int(1);
@@ -410,7 +410,7 @@ mod tests {
         w.var_int(64);
         w.var_int(21); // enchantment_glint_override = Bool
         w.bool(true);
-        w.var_int(c.custom_name as i32);
+        w.var_int(c.component_custom_name);
         text_component(&mut w, "Glanz", "aqua");
 
         let mut r = Reader::new(&w.data);
@@ -423,13 +423,13 @@ mod tests {
     #[test]
     fn unbekannte_komponente_stoppt_sauber() {
         let proto = protocol("26.1");
-        let c = &proto.extra.components;
+        let c = &proto.ids;
         let mut w = Writer::default();
         w.var_int(1);
         w.var_int(1);
         w.var_int(2);
         w.var_int(0);
-        w.var_int(c.custom_name as i32);
+        w.var_int(c.component_custom_name);
         text_component(&mut w, "Name", "white");
         w.var_int(16); // attribute_modifiers: Aufbau nicht hinterlegt
         w.raw(&[1, 2, 3]);
@@ -448,13 +448,13 @@ mod tests {
     #[test]
     fn unplausible_listenlaenge_gilt_nicht_als_gelesen() {
         let proto = protocol("26.1");
-        let c = &proto.extra.components;
+        let c = &proto.ids;
         let mut w = Writer::default();
         w.var_int(1); // Anzahl
         w.var_int(1); // Nummer
         w.var_int(1); // eine Komponente
         w.var_int(0); // keine entfernten
-        w.var_int(c.lore as i32);
+        w.var_int(c.component_lore);
         w.var_int(500_000); // so viele Lore-Zeilen gibt es nicht
         w.raw(&[0; 32]);
 
@@ -495,17 +495,17 @@ mod tests {
             if p.legacy {
                 continue;
             }
-            let c = &p.extra.components;
-            let shapes = c.shapes.as_bytes();
+            let c = &p.ids;
+            let shapes = p.item_shapes.as_bytes();
             assert!(
-                shapes.len() > c.lore as usize,
+                shapes.len() > c.component_lore as usize,
                 "Tabelle zu kurz: {}",
                 p.name
             );
-            assert_eq!(shapes[c.custom_name as usize], b'C', "{}", p.name);
-            assert_eq!(shapes[c.item_name as usize], b'C', "{}", p.name);
-            assert_eq!(shapes[c.lore as usize], b'L', "{}", p.name);
-            assert!(c.shapes.is_ascii(), "{}", p.name);
+            assert_eq!(shapes[c.component_custom_name as usize], b'C', "{}", p.name);
+            assert_eq!(shapes[c.component_item_name as usize], b'C', "{}", p.name);
+            assert_eq!(shapes[c.component_lore as usize], b'L', "{}", p.name);
+            assert!(p.item_shapes.is_ascii(), "{}", p.name);
         }
     }
 }

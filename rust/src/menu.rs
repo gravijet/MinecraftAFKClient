@@ -7,22 +7,22 @@
 //! ungelesen ins Leere.
 //!
 //! Mit `--features items` kommt der Inhalt dazu: je Feld Anzahl, Name mit Farbformatierung und
-//! Lore, gelesen von [`crate::items`]. Dazu gehört auch das **eigene Inventar** (Fenster 0),
+//! Lore, gelesen von [`crate::protocol::items`]. Dazu gehört auch das **eigene Inventar** (Fenster 0),
 //! das der Server über denselben Weg schickt.
 //!
 //! Beim Senden werden „keine geänderten Felder" und „nichts in der Hand" mitgeschickt. Beides ist
 //! in allen vier Versionen dasselbe Byte (`0`), obwohl der Gegenstandstyp dahinter ein anderer
 //! ist – nachgesehen in den Codec-Jars.
 
-use crate::buf::{Reader, Writer};
 use crate::client::Shared;
 use crate::console::{BOLD, GRAY};
-use crate::nbt::{self, Fmt};
-use crate::proto::{values, In};
+use crate::protocol::buf::{Reader, Writer};
+use crate::protocol::nbt::{self, Fmt};
+use crate::protocol::{values, In};
 
 use std::sync::{Arc, Mutex};
 
-use crate::items::{self, Item};
+use crate::protocol::items::{self, Item};
 
 /// Mehr Felder hat kein Fenster (Doppelkiste 90, Spielerinventar 46).
 const MAX_SLOTS: usize = 200;
@@ -89,7 +89,7 @@ struct Open {
     id: i32,
     /// Vanilla-Menue-Typ aus `OpenScreen`; der Browser waehlt damit den passenden Hintergrund.
     kind: i32,
-    /// Überschrift als `§`-Text (siehe [`crate::nbt::Fmt::Legacy`]).
+    /// Überschrift als `§`-Text (siehe [`crate::protocol::nbt::Fmt::Legacy`]).
     title: String,
     /// Zustandszähler. Der Server erhöht ihn bei jeder Änderung; unser Klick muss den zuletzt
     /// gesehenen mitschicken, sonst schickt der Server das ganze Fenster erneut.
@@ -98,7 +98,7 @@ struct Open {
     slots: usize,
     /// Inhalt je Feld.
     items: Vec<Option<Item>>,
-    /// Ab diesem Feld war der Inhalt nicht mehr lesbar (siehe [`crate::items`]).
+    /// Ab diesem Feld war der Inhalt nicht mehr lesbar (siehe [`crate::protocol::items`]).
     unknown_from: usize,
 }
 
@@ -335,13 +335,15 @@ fn read_item_slot_with(
     if let Some(item) = slot.item.as_mut() {
         if item.name.is_none() {
             item.name = if shared.proto.legacy {
-                crate::item_names::get_legacy(item.id, item.legacy_damage).map(str::to_string)
+                crate::protocol::item_names::get_legacy(item.id, item.legacy_damage)
+                    .map(str::to_string)
             } else {
                 usize::try_from(item.id)
                     .ok()
                     .and_then(|id| names.get(id).cloned())
                     .or_else(|| {
-                        crate::item_names::get(shared.proto.name, item.id).map(str::to_string)
+                        crate::protocol::item_names::get(shared.proto.name, item.id)
+                            .map(str::to_string)
                     })
             };
         }
@@ -386,8 +388,8 @@ pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
         Some(item) => serde_json::json!({
             "id": item.id,
             "count": item.count,
-            "name": crate::nbt::strip_legacy(&item.label()),
-            "lore": item.lore.iter().map(|line| crate::nbt::strip_legacy(line)).collect::<Vec<_>>(),
+            "name": crate::protocol::nbt::strip_legacy(&item.label()),
+            "lore": item.lore.iter().map(|line| crate::protocol::nbt::strip_legacy(line)).collect::<Vec<_>>(),
         }),
         None => serde_json::Value::Null,
     };
@@ -398,7 +400,7 @@ pub(crate) fn web_state(shared: &Arc<Shared>) -> serde_json::Value {
             "id": open.id,
             "kind": open.kind,
             "type": menu_type(open.kind),
-            "title": crate::nbt::strip_legacy(&open.title),
+            "title": crate::protocol::nbt::strip_legacy(&open.title),
             "slots": open.slots,
             "items": open.items.iter().map(item_json).collect::<Vec<_>>(),
             "inventory": inventory.iter().map(item_json).collect::<Vec<_>>(),
@@ -618,7 +620,7 @@ pub fn click_command(shared: &Arc<Shared>, arg: &str) -> bool {
         return false;
     }
 
-    let mut w = Writer::packet(shared.proto.extra.sb_container_click);
+    let mut w = Writer::packet(shared.proto.ids.sb_container_click);
     write_container_id(shared, &mut w, id);
     if shared.proto.legacy {
         let action = state.wrapping_add(1) as i16;
@@ -668,7 +670,7 @@ pub fn close_command(shared: &Arc<Shared>) -> bool {
         shared.console.error("Gerade ist kein Menü offen.");
         return false;
     };
-    let mut w = Writer::packet(shared.proto.extra.sb_container_close);
+    let mut w = Writer::packet(shared.proto.ids.sb_container_close);
     write_container_id(shared, &mut w, id);
     shared.send(w);
     shared.console.info("Menü geschlossen.");
@@ -678,7 +680,7 @@ pub fn close_command(shared: &Arc<Shared>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::menu_type;
-    use crate::proto::values;
+    use crate::protocol::values;
 
     /// Klickarten dürfen sich nicht überschneiden – sonst würde ein Linksklick als
     /// Umschalt-Klick beim Server ankommen und den halben Behälter leerräumen.
@@ -692,9 +694,9 @@ mod tests {
     /// Der Parser darf sich deshalb nicht zufällig auf die üblichen IDs 1..100 verlassen.
     #[test]
     fn fenster_nummer_hat_zwei_kodierungen() {
-        let mut byte = crate::buf::Writer::default();
+        let mut byte = crate::protocol::buf::Writer::default();
         byte.u8(200);
-        let mut varint = crate::buf::Writer::default();
+        let mut varint = crate::protocol::buf::Writer::default();
         varint.var_int(200);
         assert_eq!(byte.data, vec![200]);
         assert_eq!(varint.data, vec![200, 1]);

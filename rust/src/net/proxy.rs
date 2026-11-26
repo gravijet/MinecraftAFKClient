@@ -130,7 +130,7 @@ impl Proxy {
     /// Verbindet zum Proxy und lässt ihn zu `host:port` durchstellen.
     ///
     /// Aufbau und Handshake laufen unter [`HANDSHAKE_TIMEOUT`]; die endgültigen Zeitlimits der
-    /// Spielverbindung setzt danach [`crate::conn::connect`] auf demselben Socket.
+    /// Spielverbindung setzt danach [`crate::net::connect`] auf demselben Socket.
     pub fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         let stream = self.dial()?;
         stream.set_nodelay(true)?;
@@ -147,7 +147,7 @@ impl Proxy {
     /// Damit blockiert auch ein nur halb erreichbarer IPv6-Proxy nicht den funktionierenden
     /// IPv4-Kandidaten bis zum vollen Zeitlimit.
     fn dial(&self) -> io::Result<TcpStream> {
-        crate::conn::dial_timeout(&self.host, self.port, HANDSHAKE_TIMEOUT)
+        crate::net::dial_timeout(&self.host, self.port, HANDSHAKE_TIMEOUT)
     }
 
     // ===================== SOCKS5 (RFC 1928) =====================
